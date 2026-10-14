@@ -1,0 +1,32 @@
+[package]
+name = "dupfind"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Duplicate file finder"
+
+[[bin]]
+name = "dupfind"
+path = "src/main.rs"
+
+[dependencies]
+dupfind-core = { path = "../core" }
+dupfind-backend-generic = { path = "../backend-generic" }
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ctrlc = "3"
+
+[features]
+default = []
+test-hooks = ["dupfind-core/test-hooks"]
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

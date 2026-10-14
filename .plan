@@ -1,0 +1,101 @@
+# dupfind — Phase 0 + Phase 1 Build Plan
+
+Source of truth: `.plan.md` sections 1, 3, 4. When code and `.plan.md` disagree, stop and ask; don't improvise. All behavior specs (schema 4.3, states 4.4/4.4a, writer 4.5, maps 4.6, resume 4.7/4.7a, lookup 4.8, paths 4.9, volume identity 4.10, tests 4.12, CLI 4.13) live there. This plan adds the Phase 0 bootstrap (missing entirely) and orders Phase 1 per 4.11.
+
+Workspace root: `dupfind/` layout exactly as `.plan.md` section 1. `core` has `#![forbid(unsafe_code)]`; all `cfg`/FFI lives in `backend-*` crates. Per user rules: the build agent does NOT run tests or scripts; the user triggers test runs. Each numbered step must `cargo check` cleanly before the next starts.
+
+---
+
+## Part A — Phase 0 bootstrap
+
+### A1. Workspace scaffolding
+- `Cargo.toml`: `[workspace]` with members `crates/*`, `bench`, `xtask`; shared `[workspace.lints]` (`clippy::all = "deny"`); `[profile.release] lto = "thin"`.
+- `rust-toolchain.toml` pinned stable.
+- Crate skeletons: `core`, `backend-generic`, `cli`, `tui` (stub lib), `bench`, `xtask`.
+- Pinned deps in workspace: `rusqlite = { version = "0.32", features = ["bundled"] }`, `blake3`, `thiserror`, `anyhow` (cli only), `smallvec`, `unicode-normalization`, `tracing`, `tracing-subscriber`, `walkdir`; dev: `proptest`, `tempfile`, `assert_cmd`, `predicates`.
+- `.github/workflows/ci.yml`: matrix ubuntu-22.04/ubuntu-24.04/macos-arm64/windows-2022; `cargo fmt --check`, `cargo clippy -D warnings`, build.
+
+### A2. `core` skeleton
+- `core/src/lib.rs`: `#![forbid(unsafe_code)]`, modules.
+- `core/src/error.rs`: full `CoreError` enum as in `.plan.md` 4.16.
+- `core/src/model.rs`: `FileEntry`, `FolderRow`, `ErrRow`, `VolumeId`, `FileId`, `Hash([u8;16])`, `State` enum (4.4 values), `Phase` enum (4.4b), `Attrs` bitflags-style, `SkipReason`, `FsType`, `UuidKind`.
+- `core/src/traits.rs`: `Enumerator`, `ContentReader`, `Hasher`, `Index`, `Action` (stub), plus (already needed by Phase 1, added now) `VolumeIdentity`, `PathCodec`, `VolumeInfo`.
+- `core/src/config.rs`: `Config` struct: db path, prefix_first_bytes (16 KiB), prefix_last_bytes (4 KiB), mem_budget (1 GiB), one_file_system (default true), include_placeholders (false), verify (off), force.
+- `core/src/hash.rs`: BLAKE3-128 wrapper, `prefix_mode` / `full_mode`.
+- `core/src/path.rs`: `RawPath` + `to_display()` per 4.16 boilerplate.
+- `core/src/cancel.rs`, `core/src/progress.rs`: token + sink traits.
+
+### A3. `backend-generic`
+- `Enumerator` via `walkdir`; per-entry `file_type` gate (regular files only, 4.4a rule 1).
+- `ContentReader` via `std::fs::File` + `read_at` shim (` seek + read` acceptable).
+- `codec.rs`: `PathCodec` — Unix `OsStrExt::as_bytes`; Windows WTF-8 encoder/decoder over `encode_wide()`.
+- `volume.rs` (cfg-gated, Phase 1 dependency but stub now): Linux `/dev/disk/by-uuid` + `statfs.f_fsid` fallback; macOS `getattrlist` `ATTR_VOL_UUID` + fallback; Windows `GetVolumeNameForVolumeMountPointW` + serial.
+
+### A4. Naive pipeline + CLI (Phase 0 behavior)
+- `core/src/pipeline/`: sequential orchestrator, `pass_enumerate/size/prefix/full`, no DB yet, in-Vec grouping.
+- `core/src/report.rs`: group construction, JSON + human output.
+- `cli/src/main.rs`: `scan <ROOT>... [--format json|human]` minimal.
+- Smoke fixture `crates/core/tests/fixtures/tree` with known dups.
+- Exit criterion A: `dupfind scan <fixture> --format json` correct and stable.
+
+---
+
+## Part B — Phase 1 (per `.plan.md` 4.11, in order)
+
+### B1. `core/path.rs` + `core/traits.rs` finalize
+Already largely done in A2/A3; verify `RawPath` and `VolumeIdentity`/`PathCodec` signatures match 4.16 / 4.10 exactly.
+
+### B2. `backend-generic/src/volume.rs`, `codec.rs` — full impls
+Per 4.9/4.10. Unit test: NFD name stored byte-exact; WTF-8 round-trip on Windows (cfg test).
+
+### B3. `core/db/mod.rs`
+`Db::open(path, cfg)`, `Db::open_readonly`, pragma order: `busy_timeout` → `journal_mode=WAL` (check returned mode; else `WalUnavailable`) → `synchronous=NORMAL` → `foreign_keys=ON` → `temp_store=MEMORY` → `wal_autocheckpoint=10000`. Use 4.16 boilerplate.
+
+### B4. `core/db/schema.rs` + `schema/v1.sql`
+Embed 4.3 SQL verbatim (minus its comment-only pragmas). `apply_migrations`, `check_version`, `EXPECTED_VERSION = 1`. Unit: apply, re-apply idempotent, refuse `user_version > 1`.
+
+### B5. `core/db/ids.rs`
+`IdAllocator` per 4.16. Unit: seed on empty and existing DB.
+
+### B6. `core/db/queries.rs`
+Helpers (all `&Connection`): `upsert_file`, `find_by_path`, `find_move_candidate`, `set_state`, `size_candidates` (the 4.6 GROUP BY HAVING COUNT(DISTINCT COALESCE(file_id,id)) query), `rows_in_state`, `prefix_partners`, `full_partners`, `delete_stale_under_roots` (recursive CTE), `reconstruct_path` (recursive CTE, root sentinel `parent_id=0`), `recompute_groups` (DELETE + INSERT...SELECT with `distinct_inodes > 1`). Unit test each against a fixture DB.
+
+### B7. `core/db/writer.rs`
+`Batch` enum exactly per 4.5; `spawn_writer`, batching loop per 4.16 (rows ≥ 50k or 5 s, `PhaseComplete` forces commit in same txn, PASSIVE checkpoints, TRUNCATE on Shutdown, `WriterDied` propagation). `apply()` one arm per variant with `prepared_cached`. Units: threshold flush, PhaseComplete flush, replay `Enumerated` twice → identical DB.
+
+### B8. `core/index/mod.rs` + `memory.rs`
+`Index` trait per 4.16; memory impl = `prefix_map`/`full_map` (`HashMap<Hash, SmallVec<[i64;2]>>`), budget accounting vs `cfg.mem_budget`.
+
+### B9. `core/index/sqlite.rs`
+DB-backed fallback: streamed grouped cursor over `idx_files_prefix`/`idx_files_full`. Log switch at `warn`.
+
+### B10. `core/pipeline/pass_*.rs` refactor
+Emit `Batch` messages; add all 4.4a rules: non-regular skip, placeholder skip, hardlink collapse (group by `(volume_id, file_id)`, count distinct inodes), small-file rule (`size <= F+L` → `Hashed` both hashes, skip pass_full; boundary tests at 1, F+L, F+L+1), change-during-read guard (re-stat after hash → `ERROR(changed_during_read)`), stored-hash reuse when `prefix_bytes` matches config. `--stop-after-pass N` behind `test-hooks` feature. `PhaseComplete` written with last rows of each phase. `core/pipeline/rescan.rs`: enumerate-merge per 4.7a (unchanged keep hashes; changed null them; move detection via `file_id`+`size`+`mtime_ns` among not-yet-seen rows; stale deletion under this run's roots only).
+
+### B11. `core/pipeline/resume.rs`
+`plan_resume(conn, cfg) -> ResumePlan`; `execute(plan)` per 4.7: hash_algo/prefix config guard, `--force` wipe, latest `running` run, volume UUID guard via backend, mount-move update, resume at pass after `phase_reached`, rebuild maps from rows past the pass, `recompute_groups`, mark finished. Fresh scan: mark overlapping `running` runs `abandoned` (warn).
+
+### B12. `core/lookup.rs`
+Algorithm 4.8 exactly: skip rules; size candidates across all volumes (`state NOT IN (-1,-2)`); prefix compute; on-demand hashing of `-3`/`-4` candidates (mounted) else `Unmounted`; full hash; freshness re-stat per match; `--insert` path. `LookupOutcome`/`MatchRow`/`Freshness` per 4.8.
+
+### B13. `core/report.rs` — DB-backed
+Read `dup_groups` + members via `reconstruct_path` / `v_files` view; exclude stale (`last_seen_run_id` != latest completed); `--min-wasted` filter.
+
+### B14. CLI
+`cli/src/scan.rs`, `lookup.rs`, `report.rs`, `db.rs` per 4.13 flags, incl. `db info|vacuum|drop --yes`. Ctrl-C sets cancel token.
+
+### B15. Tests (4.12)
+All unit tests listed in 4.12 (schema, queries, state transitions incl. 1→5 exception, writer, abandoned runs, hardlink-only pair, allocator, volume mismatch with fake VolumeIdentity, hash config mismatch, path reconstruction, unicode, small-file boundaries). Integration: end-to-end resume with `--stop-after-pass` for each N → normalized group equality; kill-9 subprocess fuzz (20 runs); lookup basic/singleton-regression/freshness; hardlinks; FIFO/socket skip; change-during-read double; rescan unchanged/modified/deleted/root-scoping; move detection; volume guard with fakes. Property: `FileEntry -> DB -> FileEntry` round-trip with the 4.12 name strategies; state-machine transition sequences. Bench stub: 1 M-file synthetic DB insert/resume/lookup.
+
+### B16. Docs + gates
+`docs/phase1.md` (schema, state machine, resume/rescan, CLI additions). Verify `#![forbid(unsafe_code)]` compiles in core; `cargo deny check` clean (add `deny.toml`).
+
+---
+
+## Handover
+
+- Files: everything under `dupfind/` (new workspace created inside current repo root).
+- Order: A1→A4 (Phase 0 shippable), then B1→B16 strictly; each step `cargo check` + at least one passing unit test before the next.
+- Conventions: `Result<T, CoreError>` in core, `anyhow` only in cli; BLOB path columns via `RawPath` bytes; `tracing` spans per phase; no `unsafe` outside `backend-*`.
+- Test runs are user-triggered; do not run tests, benches, or scripts proactively.
+- When implementation conflicts with `.plan.md`, stop and surface the conflict.

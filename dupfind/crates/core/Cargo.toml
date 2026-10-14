@@ -1,0 +1,32 @@
+[package]
+name = "dupfind-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "dupfind_core"
+path = "src/lib.rs"
+
+[dependencies]
+rusqlite.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+smallvec.workspace = true
+unicode-normalization.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[features]
+default = []
+# Exposes `--stop-after-pass N`; never enabled in release builds.
+test-hooks = []
+
+[lints]
+workspace = true
