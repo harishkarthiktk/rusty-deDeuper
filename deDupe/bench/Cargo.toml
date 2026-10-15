@@ -1,0 +1,20 @@
+[package]
+name = "dedupe-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "dedupe-bench"
+path = "src/main.rs"
+
+[dependencies]
+dedupe-core = { path = "../crates/core" }
+dedupe-backend-generic = { path = "../crates/backend-generic" }
+rusqlite.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
