@@ -1,4 +1,0 @@
-- [x] A1 - writer.rs: replay test asserts identical row; add shutdown-flush test (cargo check gate)
-- [x] A2 - .overall_plan.md §12.3: flip B2, B6, B7, B9, B10, B15 to done with updated evidence
-- [x] A3 - .overall_plan.md: §12 header snapshot, §12.1 roll-up, §12.4 §4 row, §12.5, §12.6
-- [x] A4 - .overall_plan.md top status index: bottom line, Phase 1 row, cross-cutting row, §4 sub-items table, build-items line, condensed gaps list
