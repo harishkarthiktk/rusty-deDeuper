@@ -35,6 +35,7 @@ pub struct Services<'a> {
     pub volume: &'a dyn VolumeIdentity,
     pub hasher: &'a dyn Hasher,
     pub cancel: &'a Token,
+    pub sink: &'a crate::progress::SharedSink,
 }
 
 /// Everything a pass needs: config, the run, the writer, the read connection,

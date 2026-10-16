@@ -289,6 +289,7 @@ fn scan(
     let codec = Codec;
     let hasher = Blake3Hasher;
     let cancel = Token::new();
+    let sink = dedupe_core::progress::null_sink();
     let svc = Services {
         enumr: &walker,
         reader,
@@ -296,6 +297,7 @@ fn scan(
         volume: vi,
         hasher: &hasher,
         cancel: &cancel,
+        sink: &sink,
     };
     run_scan(
         db,
@@ -538,6 +540,9 @@ fn hardlink_only_pair_is_not_a_group() {
     let report = Report::from_db(&conn, 0).unwrap();
     assert_eq!(report.groups.len(), 1);
     assert_eq!(report.groups[0].distinct_inodes, 2);
+    // Two inodes hold one copy of the bytes, so exactly one file's size is wasted.
+    let size = b"data-here\n".len() as i64;
+    assert_eq!(report.groups[0].wasted_logical, size);
 }
 
 #[cfg(unix)]
@@ -554,9 +559,20 @@ fn non_regular_files_are_skipped() {
     assert!(status.map(|s| s.success()).unwrap_or(false), "mkfifo");
     let _listener = UnixListener::bind(e.root.join("sock")).unwrap();
 
-    let cfg = Config::default();
-    let vi = FakeVol::new("vol-A");
-    scan(&e.db, &e.root, &cfg, &vi, &FsReader::new(), false, None).unwrap();
+    // Scan on a worker thread: if a FIFO is opened, the open blocks forever, so
+    // the timeout turns that regression into a failure instead of a hang.
+    let (db, root) = (e.db.clone(), e.root.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let cfg = Config::default();
+        let vi = FakeVol::new("vol-A");
+        let res = scan(&db, &root, &cfg, &vi, &FsReader::new(), false, None);
+        let _ = tx.send(res);
+    });
+    let scanned = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("scan did not finish within 30 s; a FIFO or socket was likely opened");
+    scanned.unwrap();
 
     let conn = Db::open_readonly(&e.db).unwrap().conn;
     let skipped = queries::all_rows_in_state(&conn, 1, State::Skipped).unwrap();
@@ -778,6 +794,7 @@ fn rescan_root_scoping_leaves_other_roots_untouched() {
 
     let reader1 = FsReader::new();
     let cancel1 = Token::new();
+    let sink1 = dedupe_core::progress::null_sink();
     let svc1 = Services {
         enumr: &walker,
         reader: &reader1,
@@ -785,6 +802,7 @@ fn rescan_root_scoping_leaves_other_roots_untouched() {
         volume: &vi,
         hasher: &hasher,
         cancel: &cancel1,
+        sink: &sink1,
     };
     run_scan(&e.db, &[a.clone(), b.clone()], &cfg, &svc1, &opts).unwrap();
 
@@ -799,6 +817,7 @@ fn rescan_root_scoping_leaves_other_roots_untouched() {
     // Rescan only root A.
     let reader2 = FsReader::new();
     let cancel2 = Token::new();
+    let sink2 = dedupe_core::progress::null_sink();
     let svc2 = Services {
         enumr: &walker,
         reader: &reader2,
@@ -806,6 +825,7 @@ fn rescan_root_scoping_leaves_other_roots_untouched() {
         volume: &vi,
         hasher: &hasher,
         cancel: &cancel2,
+        sink: &sink2,
     };
     run_scan(&e.db, std::slice::from_ref(&a), &cfg, &svc2, &opts).unwrap();
 

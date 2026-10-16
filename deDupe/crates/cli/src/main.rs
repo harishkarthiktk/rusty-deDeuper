@@ -3,6 +3,7 @@
 
 mod db;
 mod lookup;
+mod progress;
 mod report;
 mod scan;
 
@@ -95,6 +96,10 @@ pub struct ScanArgs {
 
     #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
     pub format: OutputFormat,
+
+    /// Draw progress bars on stderr: auto (TTY only), always, or never.
+    #[arg(long, value_enum, default_value_t = progress::ProgressMode::Auto)]
+    pub progress: progress::ProgressMode,
 }
 
 #[derive(Args, Debug)]
@@ -211,6 +216,7 @@ fn init_tracing(level: LogLevel) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_writer(std::io::stderr)
         .try_init();
 }

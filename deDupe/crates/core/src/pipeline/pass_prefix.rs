@@ -14,12 +14,24 @@ use crate::hash::{hash_full, hash_prefix};
 use crate::index::{Index, MemoryIndex, SqliteIndex};
 use crate::model::{ErrRow, ErrorKind, FileEntry, Hash, Phase, State};
 use crate::path::RawPath;
+use crate::progress::{emit_advance, emit_finished, emit_started, PhaseProgress};
 
 use super::{Ctx, PathCache};
 
 pub fn run(ctx: &Ctx, volume_id: i64) -> Result<()> {
     let cfg = ctx.cfg;
     let rows = queries::rows_in_state(ctx.read, volume_id, ctx.run_id, State::SizeCandidate)?;
+    let total = rows.len() as u64;
+    emit_started(
+        ctx.svc.sink,
+        &PhaseProgress {
+            run_id: ctx.run_id,
+            volume_id,
+            phase: Phase::PrefixDone,
+            done: 0,
+            total: Some(total),
+        },
+    );
 
     let mut index = MemoryIndex::new(cfg.mem_budget);
     for (id, h) in queries::rows_with_prefix(ctx.read, volume_id, ctx.run_id)? {
@@ -37,6 +49,9 @@ pub fn run(ctx: &Ctx, volume_id: i64) -> Result<()> {
 
     for (i, r) in rows.iter().enumerate() {
         ctx.svc.cancel.check()?;
+        // Every row index is counted exactly once here, including hardlink
+        // siblings, so the sum of advances equals `total` (= rows.len()).
+        emit_advance(ctx.svc.sink, ctx.run_id, volume_id, 1);
         if rep_of.contains_key(&i) {
             continue; // sibling; hashes copied in the loop below
         }
@@ -107,6 +122,16 @@ pub fn run(ctx: &Ctx, volume_id: i64) -> Result<()> {
         })?;
     }
     ctx.writer.flush()?;
+    emit_finished(
+        ctx.svc.sink,
+        &PhaseProgress {
+            run_id: ctx.run_id,
+            volume_id,
+            phase: Phase::PrefixDone,
+            done: total,
+            total: Some(total),
+        },
+    );
     Ok(())
 }
 

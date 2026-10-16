@@ -1,6 +1,9 @@
 //! `dedupe scan`. Persists by default (`.dedupe.db` under the first root); `--no-db`
 //! runs the naive Phase 0 pipeline with no persistence; `--db` selects an explicit path.
 
+use std::io::IsTerminal;
+use std::sync::{Arc, Mutex};
+
 use anyhow::{Context, Result};
 use dedupe_backend_generic::GenericBackend;
 use dedupe_core::cancel::Token;
@@ -8,8 +11,10 @@ use dedupe_core::config::Config;
 use dedupe_core::hash::Blake3Hasher;
 use dedupe_core::pipeline::scan::{run_scan, ScanOptions};
 use dedupe_core::pipeline::{scan_naive, Services};
+use dedupe_core::progress::SharedSink;
 use dedupe_core::report::Report;
 
+use crate::progress::{should_draw, BarSink};
 use crate::{OutputFormat, ScanArgs};
 
 pub fn run(args: ScanArgs, cancel: &Token) -> Result<()> {
@@ -43,6 +48,17 @@ pub fn run(args: ScanArgs, cancel: &Token) -> Result<()> {
 
     let hasher = Blake3Hasher;
     let backend = GenericBackend::new();
+    // Only the DB path reports progress; `--no-db` (naive) keeps the null sink.
+    let draw = should_draw(
+        args.progress,
+        args.format == OutputFormat::Json,
+        std::io::stderr().is_terminal(),
+    );
+    let sink: SharedSink = if draw {
+        Arc::new(Mutex::new(BarSink::new()))
+    } else {
+        dedupe_core::progress::null_sink()
+    };
     let svc = Services {
         enumr: &backend.enumerator,
         reader: &backend.reader,
@@ -50,6 +66,7 @@ pub fn run(args: ScanArgs, cancel: &Token) -> Result<()> {
         volume: &backend.volume,
         hasher: &hasher,
         cancel,
+        sink: &sink,
     };
 
     match &cfg.db_path {

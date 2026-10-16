@@ -10,11 +10,14 @@ use crate::db::writer::Batch;
 use crate::error::Result;
 use crate::model::{attrs, now_unix_ns, FileEntry, FolderRow, State};
 use crate::path::RawPath;
+use crate::progress::{emit_advance, emit_finished, emit_started, PhaseProgress};
 use crate::traits::{EntryKind, FileMeta, WalkItem};
 
 use super::{rescan, Ctx, VolumeScan};
 
 const BATCH: usize = 5_000;
+/// Walk progress is reported every this many accepted rows (not per entry).
+const PROGRESS_CHUNK: u64 = 1_024;
 
 /// Returns the root folder ids for this volume (for stale deletion scoping).
 pub fn run(ctx: &Ctx, v: &VolumeScan) -> Result<Vec<i64>> {
@@ -41,6 +44,19 @@ pub fn run(ctx: &Ctx, v: &VolumeScan) -> Result<Vec<i64>> {
     let mut seen_ids: HashSet<i64> = HashSet::new();
     let mut claimed_inodes: HashSet<Vec<u8>> = HashSet::new();
     let mut root_folder_ids: Vec<i64> = Vec::new();
+    // Accepted file rows so far; reported to the sink in chunks of 1024.
+    let mut accepted: u64 = 0;
+
+    emit_started(
+        ctx.svc.sink,
+        &PhaseProgress {
+            run_id: ctx.run_id,
+            volume_id: v.volume_id,
+            phase: crate::model::Phase::Enumerated,
+            done: 0,
+            total: None,
+        },
+    );
 
     // The volume mount root is folder(volume, parent=0, name='').
     let mount_root = ensure_folder(ctx, v.volume_id, 0, &RawPath::empty(), &mut folders_out)?;
@@ -92,6 +108,10 @@ pub fn run(ctx: &Ctx, v: &VolumeScan) -> Result<Vec<i64>> {
                         &mut claimed_inodes,
                     )?;
                     files_out.push(entry);
+                    accepted += 1;
+                    if accepted % PROGRESS_CHUNK == 0 {
+                        emit_advance(ctx.svc.sink, ctx.run_id, v.volume_id, PROGRESS_CHUNK);
+                    }
                     if files_out.len() >= BATCH || folders_out.len() >= BATCH {
                         flush_folders(ctx, &mut folders_out)?;
                         flush_files(ctx, &mut files_out)?;
@@ -105,6 +125,12 @@ pub fn run(ctx: &Ctx, v: &VolumeScan) -> Result<Vec<i64>> {
     flush_folders(ctx, &mut folders_out)?;
     flush_files(ctx, &mut files_out)?;
 
+    // Report the remainder that did not fill a whole chunk.
+    let remainder = accepted % PROGRESS_CHUNK;
+    if remainder > 0 {
+        emit_advance(ctx.svc.sink, ctx.run_id, v.volume_id, remainder);
+    }
+
     // Phase marker: shares the txn with the last rows.
     ctx.writer.send(Batch::PhaseComplete {
         run_id: ctx.run_id,
@@ -112,6 +138,16 @@ pub fn run(ctx: &Ctx, v: &VolumeScan) -> Result<Vec<i64>> {
         phase: crate::model::Phase::Enumerated,
     })?;
     ctx.writer.flush()?;
+    emit_finished(
+        ctx.svc.sink,
+        &PhaseProgress {
+            run_id: ctx.run_id,
+            volume_id: v.volume_id,
+            phase: crate::model::Phase::Enumerated,
+            done: accepted,
+            total: Some(accepted),
+        },
+    );
 
     // Stale deletion after enumeration is committed (4.7a step 2).
     rescan::delete_stale(ctx, v.volume_id, &root_folder_ids)?;
