@@ -1,4 +1,5 @@
 /target
+/.todo
 **/*.rs.bk
 *.db
 *.db-wal

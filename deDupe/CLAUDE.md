@@ -94,7 +94,7 @@ cargo run -p dedupe-bench --release -- [rows]
 - Do not add `unsafe` or `cfg(target_os)` to `core`. Put platform code in a backend crate behind a trait.
 - Several source comments point to `.plan.md` (7 references in 5 files). That file was renamed to `../.overall_plan.md`, and the section numbers in those comments may not match the current plan.
 - `file_id` is `None` on Windows until the Windows backend lands, so there is no hardlink collapse or move detection there.
-- `--verify` is not wired to the CLI yet (plan Phase 2). `pass_verify` only advances the phase.
+- `--verify` is not wired to the CLI yet (plan P2.7). `pass_verify` is implemented (core only, enabled via `Config.verify = Byte`; untested): state 3 -> 4, mismatch -> -2.
 - `scale.rs` and `kill_fuzz.rs` tests are `#[ignore]`. Plain `cargo test` skips them.
 - The hash is BLAKE3 truncated to 128 bits (`blake3-128`).
 

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{Config, VerifyMode};
 use crate::db::ids::IdAllocator;
-use crate::db::writer::spawn_writer;
+use crate::db::writer::{spawn_writer, Batch};
 use crate::db::{self, queries};
 use crate::error::Result;
 use crate::model::{now_unix_ns, Phase};
@@ -130,6 +130,15 @@ pub fn run_scan(
                 stopped = true;
                 break;
             }
+        }
+        // Runs even when pass_full was skipped on resume, so rows an interrupted
+        // verify-on run left in state 3 do not stay there. Before groups recompute.
+        if cfg.verify != VerifyMode::Byte {
+            ctx.writer.send(Batch::PromotePending {
+                volume_id: v.volume_id,
+                run_id,
+            })?;
+            ctx.writer.flush()?;
         }
         if cfg.verify == VerifyMode::Byte && phase < Phase::Verified {
             pass_verify::run(&ctx, v.volume_id)?;

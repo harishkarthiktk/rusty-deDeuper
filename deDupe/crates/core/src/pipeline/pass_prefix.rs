@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use crate::config::VerifyMode;
 use crate::db::queries;
 use crate::db::writer::Batch;
 use crate::error::Result;
@@ -84,8 +85,15 @@ pub fn run(ctx: &Ctx, volume_id: i64) -> Result<()> {
         index.insert(*h, *id)?;
     }
 
+    // Under --verify=byte, small files wait in state 3 for pass_verify.
+    let small_batch = if cfg.verify == VerifyMode::Byte {
+        Batch::HashedPending(small)
+    } else {
+        Batch::Hashed(small)
+    };
+
     if index.over_budget() {
-        ctx.writer.send(Batch::Hashed(small))?;
+        ctx.writer.send(small_batch)?;
         ctx.writer.send(Batch::PrefixHashed(large.clone()))?;
         send_errors(ctx, &mut errors)?;
         ctx.writer.send(Batch::PhaseComplete {
@@ -111,7 +119,7 @@ pub fn run(ctx: &Ctx, volume_id: i64) -> Result<()> {
                 unique.push((*id, *h));
             }
         }
-        ctx.writer.send(Batch::Hashed(small))?;
+        ctx.writer.send(small_batch)?;
         ctx.writer.send(Batch::PrefixHashed(partnered))?;
         ctx.writer.send(Batch::UniquePrefix(unique))?;
         send_errors(ctx, &mut errors)?;

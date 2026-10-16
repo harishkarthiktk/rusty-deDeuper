@@ -22,7 +22,18 @@ pub enum Batch {
     UniquePrefix(Vec<(i64, Hash)>),
     Hashed(Vec<(i64, Hash, Hash)>),
     FullHashed(Vec<(i64, Hash)>),
+    /// Like `FullHashed` but lands in state 3 (awaiting byte verify). Only sent when verify == Byte.
+    FullHashedPending(Vec<(i64, Hash)>),
+    /// Like `Hashed` (small files, prefix+full together) but lands in state 3.
+    /// Only sent when verify == Byte.
+    HashedPending(Vec<(i64, Hash, Hash)>),
     Verified(Vec<i64>),
+    /// Move this run's leftover state-3 rows to state 5. Sent only when verify is
+    /// off: a verify-on run interrupted after full hash leaves them in 3.
+    PromotePending {
+        volume_id: i64,
+        run_id: i64,
+    },
     Error(Vec<ErrRow>),
     PhaseComplete {
         run_id: i64,
@@ -52,10 +63,12 @@ impl Batch {
             Batch::Enumerated(v) => v.len(),
             Batch::SizeCandidate(v) | Batch::UniqueSize(v) | Batch::Verified(v) => v.len(),
             Batch::PrefixHashed(v) | Batch::UniquePrefix(v) | Batch::FullHashed(v) => v.len(),
-            Batch::Hashed(v) => v.len(),
+            Batch::Hashed(v) | Batch::HashedPending(v) => v.len(),
+            Batch::FullHashedPending(v) => v.len(),
             Batch::Error(v) => v.len(),
             Batch::PhaseComplete { .. }
             | Batch::DeleteStale { .. }
+            | Batch::PromotePending { .. }
             | Batch::Checkpoint
             | Batch::Flush(_)
             | Batch::Shutdown => 0,
@@ -293,6 +306,15 @@ fn apply(tx: &Transaction<'_>, b: Batch, prefix_total: i64) -> Result<(), CoreEr
                 stmt.execute(params![p.as_bytes(), f.as_bytes(), id, prefix_total])?;
             }
         }
+        Batch::HashedPending(items) => {
+            let mut stmt = tx.prepare_cached(
+                "UPDATE files SET prefix_hash=?1, full_hash=?2, \
+                 prefix_bytes=CASE WHEN size<=?4 THEN size ELSE ?4 END, state=3 WHERE id=?3",
+            )?;
+            for (id, p, f) in items {
+                stmt.execute(params![p.as_bytes(), f.as_bytes(), id, prefix_total])?;
+            }
+        }
         Batch::FullHashed(items) => {
             let mut stmt =
                 tx.prepare_cached("UPDATE files SET full_hash=?1, state=5 WHERE id=?2")?;
@@ -300,11 +322,24 @@ fn apply(tx: &Transaction<'_>, b: Batch, prefix_total: i64) -> Result<(), CoreEr
                 stmt.execute(params![h.as_bytes(), id])?;
             }
         }
+        Batch::FullHashedPending(items) => {
+            let mut stmt =
+                tx.prepare_cached("UPDATE files SET full_hash=?1, state=3 WHERE id=?2")?;
+            for (id, h) in items {
+                stmt.execute(params![h.as_bytes(), id])?;
+            }
+        }
         Batch::Verified(ids) => {
-            let mut stmt = tx.prepare_cached("UPDATE files SET state=5 WHERE id=?1 AND state=3")?;
+            let mut stmt = tx.prepare_cached("UPDATE files SET state=4 WHERE id=?1 AND state=3")?;
             for id in ids {
                 stmt.execute([id])?;
             }
+        }
+        Batch::PromotePending { volume_id, run_id } => {
+            tx.prepare_cached(
+                "UPDATE files SET state=5 WHERE volume_id=?1 AND last_seen_run_id=?2 AND state=3",
+            )?
+            .execute(params![volume_id, run_id])?;
         }
         Batch::Error(rows) => {
             let mut set_err = tx.prepare_cached("UPDATE files SET state=-2, err=?1 WHERE id=?2")?;

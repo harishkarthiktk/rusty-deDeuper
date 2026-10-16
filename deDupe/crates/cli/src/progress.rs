@@ -1,11 +1,12 @@
-//! Terminal progress for `dedupe scan`. Counting happens in `core`; this module only draws.
-//! Output goes to stderr so stdout stays a clean report.
+//! Terminal progress for `dedupe scan` and `dedupe report`. Counting happens in `core`;
+//! this module only draws. Output goes to stderr so stdout stays a clean report.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use dedupe_core::model::Phase;
 use dedupe_core::progress::{PhaseProgress, Sink};
+use dedupe_core::report::ReportEvent;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 /// `--progress` flag: when to draw progress on stderr.
@@ -109,6 +110,47 @@ impl Sink for BarSink {
 
     fn message(&mut self, msg: &str) {
         let _ = self.multi.println(msg);
+    }
+}
+
+fn report_bar_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{spinner:.green} Building report {pos}/{len} groups [{elapsed_precise}]",
+    )
+    .unwrap_or_else(|_| ProgressStyle::default_bar())
+}
+
+/// Spinner until the candidate count is known, then a counter, for `dedupe report`.
+pub struct ReportBar {
+    bar: ProgressBar,
+}
+
+impl ReportBar {
+    pub fn new() -> Self {
+        let bar = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr())
+            .with_style(spinner_style())
+            .with_prefix("Building report");
+        bar.enable_steady_tick(Duration::from_millis(120));
+        Self { bar }
+    }
+
+    pub fn on_event(&mut self, ev: ReportEvent) {
+        match ev {
+            ReportEvent::Volume { groups, .. } => {
+                self.bar.set_style(report_bar_style());
+                self.bar.set_length(groups);
+                self.bar.set_position(0);
+            }
+            ReportEvent::Group { done } => self.bar.set_position(done),
+            ReportEvent::Done => self.bar.finish_and_clear(),
+        }
+    }
+}
+
+impl Drop for ReportBar {
+    /// Clears the line on error or cancellation, so the error message prints cleanly.
+    fn drop(&mut self) {
+        self.bar.finish_and_clear();
     }
 }
 

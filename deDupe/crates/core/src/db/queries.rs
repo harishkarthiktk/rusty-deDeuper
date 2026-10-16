@@ -1,6 +1,8 @@
 //! Typed query helpers. All take a `&Connection` so they work on the writer thread,
 //! the pipeline's read connection, or a test fixture.
 
+use std::collections::HashMap;
+
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::error::Result;
@@ -496,6 +498,97 @@ fn separator_for(mount: &[u8]) -> u8 {
     }
 }
 
+/// Memoizes folder paths for one volume, so a report reads each folder row once.
+///
+/// Build one per volume: the mount is looked up on the first walk and reused for
+/// the life of the cache. Results match [`reconstruct_file_path`] exactly.
+#[derive(Default)]
+pub struct PathCache {
+    /// Folder id to absolute folder path, filled as chains are walked.
+    dirs: HashMap<i64, RawPath>,
+    /// Volume mount, loaded on the first walk that reaches the volume root.
+    mount: Option<RawPath>,
+}
+
+impl PathCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Full path for a file: cached folder path plus `name`.
+    pub fn file_path(
+        &mut self,
+        conn: &Connection,
+        folder_id: i64,
+        name: &RawPath,
+    ) -> Result<RawPath> {
+        if let Some(dir) = self.dirs.get(&folder_id) {
+            return Ok(dir.join_component(name.as_bytes()));
+        }
+        let dir = self.walk(conn, folder_id)?;
+        Ok(dir.join_component(name.as_bytes()))
+    }
+
+    /// Walks up to the nearest cached ancestor or the volume root (one single-row
+    /// lookup per uncached folder), then fills the cache top-down.
+    fn walk(&mut self, conn: &Connection, folder_id: i64) -> Result<RawPath> {
+        let mut chain: Vec<(i64, Vec<u8>)> = Vec::new(); // (folder id, name), leaf first
+        let mut volume_id = None;
+        let mut cur = folder_id;
+        let base = loop {
+            if let Some(cached) = self.dirs.get(&cur) {
+                break Some(cached.clone());
+            }
+            let Some((parent_id, name, vol)) = folder_row(conn, cur)? else {
+                break None;
+            };
+            chain.push((cur, name));
+            volume_id = Some(vol);
+            cur = parent_id;
+        };
+        // An unknown folder id has no volume; mirror reconstruct_path's error.
+        let volume_id = volume_id.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        let mount = self.volume_mount(conn, volume_id)?;
+        let sep = separator_for(mount.as_bytes());
+        let mut out = base.unwrap_or(mount).0;
+        for (id, name) in chain.iter().rev() {
+            if !name.is_empty() {
+                if !out.is_empty() && !out.ends_with(&[sep]) {
+                    out.push(sep);
+                }
+                out.extend_from_slice(name);
+            }
+            self.dirs.insert(*id, RawPath::new(out.clone()));
+        }
+        Ok(RawPath::new(out))
+    }
+
+    fn volume_mount(&mut self, conn: &Connection, volume_id: i64) -> Result<RawPath> {
+        if let Some(m) = &self.mount {
+            return Ok(m.clone());
+        }
+        let mut stmt = conn.prepare_cached("SELECT mount FROM volumes WHERE id=?1")?;
+        let m = RawPath::new(stmt.query_row([volume_id], |r| r.get::<_, Vec<u8>>(0))?);
+        self.mount = Some(m.clone());
+        Ok(m)
+    }
+}
+
+/// `(parent_id, name, volume_id)` for one folder row, or `None` if no such folder.
+fn folder_row(conn: &Connection, folder_id: i64) -> Result<Option<(i64, Vec<u8>, i64)>> {
+    let mut stmt =
+        conn.prepare_cached("SELECT parent_id,name,volume_id FROM folders WHERE id=?1")?;
+    Ok(stmt
+        .query_row([folder_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })
+        .optional()?)
+}
+
 // ---------------------------------------------------------------------------
 // dup_groups
 // ---------------------------------------------------------------------------
@@ -547,6 +640,26 @@ pub fn list_groups(conn: &Connection, volume_id: i64, min_wasted: i64) -> Result
     Ok(rows)
 }
 
+/// Group count and summed `wasted_logical` for a volume, counting only groups that
+/// [`volume_group_members`] would list for `run_id`: at least `min_wasted` wasted bytes
+/// and at least two member rows from that run. Both are zero when no group matches.
+pub fn group_totals(
+    conn: &Connection,
+    volume_id: i64,
+    run_id: i64,
+    min_wasted: i64,
+) -> Result<(i64, i64)> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(g.wasted_logical),0) FROM dup_groups g \
+         WHERE g.volume_id=?1 AND g.wasted_logical>=?2 \
+         AND (SELECT COUNT(*) FROM files f \
+              WHERE f.volume_id=g.volume_id AND f.full_hash=g.full_hash \
+              AND f.state IN (3,4,5) AND f.last_seen_run_id=?3) >= 2",
+        params![volume_id, min_wasted, run_id],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+    )?)
+}
+
 /// Members of a group (paths), restricted to the latest run for the volume.
 pub fn group_members(
     conn: &Connection,
@@ -566,6 +679,39 @@ pub fn group_members(
                 r.get::<_, i64>(1)?,
                 RawPath::new(r.get::<_, Vec<u8>>(2)?),
                 r.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// One member row from [`volume_group_members`]: `(full_hash, file row id, folder_id, name, size)`.
+pub type GroupMemberRow = (Hash, i64, i64, RawPath, i64);
+
+/// Members of every group on a volume in one pass, ordered by hash then file row id.
+/// Same filters as [`group_members`], applied to the groups [`list_groups`] would return.
+pub fn volume_group_members(
+    conn: &Connection,
+    volume_id: i64,
+    run_id: i64,
+    min_wasted: i64,
+) -> Result<Vec<GroupMemberRow>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT g.full_hash, f.id, f.folder_id, f.name, f.size FROM dup_groups g \
+         JOIN files f ON f.volume_id=g.volume_id AND f.full_hash=g.full_hash \
+         WHERE g.volume_id=?1 AND g.wasted_logical>=?2 \
+         AND f.full_hash IS NOT NULL AND f.state IN (3,4,5) AND f.last_seen_run_id=?3 \
+         ORDER BY g.full_hash, f.id",
+    )?;
+    let rows = stmt
+        .query_map(params![volume_id, min_wasted, run_id], |r| {
+            let h: Vec<u8> = r.get(0)?;
+            Ok((
+                Hash::from_slice(&h).unwrap_or(Hash([0; 16])),
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                RawPath::new(r.get::<_, Vec<u8>>(3)?),
+                r.get::<_, i64>(4)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;

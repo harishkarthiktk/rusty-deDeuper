@@ -54,7 +54,7 @@ By default, the results are saved to a database named `.dedupe.db` inside the fi
 | `--force` | Ignore safety checks when the database does not match the current settings or the disk. Use with care. |
 | `--cross-mounts` | Also descend into other mounted drives. Off by default. |
 | `--include-placeholders` | Include cloud-only files (for example, OneDrive or iCloud placeholders). Off by default, because reading them downloads the file. |
-| `--mem-budget <BYTES>` | Memory budget for the in-memory working set. |
+| `--mem-budget <SIZE>` | Memory budget for the in-memory working set. Accepts bytes or a unit, such as `512MiB` or `1GiB`. |
 | `--format <human\|json>` | Output format. Default: `human`. |
 | `--progress <auto\|always\|never>` | Progress bar on stderr. Default: `auto` (shown only in a terminal). |
 
@@ -81,8 +81,30 @@ Prints the duplicate groups from the last completed scan. It reads the database 
 | Option | What it does |
 |---|---|
 | `--db <PATH>` | Read this database. Default: `./.dedupe.db` in the current folder. |
-| `--min-wasted <BYTES>` | Hide groups that waste less than this many bytes. |
+| `--min-wasted <SIZE>` | Hide groups that waste less than this size. Accepts a plain byte count or a size with a unit, such as `10MB` or `1.5GiB`. |
 | `--format <human\|json>` | Output format. |
+| `--progress <auto\|always\|never>` | Draw a progress bar on stderr while the report is built. `auto` draws only on a terminal and never with `--format json`. |
+
+Human output streams group by group as it is built, so large databases show results immediately. Press Ctrl-C to cancel.
+
+`--min-wasted` is a per-group threshold. A group wastes `size × (copies − 1)`, counted by logical size. For example, a 5 MB file with 3 copies wastes 10 MB.
+
+Accepted units (case-insensitive, optional space before the unit):
+
+| Unit | Meaning | Bytes |
+|---|---|---|
+| none or `B` | bytes | 1 |
+| `KB`, `MB`, `GB`, `TB` | decimal (powers of 1000) | 1,000 / 1,000,000 / 1,000,000,000 / 1,000,000,000,000 |
+| `KiB`, `MiB`, `GiB`, `TiB` | binary (powers of 1024) | 1,024 / 1,048,576 / 1,073,741,824 / 1,099,511,627,776 |
+
+Fractions work with a unit (`1.5GB`). The result is rounded down to whole bytes. Bare `K`, `M`, `G`, `T` are rejected as ambiguous.
+
+```bash
+dedupe report --min-wasted 10MB       # 10,000,000 bytes
+dedupe report --min-wasted 1MiB       # 1,048,576 bytes
+dedupe report --min-wasted 1.5GiB
+dedupe report --min-wasted 1048576    # plain bytes still work
+```
 
 Example output (values are illustrative):
 
@@ -156,7 +178,7 @@ Log verbosity is a global option: `dedupe --log-level debug scan ~/Pictures`. Le
 
 ```bash
 dedupe scan ~/Photos --db ~/photo-index.db    # once, or after big changes
-dedupe report --db ~/photo-index.db --min-wasted 1048576   # groups wasting 1 MiB or more
+dedupe report --db ~/photo-index.db --min-wasted 1MiB   # groups wasting 1 MiB or more
 dedupe lookup ~/Downloads/new-photo.jpg --db ~/photo-index.db --insert
 ```
 

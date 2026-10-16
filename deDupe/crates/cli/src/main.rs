@@ -6,6 +6,7 @@ mod lookup;
 mod progress;
 mod report;
 mod scan;
+mod size;
 
 use std::path::PathBuf;
 
@@ -85,8 +86,8 @@ pub struct ScanArgs {
     #[arg(long)]
     pub include_placeholders: bool,
 
-    /// Budget for the in-memory maps, in bytes.
-    #[arg(long)]
+    /// Budget for the in-memory maps (bytes, or e.g. 512MiB, 1GiB).
+    #[arg(long, value_parser = size::parse_size)]
     pub mem_budget: Option<u64>,
 
     /// Test hook: stop right after committing phase N.
@@ -111,9 +112,13 @@ pub struct ReportArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
     pub format: OutputFormat,
 
-    /// Hide groups whose logical waste is below this many bytes.
-    #[arg(long, default_value_t = 0)]
+    /// Hide groups whose logical waste is below this size (bytes, or e.g. 10MB, 1.5GiB).
+    #[arg(long, default_value_t = 0, value_parser = size::parse_size_i64)]
     pub min_wasted: i64,
+
+    /// Draw progress bars on stderr: auto (TTY only), always, or never.
+    #[arg(long, value_enum, default_value_t = progress::ProgressMode::Auto)]
+    pub progress: progress::ProgressMode,
 }
 
 #[derive(Args, Debug)]
@@ -199,7 +204,7 @@ fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Cmd::Scan(args) => scan::run(args, &token),
-        Cmd::Report(args) => report::run(args),
+        Cmd::Report(args) => report::run(args, &token),
         Cmd::Lookup(args) => lookup::run(args),
         Cmd::Db(args) => db::run(args),
     }

@@ -110,13 +110,17 @@ impl State {
 }
 
 /// Whether `from -> to` is a legal transition within a run (4.4). Includes the
-/// merged-pass exception `SizeCandidate -> Done` (small files / HDD merged pass).
+/// merged-pass exceptions `SizeCandidate -> Done` (small files / HDD merged pass) and
+/// `SizeCandidate -> FullHashed` (small files under `VerifyMode::Byte`).
 pub fn is_legal_transition(from: State, to: State) -> bool {
     use State::*;
     match from {
         Enumerated => matches!(to, SizeCandidate | UniqueSize | Skipped | Error),
         SizeCandidate => {
-            matches!(to, PrefixHashed | UniquePrefix | Done | Skipped | Error)
+            matches!(
+                to,
+                PrefixHashed | UniquePrefix | FullHashed | Done | Skipped | Error
+            )
         }
         PrefixHashed => matches!(to, FullHashed | Done | Skipped | Error),
         FullHashed => matches!(to, Verified | Done | Error),
@@ -287,6 +291,7 @@ pub enum ErrorKind {
     TooLong = 2,
     ChangedDuringRead = 3,
     Other = 4,
+    VerifyMismatch = 5,
 }
 
 impl ErrorKind {

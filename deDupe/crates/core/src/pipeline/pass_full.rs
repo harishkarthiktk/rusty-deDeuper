@@ -1,6 +1,8 @@
 //! `pass_full`: full-hash every prefix survivor (state 2). Without `--verify`,
-//! the file lands in state 5 directly (3 is transient).
+//! the file lands in state 5 directly (3 is transient). With `--verify=byte`
+//! it stops in state 3 until `pass_verify`.
 
+use crate::config::VerifyMode;
 use crate::db::queries;
 use crate::db::writer::Batch;
 use crate::error::Result;
@@ -51,7 +53,12 @@ pub fn run(ctx: &Ctx, volume_id: i64) -> Result<()> {
         }
     }
 
-    ctx.writer.send(Batch::FullHashed(hashed))?;
+    let full_batch = if ctx.cfg.verify == VerifyMode::Byte {
+        Batch::FullHashedPending(hashed)
+    } else {
+        Batch::FullHashed(hashed)
+    };
+    ctx.writer.send(full_batch)?;
     if !errors.is_empty() {
         ctx.writer.send(Batch::Error(errors))?;
     }
