@@ -1,0 +1,12 @@
+name: nightly
+on:
+  schedule: [{ cron: "0 3 * * *" }]
+  workflow_dispatch:
+jobs:
+  kill-fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p dedupe --test kill_fuzz -- --ignored
