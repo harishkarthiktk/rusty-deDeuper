@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use crate::hash::HASH_ALGO;
+use crate::storage_profile::Profile;
 
 /// Whether `pass_verify` runs. `Byte` lands in Phase 2; Phase 1 only knows `Off`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -31,6 +32,10 @@ pub struct Config {
     pub force: bool,
     /// `meta.hash_algo`.
     pub hash_algo: String,
+    /// Resolved I/O policy. The CLI probes storage and sets this; the default is
+    /// the SSD policy. Not part of the hash-config guard, since it does not change
+    /// hash output.
+    pub profile: Profile,
 }
 
 impl Default for Config {
@@ -45,6 +50,7 @@ impl Default for Config {
             verify: VerifyMode::Off,
             force: false,
             hash_algo: HASH_ALGO.to_string(),
+            profile: Profile::default(),
         }
     }
 }

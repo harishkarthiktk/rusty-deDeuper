@@ -118,9 +118,11 @@ impl Report {
             })?;
         }
         on(ReportEvent::Done);
+        let files_enumerated = usize::try_from(queries::total_files(conn)?)
+            .map_err(|_| CoreError::Other("negative file count".into()))?;
         let mut report = Report {
             groups,
-            files_enumerated: queries::total_files(conn)? as usize,
+            files_enumerated,
             files_skipped: 0,
             files_errored: 0,
         };
@@ -159,12 +161,12 @@ impl Report {
         }
         // Reused for each block so a group is one write to `out`.
         let mut line = String::new();
-        write_header(&mut line, count, wasted).map_err(fmt_error)?;
+        write_header(&mut line, count, wasted).expect("writing to a String cannot fail");
         out.write_all(line.as_bytes())?;
         for (volume_id, run_id) in volumes {
             for_each_group(conn, volume_id, run_id, min_wasted, cancel, on, |g| {
                 line.clear();
-                write_group(&mut line, &g).map_err(fmt_error)?;
+                write_group(&mut line, &g).expect("writing to a String cannot fail");
                 out.write_all(line.as_bytes())?;
                 Ok(())
             })?;
@@ -266,9 +268,4 @@ fn write_group<W: std::fmt::Write>(out: &mut W, g: &Group) -> std::fmt::Result {
         writeln!(out, "    {}", m.path.to_display())?;
     }
     Ok(())
-}
-
-/// Maps a formatting failure from [`write_group`] into the crate error type.
-fn fmt_error(e: std::fmt::Error) -> CoreError {
-    CoreError::Other(format!("report formatting failed: {e}"))
 }

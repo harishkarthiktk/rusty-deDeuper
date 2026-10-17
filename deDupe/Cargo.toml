@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/backend-generic",
+    "crates/backend-windows",
     "crates/cli",
     "crates/tui",
     "bench",
@@ -12,12 +13,13 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.83"
 license = "MIT OR Apache-2.0"
 repository = "https://example.invalid/dedupe"
 
 [workspace.lints.clippy]
 all = "deny"
+perf = "deny"
 
 [workspace.dependencies]
 # runtime
@@ -36,6 +38,7 @@ indicatif = "0.17"
 # backend FFI
 rustix = { version = "0.38", features = ["fs", "system"] }
 libc = "0.2"
+windows-sys = "0.59"
 
 # dev
 proptest = "1.5"

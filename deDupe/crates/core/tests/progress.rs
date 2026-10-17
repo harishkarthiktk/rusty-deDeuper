@@ -82,13 +82,24 @@ impl Sink for CountingSink {
 struct Codec;
 
 impl PathCodec for Codec {
+    #[cfg(unix)]
     fn to_raw(&self, path: &OsStr) -> RawPath {
         use std::os::unix::ffi::OsStrExt;
         RawPath::new(path.as_bytes().to_vec())
     }
+    // Windows names are UTF-16; the test fixtures only use UTF-8 names there.
+    #[cfg(windows)]
+    fn to_raw(&self, path: &OsStr) -> RawPath {
+        RawPath::new(path.to_string_lossy().as_bytes().to_vec())
+    }
+    #[cfg(unix)]
     fn to_native(&self, path: &RawPath) -> OsString {
         use std::os::unix::ffi::OsStringExt;
         OsString::from_vec(path.0.clone())
+    }
+    #[cfg(windows)]
+    fn to_native(&self, path: &RawPath) -> OsString {
+        OsString::from(String::from_utf8_lossy(&path.0).into_owned())
     }
     fn split_component(&self, path: &Path) -> (RawPath, RawPath) {
         let parent = path
@@ -135,8 +146,19 @@ fn recurse(dir: &Path, visit: &mut dyn FnMut(WalkItem) -> Result<()>) -> Result<
     Ok(())
 }
 
-fn to_meta(md: &fs::Metadata) -> FileMeta {
+/// Inode and link count. Windows has no stable inode here, so no hardlink collapse.
+#[cfg(unix)]
+fn inode_and_links(md: &fs::Metadata) -> (Option<Vec<u8>>, i64) {
     use std::os::unix::fs::MetadataExt;
+    (Some(md.ino().to_le_bytes().to_vec()), md.nlink() as i64)
+}
+
+#[cfg(not(unix))]
+fn inode_and_links(_md: &fs::Metadata) -> (Option<Vec<u8>>, i64) {
+    (None, 1)
+}
+
+fn to_meta(md: &fs::Metadata) -> FileMeta {
     let ft = md.file_type();
     let kind = if ft.is_file() {
         EntryKind::RegularFile
@@ -145,9 +167,9 @@ fn to_meta(md: &fs::Metadata) -> FileMeta {
     } else {
         EntryKind::Other
     };
-    let nlink = md.nlink() as i64;
+    let (file_id, nlink) = inode_and_links(md);
     FileMeta {
-        file_id: Some(md.ino().to_le_bytes().to_vec()),
+        file_id,
         nlink,
         size: md.len() as i64,
         mtime_ns: md
@@ -162,13 +184,25 @@ fn to_meta(md: &fs::Metadata) -> FileMeta {
     }
 }
 
+/// Positional read with no shared cursor. `pread` on unix, `seek_read` on Windows.
+#[cfg(unix)]
+fn pread(f: &fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    f.read_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn pread(f: &fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    f.seek_read(buf, offset)
+}
+
 struct Reader;
 
 impl ContentReader for Reader {
     fn read_at(&self, path: &Path, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        use std::os::unix::fs::FileExt;
         let f = fs::File::open(path)?;
-        Ok(f.read_at(buf, offset)?)
+        Ok(pread(&f, buf, offset)?)
     }
     fn metadata(&self, path: &Path) -> Result<FileMeta> {
         Ok(to_meta(&fs::symlink_metadata(path)?))

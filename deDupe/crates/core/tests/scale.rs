@@ -17,7 +17,9 @@ use dedupe_core::config::Config;
 use dedupe_core::db::Db;
 use dedupe_core::error::Result;
 use dedupe_core::hash::Blake3Hasher;
-use dedupe_core::model::{attrs, FsType, UuidKind};
+#[cfg(unix)]
+use dedupe_core::model::attrs;
+use dedupe_core::model::{FsType, UuidKind};
 use dedupe_core::path::RawPath;
 use dedupe_core::pipeline::scan::{run_scan, ScanOptions};
 use dedupe_core::pipeline::Services;
@@ -31,13 +33,24 @@ use dedupe_core::traits::*;
 struct Codec;
 
 impl PathCodec for Codec {
+    #[cfg(unix)]
     fn to_raw(&self, path: &OsStr) -> RawPath {
         use std::os::unix::ffi::OsStrExt;
         RawPath::new(path.as_bytes().to_vec())
     }
+    // Windows names are UTF-16; the test fixtures only use UTF-8 names there.
+    #[cfg(windows)]
+    fn to_raw(&self, path: &OsStr) -> RawPath {
+        RawPath::new(path.to_string_lossy().as_bytes().to_vec())
+    }
+    #[cfg(unix)]
     fn to_native(&self, path: &RawPath) -> OsString {
         use std::os::unix::ffi::OsStringExt;
         OsString::from_vec(path.0.clone())
+    }
+    #[cfg(windows)]
+    fn to_native(&self, path: &RawPath) -> OsString {
+        OsString::from(String::from_utf8_lossy(&path.0).into_owned())
     }
     fn split_component(&self, path: &Path) -> (RawPath, RawPath) {
         let parent = path
@@ -143,6 +156,19 @@ fn to_meta(md: &fs::Metadata) -> FileMeta {
     }
 }
 
+/// Positional read with no shared cursor. `pread` on unix, `seek_read` on Windows.
+#[cfg(unix)]
+fn pread(f: &fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    f.read_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn pread(f: &fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    f.seek_read(buf, offset)
+}
+
 struct FsReader {
     opens: AtomicU64,
 }
@@ -157,10 +183,9 @@ impl FsReader {
 
 impl ContentReader for FsReader {
     fn read_at(&self, path: &Path, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        use std::os::unix::fs::FileExt;
         let f = fs::File::open(path)?;
         self.opens.fetch_add(1, Ordering::Relaxed);
-        Ok(f.read_at(buf, offset)?)
+        Ok(pread(&f, buf, offset)?)
     }
     fn metadata(&self, path: &Path) -> Result<FileMeta> {
         let md = fs::symlink_metadata(path)?;

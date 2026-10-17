@@ -35,6 +35,22 @@ pub fn parse_size_i64(s: &str) -> Result<i64, String> {
     i64::try_from(v).map_err(|_| format!("size '{s}' is too large"))
 }
 
+/// Upper bound for `--buf-size`. Caps the buffer each read allocates, so a mistyped
+/// size such as `1GiB` cannot multiply across hash workers.
+const MAX_BUF_SIZE: u64 = 64 * 1024 * 1024;
+
+/// clap value_parser for `--buf-size`: a size in `1..=64MiB`.
+pub fn parse_buf_size(s: &str) -> Result<u64, String> {
+    let bytes = parse_size(s)?;
+    if bytes == 0 {
+        return Err(format!("buffer size '{s}' must be at least 1 byte"));
+    }
+    if bytes > MAX_BUF_SIZE {
+        return Err(format!("buffer size '{s}' exceeds the 64MiB limit"));
+    }
+    Ok(bytes)
+}
+
 /// Byte multiplier for a size suffix, case-insensitive. Bare k/m/g/t are rejected.
 fn suffix_multiplier(suffix: &str) -> Option<u64> {
     match suffix.to_ascii_lowercase().as_str() {
@@ -56,4 +72,37 @@ fn invalid_size(s: &str) -> String {
     format!(
         "invalid size '{s}': expected a number with optional suffix B, KB, MB, GB, TB, KiB, MiB, GiB, TiB"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_buf_size;
+
+    #[test]
+    fn parse_buf_size_should_reject_zero() {
+        let result = parse_buf_size("0");
+        assert!(
+            result.is_err(),
+            "buffer size '0' should be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_buf_size_should_reject_above_64_mib() {
+        let result = parse_buf_size("65MiB");
+        assert!(
+            result.is_err(),
+            "buffer size '65MiB' should be rejected as above 64MiB, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_buf_size_should_accept_1mib() {
+        let result = parse_buf_size("1MiB");
+        assert_eq!(
+            result,
+            Ok(1 << 20),
+            "buffer size '1MiB' should parse to 1048576 bytes, got {result:?}"
+        );
+    }
 }

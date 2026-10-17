@@ -7,7 +7,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::error::Result;
 use crate::model::{now_unix_ns, ErrRow, FileEntry, FolderRow, Hash, Phase, State};
-use crate::path::RawPath;
+use crate::path::{separator_for, RawPath};
 use crate::traits::VolumeInfo;
 
 const FILE_COLS: &str = "id,volume_id,folder_id,name,file_id,nlink,size,mtime_ns,ctime_ns,\
@@ -488,14 +488,6 @@ pub fn reconstruct_path(conn: &Connection, folder_id: i64) -> Result<RawPath> {
         out.extend_from_slice(&n);
     }
     Ok(RawPath::new(out))
-}
-
-fn separator_for(mount: &[u8]) -> u8 {
-    if mount.contains(&b'\\') && !mount.contains(&b'/') {
-        b'\\'
-    } else {
-        b'/'
-    }
 }
 
 /// Memoizes folder paths for one volume, so a report reads each folder row once.

@@ -16,6 +16,8 @@ pub mod path;
 pub mod pipeline;
 pub mod progress;
 pub mod report;
+pub mod scheduler;
+pub mod storage_profile;
 pub mod traits;
 
 pub use error::{CoreError, Result};

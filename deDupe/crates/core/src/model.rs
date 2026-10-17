@@ -3,6 +3,7 @@
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::error::{CoreError, Result};
 use crate::path::RawPath;
 
 pub type VolumeId = i64;
@@ -351,6 +352,17 @@ impl FileEntry {
             last_seen_run_id: run_id,
         }
     }
+
+    /// Row size as a byte count. A negative value is corrupt data: it is reported
+    /// as an error, never wrapped or saturated into a read length.
+    pub fn size_bytes(&self) -> Result<u64> {
+        u64::try_from(self.size).map_err(|_| {
+            CoreError::InvalidArg(format!(
+                "negative file size {} for row {}",
+                self.size, self.id
+            ))
+        })
+    }
 }
 
 /// One `folders` row.
@@ -422,5 +434,27 @@ mod tests {
         assert!(!is_legal_transition(Done, Enumerated));
         assert!(!is_legal_transition(Skipped, Enumerated));
         assert!(!is_legal_transition(UniqueSize, Enumerated));
+    }
+
+    #[test]
+    fn size_bytes_should_return_value_when_non_negative() {
+        let mut entry = FileEntry::enumerated(1, 1, 1, RawPath::new(b"a".to_vec()), 1);
+        entry.size = 4096;
+        let got = entry.size_bytes();
+        assert!(
+            matches!(got, Ok(4096)),
+            "size 4096 should map to Ok(4096), got {got:?}"
+        );
+    }
+
+    #[test]
+    fn size_bytes_should_reject_negative() {
+        let mut entry = FileEntry::enumerated(1, 1, 1, RawPath::new(b"a".to_vec()), 1);
+        entry.size = -5;
+        let got = entry.size_bytes();
+        assert!(
+            matches!(got, Err(CoreError::InvalidArg(ref msg)) if msg.contains("-5")),
+            "size -5 should be InvalidArg with the value in its message, got {got:?}"
+        );
     }
 }

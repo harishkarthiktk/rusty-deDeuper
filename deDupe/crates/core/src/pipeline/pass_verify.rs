@@ -4,15 +4,14 @@
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::path::Path;
 
 use crate::db::queries;
 use crate::db::writer::Batch;
 use crate::error::{CoreError, Result};
-use crate::hash::READ_CHUNK;
+use crate::hash::read_full;
 use crate::model::{ErrRow, ErrorKind, FileEntry, Hash, Phase, State};
 use crate::progress::{emit_advance, emit_finished, emit_started, PhaseProgress};
-use crate::traits::ContentReader;
+use crate::traits::{AccessPattern, ContentReader, ReadTarget};
 
 use super::pass_prefix::{changed_err, io_err, unchanged};
 use super::{Ctx, PathCache};
@@ -179,10 +178,11 @@ fn classify_reps(
 ) -> Result<Vec<RepState>> {
     let mut clusters: Vec<Vec<usize>> = Vec::new();
     let mut failed: Vec<Option<ErrRow>> = vec![None; reps.len()];
+    let chunk = ctx.cfg.profile.buf_size;
     'reps: for j in 0..reps.len() {
         for c in clusters.iter_mut() {
             let anchor = reps[c[0]];
-            match compare_pair(ctx, cache, anchor, reps[j])? {
+            match compare_pair(ctx, cache, anchor, reps[j], chunk)? {
                 Verdict::Equal => {
                     c.push(j);
                     continue 'reps;
@@ -225,11 +225,11 @@ fn classify_reps(
 /// Every representative fails: the failing anchor keeps its own message, the
 /// others record that the group was aborted.
 fn abort_states(n: usize, failing: usize, cause: &ErrRow) -> Vec<RepState> {
-    let own = cause.message.clone().unwrap_or_default();
+    let own = cause.message.as_deref().unwrap_or_default();
     (0..n)
         .map(|j| {
             let msg = if j == failing {
-                own.clone()
+                own.to_string()
             } else {
                 "verify aborted: reference file failed".into()
             };
@@ -245,12 +245,31 @@ fn compare_pair(
     cache: &mut PathCache<'_>,
     a: &FileEntry,
     b: &FileEntry,
+    chunk: usize,
 ) -> Result<Verdict> {
     let pa = cache.file_path(a.folder_id, &a.name)?;
     let pb = cache.file_path(b.folder_id, &b.name)?;
     let na = ctx.svc.codec.raw_to_path(&pa);
     let nb = ctx.svc.codec.raw_to_path(&pb);
-    let equal = match verify_pair(ctx.svc.reader, &na, &nb, a.size as u64) {
+    let size = match a.size_bytes() {
+        Ok(size) => size,
+        Err(e) => return Ok(Verdict::Failed(io_err(ctx, a, &pa, e))),
+    };
+    let equal = match verify_pair(
+        ctx.svc.reader,
+        ReadTarget {
+            path: &na,
+            file_id: a.file_id.as_deref(),
+            access: AccessPattern::Sequential,
+        },
+        ReadTarget {
+            path: &nb,
+            file_id: b.file_id.as_deref(),
+            access: AccessPattern::Sequential,
+        },
+        size,
+        chunk,
+    ) {
         Ok(eq) => eq,
         Err((Side::Reference, e)) => return Ok(Verdict::Failed(io_err(ctx, a, &pa, e))),
         Err((Side::Candidate, e)) => return Ok(Verdict::Failed(io_err(ctx, b, &pb, e))),
@@ -269,51 +288,42 @@ fn compare_pair(
     })
 }
 
-/// Fill `buf` from `offset`, retrying short reads. Stops early only at EOF (a
-/// `read_at` returning 0), so the result is below `buf.len()` only at true EOF.
-fn read_full(
-    reader: &dyn ContentReader,
-    path: &Path,
-    offset: u64,
-    buf: &mut [u8],
-) -> Result<usize> {
-    let mut filled = 0usize;
-    while filled < buf.len() {
-        let n = reader.read_at(path, offset + filled as u64, &mut buf[filled..])?;
-        if n == 0 {
-            break;
-        }
-        filled += n;
-    }
-    Ok(filled)
-}
-
 /// Chunked byte compare. `Ok(false)` on the first differing chunk, on a chunk
 /// still short after [`read_full`], or if either file extends past `size`.
-/// Errors name the failing side.
+/// Errors name the failing side. Each file is opened once, so a pair costs two
+/// opens regardless of its size. `chunk` is the read size per step.
 fn verify_pair(
     reader: &dyn ContentReader,
-    a: &Path,
-    b: &Path,
+    a: ReadTarget<'_>,
+    b: ReadTarget<'_>,
     size: u64,
+    chunk: usize,
 ) -> std::result::Result<bool, (Side, CoreError)> {
-    let mut buf_a = vec![0u8; READ_CHUNK];
-    let mut buf_b = vec![0u8; READ_CHUNK];
+    // A zero chunk would never advance `offset`, so the loop below would not end.
+    let chunk = chunk.max(1);
+    let mut ha = reader.open_target(a).map_err(|e| (Side::Reference, e))?;
+    let mut hb = reader.open_target(b).map_err(|e| (Side::Candidate, e))?;
+    let mut buf_a = vec![0u8; chunk];
+    let mut buf_b = vec![0u8; chunk];
     let mut offset = 0u64;
     while offset < size {
-        let want = ((size - offset) as usize).min(READ_CHUNK);
+        // Clamp in u64 before narrowing, so a large remainder cannot truncate on 32-bit targets.
+        let want = (size - offset).min(chunk as u64) as usize;
         let na =
-            read_full(reader, a, offset, &mut buf_a[..want]).map_err(|e| (Side::Reference, e))?;
+            read_full(ha.as_mut(), offset, &mut buf_a[..want]).map_err(|e| (Side::Reference, e))?;
         let nb =
-            read_full(reader, b, offset, &mut buf_b[..want]).map_err(|e| (Side::Candidate, e))?;
+            read_full(hb.as_mut(), offset, &mut buf_b[..want]).map_err(|e| (Side::Candidate, e))?;
         if na != want || nb != want || buf_a[..want] != buf_b[..want] {
             return Ok(false);
         }
         offset += want as u64;
     }
     let mut probe = [0u8; 1];
-    for (side, p) in [(Side::Reference, a), (Side::Candidate, b)] {
-        let n = reader.read_at(p, size, &mut probe).map_err(|e| (side, e))?;
+    for (side, h) in [
+        (Side::Reference, ha.as_mut()),
+        (Side::Candidate, hb.as_mut()),
+    ] {
+        let n = h.read_at(size, &mut probe).map_err(|e| (side, e))?;
         if n != 0 {
             return Ok(false);
         }

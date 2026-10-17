@@ -22,6 +22,10 @@ tracing-subscriber.workspace = true
 indicatif.workspace = true
 ctrlc = "3"
 
+# Only Windows builds link the NTFS fast path; other systems never compile it.
+[target.'cfg(windows)'.dependencies]
+dedupe-backend-windows = { path = "../backend-windows" }
+
 [features]
 default = []
 test-hooks = ["dedupe-core/test-hooks"]

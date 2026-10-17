@@ -48,6 +48,14 @@ struct Candidate {
     full_hash: Option<Hash>,
 }
 
+impl Candidate {
+    /// `None` for a corrupt negative size. The caller skips the row: one bad
+    /// row must not fail a lookup.
+    fn size_bytes(&self) -> Option<u64> {
+        u64::try_from(self.size).ok()
+    }
+}
+
 pub fn lookup(
     conn: &Connection,
     reader: &dyn ContentReader,
@@ -70,6 +78,8 @@ pub fn lookup(
     if attrs::has(meta.attrs, attrs::PLACEHOLDER) && !cfg.include_placeholders {
         return Ok(LookupOutcome::Skipped(SkipReason::Placeholder));
     }
+    // A fresh stat cannot be negative, so a failure here is a real error for the query.
+    let size = meta.size_bytes()?;
 
     // 2. candidates across every volume (singletons included).
     let candidates = size_candidates(conn, meta.size)?;
@@ -79,8 +89,8 @@ pub fn lookup(
 
     // 3. query prefix (equals full for small files).
     let total = cfg.prefix_total();
-    let (q_prefix, _) = hash_prefix(reader, path, meta.size as u64, cfg)?;
-    let small = (meta.size as u64) <= total;
+    let (q_prefix, _) = hash_prefix(reader, path, size, cfg)?;
+    let small = size <= total;
 
     // 4-5. prefix filter; unconfirmable candidates stay as Unmounted.
     let mut survivors: Vec<(Candidate, RawPath)> = Vec::new();
@@ -88,11 +98,14 @@ pub fn lookup(
     let mut on_demand: Vec<(i64, Option<Hash>, Option<Hash>)> = Vec::new();
 
     for c in &candidates {
+        let Some(csize) = c.size_bytes() else {
+            continue;
+        };
         let cpath = queries::reconstruct_file_path(conn, c.folder_id, &c.name)?;
         let native = codec.raw_to_path(&cpath);
         let cprefix = match c.prefix_hash {
             Some(h) => Some(h),
-            None => match hash_prefix(reader, &native, c.size as u64, cfg) {
+            None => match hash_prefix(reader, &native, csize, cfg) {
                 Ok((h, _)) => {
                     on_demand.push((c.id, Some(h), None));
                     Some(h)
@@ -115,15 +128,19 @@ pub fn lookup(
     let q_full = if small {
         q_prefix
     } else {
-        hash_full(reader, path, meta.size as u64)?
+        hash_full(reader, path, size)?
     };
 
     let mut matches: Vec<MatchRow> = Vec::new();
     for (c, cpath) in &survivors {
+        // Survivors passed the same check above, so this cannot skip a row that was kept.
+        let Some(csize) = c.size_bytes() else {
+            continue;
+        };
         let native = codec.raw_to_path(cpath);
         let cfull = match c.full_hash {
             Some(h) => Some(h),
-            None => match hash_full(reader, &native, c.size as u64) {
+            None => match hash_full(reader, &native, csize) {
                 Ok(h) => {
                     on_demand.push((c.id, None, Some(h)));
                     Some(h)

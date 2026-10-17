@@ -3,9 +3,14 @@
 //! Prefer the filesystem UUID / volume GUID; fall back to an fsid. `UuidKind::None`
 //! synthesizes `"none:<fs_type>:<mount>"` and warns (weak resume guard).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 use dedupe_core::error::Result;
+// Windows builds construct `RawPath` only through the `PathCodec` in `imp`, so the
+// top-level import would be unused there.
+#[cfg(not(windows))]
 use dedupe_core::path::RawPath;
 use dedupe_core::traits::{VolumeIdentity, VolumeInfo};
 
@@ -194,6 +199,7 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::*;
+    use dedupe_core::traits::PathCodec;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         GetVolumeInformationW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,

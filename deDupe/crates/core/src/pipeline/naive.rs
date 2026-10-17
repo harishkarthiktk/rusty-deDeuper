@@ -27,7 +27,10 @@ pub struct ScanStats {
 struct Rec {
     path: RawPath,
     volume_id: i64,
+    /// Grouping key for the by-size pass, copied from `FileMeta::size`.
     size: i64,
+    /// `size` checked once at enumeration, used for hashing and stats.
+    bytes: u64,
     file_id_key: Option<Vec<u8>>,
 }
 
@@ -92,11 +95,17 @@ pub fn scan_naive(
                 stats.files_skipped += 1;
                 return Ok(());
             }
+            // Corrupt metadata counts as an error for this file only; the scan goes on.
+            let Ok(bytes) = meta.size_bytes() else {
+                stats.files_errored += 1;
+                return Ok(());
+            };
             stats.files_enumerated += 1;
             recs.push(Rec {
                 path,
                 volume_id: 0,
                 size: meta.size,
+                bytes,
                 file_id_key: meta.file_id,
             });
             Ok(())
@@ -121,9 +130,9 @@ pub fn scan_naive(
         cancel.check()?;
         let r = &recs[i];
         let native = codec.raw_to_path(&r.path);
-        match hash_prefix(reader, &native, r.size as u64, cfg) {
+        match hash_prefix(reader, &native, r.bytes, cfg) {
             Ok((h, _)) => {
-                stats.bytes_hashed += r.size as u64;
+                stats.bytes_hashed += r.bytes;
                 prefix_hashes.insert(i, h);
             }
             Err(_) => stats.files_errored += 1,
@@ -146,9 +155,9 @@ pub fn scan_naive(
         cancel.check()?;
         let r = &recs[i];
         let native = codec.raw_to_path(&r.path);
-        match hash_full(reader, &native, r.size as u64) {
+        match hash_full(reader, &native, r.bytes) {
             Ok(h) => {
-                stats.bytes_hashed += r.size as u64;
+                stats.bytes_hashed += r.bytes;
                 full_hashes.insert(i, h);
             }
             Err(_) => stats.files_errored += 1,

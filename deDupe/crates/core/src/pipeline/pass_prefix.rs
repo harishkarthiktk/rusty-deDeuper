@@ -11,17 +11,28 @@ use crate::config::VerifyMode;
 use crate::db::queries;
 use crate::db::writer::Batch;
 use crate::error::Result;
-use crate::hash::{hash_full, hash_prefix};
+use crate::hash::{hash_full_target, hash_prefix_target};
 use crate::index::{Index, MemoryIndex, SqliteIndex};
 use crate::model::{ErrRow, ErrorKind, FileEntry, Hash, Phase, State};
 use crate::path::RawPath;
 use crate::progress::{emit_advance, emit_finished, emit_started, PhaseProgress};
+use crate::scheduler::Scheduler;
+use crate::traits::{AccessPattern, FileMeta, ReadTarget};
 
 use super::{Ctx, PathCache};
 
 pub fn run(ctx: &Ctx, volume_id: i64) -> Result<()> {
     let cfg = ctx.cfg;
-    let rows = queries::rows_in_state(ctx.read, volume_id, ctx.run_id, State::SizeCandidate)?;
+    let mut rows = queries::rows_in_state(ctx.read, volume_id, ctx.run_id, State::SizeCandidate)?;
+    let mut cache = PathCache::new(ctx.read);
+    // Must run before `hardlink_reps` and the index build: both refer to rows by
+    // position. On SSD the key closure is never called, so the order is unchanged.
+    Scheduler::from(cfg.profile).order(&mut rows, |r| {
+        let p = cache.file_path(r.folder_id, &r.name)?;
+        ctx.svc
+            .reader
+            .first_extent_offset(&ctx.svc.codec.raw_to_path(&p))
+    })?;
     let total = rows.len() as u64;
     emit_started(
         ctx.svc.sink,
@@ -42,7 +53,6 @@ pub fn run(ctx: &Ctx, volume_id: i64) -> Result<()> {
     // 4.4a rule 3: hash one representative per inode; copy hashes to siblings.
     let rep_of = hardlink_reps(&rows);
 
-    let mut cache = PathCache::new(ctx.read);
     let mut small: Vec<(i64, Hash, Hash)> = Vec::new();
     let mut large: Vec<(i64, Hash)> = Vec::new();
     let mut errors: Vec<ErrRow> = Vec::new();
@@ -156,8 +166,15 @@ enum HashOutcome {
 fn hash_row(ctx: &Ctx, cache: &mut PathCache<'_>, r: &FileEntry) -> Result<HashOutcome> {
     let cfg = ctx.cfg;
     let total = cfg.prefix_total();
+    let size = match r.size_bytes() {
+        Ok(size) => size,
+        Err(e) => {
+            let path = cache.file_path(r.folder_id, &r.name)?;
+            return Ok(HashOutcome::Err(io_err(ctx, r, &path, e)));
+        }
+    };
     // Reuse stored hashes for unchanged files (4.7a step 3).
-    if (r.size as u64) <= total {
+    if size <= total {
         if let (Some(p), Some(f)) = (r.prefix_hash, r.full_hash) {
             if r.prefix_bytes == Some(r.size) {
                 return Ok(HashOutcome::Small(p, f));
@@ -170,8 +187,13 @@ fn hash_row(ctx: &Ctx, cache: &mut PathCache<'_>, r: &FileEntry) -> Result<HashO
     }
     let path = cache.file_path(r.folder_id, &r.name)?;
     let native = ctx.svc.codec.raw_to_path(&path);
-    if (r.size as u64) <= total {
-        match hash_full(ctx.svc.reader, &native, r.size as u64) {
+    if size <= total {
+        let target = ReadTarget {
+            path: &native,
+            file_id: r.file_id.as_deref(),
+            access: AccessPattern::Sequential,
+        };
+        match hash_full_target(ctx.svc.reader, target, size, cfg.profile.buf_size) {
             Ok(h) => match unchanged(ctx, &native, r) {
                 Ok(true) => Ok(HashOutcome::Small(h, h)),
                 Ok(false) => Ok(HashOutcome::Err(changed_err(ctx, r, &path))),
@@ -180,7 +202,12 @@ fn hash_row(ctx: &Ctx, cache: &mut PathCache<'_>, r: &FileEntry) -> Result<HashO
             Err(e) => Ok(HashOutcome::Err(io_err(ctx, r, &path, e))),
         }
     } else {
-        match hash_prefix(ctx.svc.reader, &native, r.size as u64, cfg) {
+        let target = ReadTarget {
+            path: &native,
+            file_id: r.file_id.as_deref(),
+            access: AccessPattern::Random,
+        };
+        match hash_prefix_target(ctx.svc.reader, target, size, cfg) {
             Ok((h, _)) => match unchanged(ctx, &native, r) {
                 Ok(true) => Ok(HashOutcome::Large(h)),
                 Ok(false) => Ok(HashOutcome::Err(changed_err(ctx, r, &path))),
@@ -216,12 +243,17 @@ fn send_errors(ctx: &Ctx, errors: &mut Vec<ErrRow>) -> Result<()> {
 
 /// Re-stat and compare. `Ok(false)` means the file changed during the read.
 pub(crate) fn unchanged(ctx: &Ctx, native: &Path, r: &FileEntry) -> Result<bool> {
-    let md = ctx.svc.reader.metadata(native)?;
+    Ok(meta_matches(&ctx.svc.reader.metadata(native)?, r))
+}
+
+/// Pure comparison of a stat against the stored row. Split out so the worker
+/// pool can judge a stat that was taken on another thread.
+pub(crate) fn meta_matches(md: &FileMeta, r: &FileEntry) -> bool {
     let ctime_ok = match (r.ctime_ns, md.ctime_ns) {
         (Some(a), Some(b)) => a == b,
         _ => true,
     };
-    Ok(md.size == r.size && md.mtime_ns == r.mtime_ns && ctime_ok)
+    md.size == r.size && md.mtime_ns == r.mtime_ns && ctime_ok
 }
 
 pub(crate) fn changed_err(ctx: &Ctx, r: &FileEntry, path: &RawPath) -> ErrRow {
