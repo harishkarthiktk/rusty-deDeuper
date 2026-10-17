@@ -54,9 +54,16 @@ By default, the results are saved to a database named `.dedupe.db` inside the fi
 | `--force` | Ignore safety checks when the database does not match the current settings or the disk. Use with care. |
 | `--cross-mounts` | Also descend into other mounted drives. Off by default. |
 | `--include-placeholders` | Include cloud-only files (for example, OneDrive or iCloud placeholders). Off by default, because reading them downloads the file. |
+| `--no-mft` | Windows only: skip the NTFS `$MFT` fast path and use the standard directory walker. Ignored on other systems. See [Windows](#windows). |
 | `--mem-budget <SIZE>` | Memory budget for the in-memory working set. Accepts bytes or a unit, such as `512MiB` or `1GiB`. |
 | `--format <human\|json>` | Output format. Default: `human`. |
 | `--progress <auto\|always\|never>` | Progress bar on stderr. Default: `auto` (shown only in a terminal). |
+| `--verify <off\|byte>` | `byte` compares duplicate candidates byte for byte after hashing. Default: `off`. Ignored with `--no-db`. |
+| `--profile <auto\|hdd\|ssd>` | Storage policy. `auto` checks whether the first root is on rotational media. `hdd` or `ssd` forces one. Default: `auto`. Ignored with `--no-db`. |
+| `--queue-depth <N>` | Number of full-file hashes to run in parallel. Default: CPU count, capped at 8 on SSD; 1 on HDD; at most 2 when the storage type is unknown. Must be at least 1. Ignored with `--no-db`. |
+| `--buf-size <SIZE>` | Read buffer for hashing, such as `64KiB` or `1MiB`. Must be 1 byte to 64MiB. Default: 64KiB on SSD, 1MiB on HDD. Ignored with `--no-db`. |
+
+**Storage detection.** HDD/SSD detection uses sysfs on Linux, `diskutil` on macOS, and the drive's seek-penalty flag on Windows (not yet verified on Windows hardware). Network volumes, and any device the probe cannot read, are detected as unknown. Unknown storage reads 2 files at a time and prints a one-line note on stderr. The 2 is a conservative judgment value, not a measured one. Override it with `--profile hdd` or `--profile ssd`, or set the depth directly with `--queue-depth N`. External USB enclosures can be misreported by the bridge chip, so use `--profile` when the detected result looks wrong. Extent ordering is implemented on Linux and Windows (Windows not yet verified on hardware), so `--profile hdd` on macOS keeps enumeration order.
 
 Example:
 
@@ -182,14 +189,23 @@ dedupe report --db ~/photo-index.db --min-wasted 1MiB   # groups wasting 1 MiB o
 dedupe lookup ~/Downloads/new-photo.jpg --db ~/photo-index.db --insert
 ```
 
+## Windows
+
+On Windows, `scan` can read the NTFS master file table (`$MFT`) directly instead of walking every folder. On a large volume this is much faster. It also gives each file a stable id, which is what lets deDupe detect hard links.
+
+- **The fast path needs an elevated shell and an NTFS volume.** Start the terminal as administrator. When either is missing, deDupe uses the standard walker and prints a `note:` line on stderr saying why. The scan still completes.
+- **`--no-mft` forces the standard walker.** Use it when you do not want deDupe to read the raw volume. The flag is accepted on every platform and ignored outside Windows.
+- **File ids and hard-link detection exist only on the fast path.** The standard walker reports no file id, so it cannot tell hard links apart. Hashes saved by one mode are not reused by a rescan in the other mode, so the rescan hashes those files again.
+- **Not yet verified on real Windows.** The Windows code is cross-compiled and linted from macOS, and its portable parts are unit-tested there. The raw-volume read has not run on a Windows machine. Check a scan of a folder you know before relying on the results.
+
 ## Notes and limits
 
 - **Read-only by design.** deDupe does not delete, move, or link files. Acting on the report is up to you.
-- **Hard links.** On macOS and Linux, files that are hard links to the same data are counted once. On Windows, hard-link detection is not available yet.
+- **Hard links.** On macOS and Linux, files that are hard links to the same data are counted once. On Windows, this works only on the NTFS fast path; see [Windows](#windows).
 - **Symlinks** are not followed.
 - **Space numbers are logical.** "Wasted" means the size of the extra copies. Copy-on-write clones (reflinks) that share disk blocks are not yet reported separately.
 - **Verification.** Byte-by-byte verification of matches (`--verify`) is planned but not available yet.
-- **Platforms.** CI builds and tests on Ubuntu, macOS, and Windows. Platform-specific fast paths are planned.
+- **Platforms.** CI builds and tests on Ubuntu, macOS, and Windows. The NTFS fast path on Windows is described in [Windows](#windows).
 
 ## Development
 
