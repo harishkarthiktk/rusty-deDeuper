@@ -1,5 +1,6 @@
 /target
 /.todo
+/.rtk/*
 **/*.rs.bk
 *.db
 *.db-wal
