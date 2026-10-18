@@ -69,7 +69,10 @@ mod imp {
             None => {
                 tracing::warn!(mount = %mount.display(), "no fs UUID; using fsid fallback");
                 (
-                    format!("fsid:{:016x}", st.f_fsid),
+                    format!(
+                        "fsid:{:08x}{:08x}",
+                        st.f_fsid.val[0] as u32, st.f_fsid.val[1] as u32
+                    ),
                     dedupe_core::model::UuidKind::FsidFallback,
                 )
             }
