@@ -16,7 +16,7 @@ Run from this directory. The toolchain is pinned to Rust 1.92.0 in `rust-toolcha
 # Build
 cargo build --workspace --all-targets
 
-# Lint and format (CI runs these with RUSTFLAGS=-D warnings)
+# Lint and format (there is no CI; run these by hand before a commit)
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -24,7 +24,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar cargo check --workspace --all-targets --locked --target x86_64-pc-windows-gnu
 CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar cargo clippy --workspace --all-targets --all-features --locked --target x86_64-pc-windows-gnu -- -D warnings
 
-# Dependency policy (CI job; needs cargo-deny installed locally)
+# Dependency policy (manual; needs cargo-deny installed locally)
 cargo deny check
 
 # Run the CLI
@@ -38,7 +38,7 @@ cargo run -p dedupe -- db info
 cargo test --workspace --all-targets
 cargo test -p dedupe-core --test phase1                 # one integration-test file
 cargo test -p dedupe-core --test phase1 <name_filter>   # one test within it
-cargo test -p dedupe --test kill_fuzz -- --ignored      # kill -9 fuzz (nightly CI)
+cargo test -p dedupe --test kill_fuzz -- --ignored      # kill -9 fuzz (manual, Linux/macOS)
 # Windows self-check: elevated PowerShell on an NTFS volume only (cannot run on macOS/Linux)
 cargo test -p dedupe-backend-windows --test mft_vs_walk -- --ignored
 DEDUPE_SCALE_N=1000000 cargo test -p dedupe-core --test scale -- --ignored   # 1M-file scale tests

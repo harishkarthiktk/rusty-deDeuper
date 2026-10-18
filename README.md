@@ -205,7 +205,7 @@ On Windows, `scan` can read the NTFS master file table (`$MFT`) directly instead
 - **Symlinks** are not followed.
 - **Space numbers are logical.** "Wasted" means the size of the extra copies. Copy-on-write clones (reflinks) that share disk blocks are not yet reported separately.
 - **Verification.** Byte-by-byte verification of matches (`--verify`) is planned but not available yet.
-- **Platforms.** CI builds and tests on Ubuntu, macOS, and Windows. The NTFS fast path on Windows is described in [Windows](#windows).
+- **Platforms.** There is no CI; builds and tests are run by hand on Linux, macOS, and Windows as needed. The NTFS fast path on Windows is described in [Windows](#windows).
 
 ## Development
 
