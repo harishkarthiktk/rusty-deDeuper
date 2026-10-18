@@ -1,8 +1,0 @@
-/target
-/.todo
-**/*.rs.bk
-*.db
-*.db-wal
-*.db-shm
-/bench/corpora/*
-!/bench/corpora/.gitkeep

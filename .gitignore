@@ -1,1 +1,13 @@
-.todo
+/target
+/.todo
+**/*.rs.bk
+*.db
+*.db-wal
+*.db-shm
+/bench/corpora/*
+!/bench/corpora/.gitkeep
+
+# Personal tooling, not part of the project
+/.claude/
+/AGENTS.md
+.DS_Store
