@@ -116,7 +116,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let start = Instant::now();
-    let groups = queries::recompute_groups(&db.conn, vid, 0)?;
+    let groups = queries::recompute_groups(&db.conn, vid, 1, 0)?;
     println!(
         "  recompute_groups: {:?} ({} groups)",
         start.elapsed(),
