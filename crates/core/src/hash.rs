@@ -221,6 +221,7 @@ mod tests {
         }
         fn metadata(&self, _p: &Path) -> Result<FileMeta> {
             Ok(FileMeta {
+                dev: None,
                 file_id: None,
                 nlink: 1,
                 size: self.0.len() as i64,

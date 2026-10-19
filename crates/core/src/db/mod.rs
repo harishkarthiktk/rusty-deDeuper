@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::error::CoreError;
 
 pub mod ids;
+pub mod lock;
 pub mod queries;
 pub mod schema;
 pub mod writer;
@@ -83,6 +84,9 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
         assert_eq!(mode.to_ascii_lowercase(), "wal");
-        assert_eq!(schema::current_version(&db.conn).unwrap(), 1);
+        assert_eq!(
+            schema::current_version(&db.conn).unwrap(),
+            schema::EXPECTED_VERSION
+        );
     }
 }

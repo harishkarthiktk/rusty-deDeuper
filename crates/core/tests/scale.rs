@@ -146,6 +146,7 @@ fn to_meta(md: &fs::Metadata) -> FileMeta {
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0);
     FileMeta {
+        dev: None,
         file_id,
         nlink,
         size: md.len() as i64,

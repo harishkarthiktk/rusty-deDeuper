@@ -4,8 +4,8 @@ use rusqlite::Connection;
 
 use crate::error::CoreError;
 
-pub const EXPECTED_VERSION: i64 = 1;
-const V1: &str = include_str!("schema/v1.sql");
+pub const EXPECTED_VERSION: i64 = 2;
+const SCHEMA: &str = include_str!("schema/v2.sql");
 
 pub fn current_version(conn: &Connection) -> Result<i64, CoreError> {
     Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
@@ -21,10 +21,12 @@ pub fn check_version(conn: &Connection) -> Result<(), CoreError> {
     }
 }
 
-/// Create the schema on a fresh DB; migrate older versions; refuse newer ones.
+/// Create the schema on a fresh DB; refuse every other version.
+///
+/// There are no migrations: an older database must be deleted and rescanned.
 pub fn apply_migrations(conn: &Connection) -> Result<(), CoreError> {
     let v = current_version(conn)?;
-    if v > EXPECTED_VERSION {
+    if v != 0 && v != EXPECTED_VERSION {
         return Err(CoreError::SchemaVersion {
             found: v,
             expected: EXPECTED_VERSION,
@@ -32,11 +34,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<(), CoreError> {
     }
     if v == 0 {
         let tx = conn.unchecked_transaction()?;
-        tx.execute_batch(V1)?;
-        tx.pragma_update(None, "user_version", 1)?;
+        tx.execute_batch(SCHEMA)?;
+        tx.pragma_update(None, "user_version", EXPECTED_VERSION)?;
         tx.commit()?;
     }
-    // future: if v == 1 { apply v2 } ...
     Ok(())
 }
 
@@ -57,7 +58,7 @@ mod tests {
         let (_dir, conn) = temp_db();
         apply_migrations(&conn).unwrap();
         apply_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 1);
+        assert_eq!(current_version(&conn).unwrap(), EXPECTED_VERSION);
     }
 
     #[test]
@@ -69,7 +70,7 @@ mod tests {
             err,
             CoreError::SchemaVersion {
                 found: 999,
-                expected: 1
+                expected: EXPECTED_VERSION
             }
         ));
         assert!(apply_migrations(&conn).is_err());

@@ -147,6 +147,7 @@ fn to_meta(md: &fs::Metadata) -> FileMeta {
     #[cfg(not(unix))]
     let (file_id, nlink, attr_bits) = (None, 1, 0);
     FileMeta {
+        dev: None,
         file_id,
         nlink,
         size: md.len() as i64,

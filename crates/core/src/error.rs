@@ -11,7 +11,10 @@ pub enum CoreError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("schema version {found}, expected {expected}")]
+    #[error(
+        "schema version {found}, expected {expected} (a database from an older release \
+         cannot be migrated: delete it and scan again)"
+    )]
     SchemaVersion { found: i64, expected: i64 },
 
     #[error("volume mismatch at {mount}: db {db_uuid}, found {found_uuid}")]
@@ -24,8 +27,17 @@ pub enum CoreError {
     #[error("hash config mismatch: {0}")]
     HashConfigMismatch(String),
 
+    #[error("database is in use by another dedupe process (lock: {0})")]
+    DbBusy(String),
+
     #[error("db writer thread died")]
     WriterDied,
+
+    #[error(
+        "file row id {id} already claimed by another path in run {run_id} \
+         (another scan may be writing this database)"
+    )]
+    IdConflict { id: i64, run_id: i64 },
 
     #[error("WAL unavailable (journal_mode = {got}); put --db on a local disk")]
     WalUnavailable { got: String },

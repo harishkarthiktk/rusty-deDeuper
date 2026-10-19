@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use crate::exclude::ExcludeSet;
 use crate::hash::HASH_ALGO;
 use crate::storage_profile::Profile;
 
@@ -36,6 +37,9 @@ pub struct Config {
     /// the SSD policy. Not part of the hash-config guard, since it does not change
     /// hash output.
     pub profile: Profile,
+    /// Paths matching any of these globs are not enumerated. Not part of the hash-config
+    /// guard, since it does not change hash output.
+    pub exclude: ExcludeSet,
 }
 
 impl Default for Config {
@@ -51,6 +55,7 @@ impl Default for Config {
             force: false,
             hash_algo: HASH_ALGO.to_string(),
             profile: Profile::default(),
+            exclude: ExcludeSet::default(),
         }
     }
 }

@@ -1,8 +1,8 @@
 //! `pass_prefix`: hash the prefix of every size candidate. Small files
 //! (`size <= F + L`) get both hashes in one `Hashed` batch and skip `pass_full`.
 //! Hardlinks sharing an inode are hashed once (representative) and copied to
-//! siblings (4.4a rule 3). Falls back to DB-backed partner lookup when the memory
-//! map exceeds budget.
+//! siblings (4.4a rule 3). Results stream to the writer in bounded chunks, and unique
+//! prefixes are classified by one SQL statement that commits with the phase marker.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -12,14 +12,13 @@ use crate::db::queries;
 use crate::db::writer::Batch;
 use crate::error::Result;
 use crate::hash::{hash_full_target, hash_prefix_target};
-use crate::index::{Index, MemoryIndex, SqliteIndex};
 use crate::model::{ErrRow, ErrorKind, FileEntry, Hash, Phase, State};
 use crate::path::RawPath;
 use crate::progress::{emit_advance, emit_finished, emit_started, PhaseProgress};
 use crate::scheduler::Scheduler;
 use crate::traits::{AccessPattern, FileMeta, ReadTarget};
 
-use super::{Ctx, PathCache};
+use super::{send_chunk, Ctx, PathCache};
 
 pub fn run(ctx: &Ctx, volume_id: i64) -> Result<()> {
     let cfg = ctx.cfg;
@@ -45,100 +44,68 @@ pub fn run(ctx: &Ctx, volume_id: i64) -> Result<()> {
         },
     );
 
-    let mut index = MemoryIndex::new(cfg.mem_budget);
-    for (id, h) in queries::rows_with_prefix(ctx.read, volume_id, ctx.run_id)? {
-        index.insert(h, id)?;
-    }
-
-    // 4.4a rule 3: hash one representative per inode; copy hashes to siblings.
+    // 4.4a rule 3: hash one representative per inode; copy hashes to siblings. The
+    // representative always has a lower row index, so its outcome is already known when
+    // a sibling is reached. Outcomes are kept only for representatives with siblings.
     let rep_of = hardlink_reps(&rows);
+    let reps: HashSet<usize> = rep_of.values().copied().collect();
+    let mut outcomes: HashMap<usize, HashOutcome> = HashMap::new();
 
     let mut small: Vec<(i64, Hash, Hash)> = Vec::new();
     let mut large: Vec<(i64, Hash)> = Vec::new();
     let mut errors: Vec<ErrRow> = Vec::new();
-    let mut outcomes: HashMap<usize, HashOutcome> = HashMap::new();
-
-    for (i, r) in rows.iter().enumerate() {
-        ctx.svc.cancel.check()?;
-        // Every row index is counted exactly once here, including hardlink
-        // siblings, so the sum of advances equals `total` (= rows.len()).
-        emit_advance(ctx.svc.sink, ctx.run_id, volume_id, 1);
-        if rep_of.contains_key(&i) {
-            continue; // sibling; hashes copied in the loop below
-        }
-        let outcome = hash_row(ctx, &mut cache, r)?;
-        match &outcome {
-            HashOutcome::Small(p, f) => small.push((r.id, *p, *f)),
-            HashOutcome::Large(p) => large.push((r.id, *p)),
-            HashOutcome::Err(e) => errors.push(e.clone()),
-        }
-        outcomes.insert(i, outcome);
-    }
-    for (sib, rep) in &rep_of {
-        if let Some(outcome) = outcomes.get(rep) {
-            let r = &rows[*sib];
-            match outcome {
-                HashOutcome::Small(p, f) => small.push((r.id, *p, *f)),
-                HashOutcome::Large(p) => large.push((r.id, *p)),
-                HashOutcome::Err(e) => {
-                    let path = cache.file_path(r.folder_id, &r.name)?;
-                    let mut e2 = e.clone();
-                    e2.file_row_id = Some(r.id);
-                    e2.path = Some(path);
-                    errors.push(e2);
-                }
-            }
-        }
-    }
-
-    for (id, h) in &large {
-        index.insert(*h, *id)?;
-    }
-
     // Under --verify=byte, small files wait in state 3 for pass_verify.
-    let small_batch = if cfg.verify == VerifyMode::Byte {
-        Batch::HashedPending(small)
+    let small_wrap: fn(Vec<(i64, Hash, Hash)>) -> Batch = if cfg.verify == VerifyMode::Byte {
+        Batch::HashedPending
     } else {
-        Batch::Hashed(small)
+        Batch::Hashed
     };
 
-    if index.over_budget() {
-        ctx.writer.send(small_batch)?;
-        ctx.writer.send(Batch::PrefixHashed(large.clone()))?;
-        send_errors(ctx, &mut errors)?;
-        ctx.writer.send(Batch::PhaseComplete {
-            run_id: ctx.run_id,
-            volume_id,
-            phase: Phase::PrefixDone,
-        })?;
-        ctx.writer.flush()?;
-        let db_index = SqliteIndex::new(ctx.read, volume_id, ctx.run_id);
-        let singles: HashSet<i64> = db_index.prefix_singletons()?.into_iter().collect();
-        let uniques: Vec<(i64, Hash)> = large
-            .into_iter()
-            .filter(|(id, _)| singles.contains(id))
-            .collect();
-        ctx.writer.send(Batch::UniquePrefix(uniques))?;
-    } else {
-        let mut partnered = Vec::new();
-        let mut unique = Vec::new();
-        for (id, h) in &large {
-            if index.count(h) > 1 {
-                partnered.push((*id, *h));
-            } else {
-                unique.push((*id, *h));
+    let res = (|| -> Result<()> {
+        for (i, r) in rows.iter().enumerate() {
+            ctx.svc.cancel.check()?;
+            // Every row index is counted exactly once here, including hardlink
+            // siblings, so the sum of advances equals `total` (= rows.len()).
+            emit_advance(ctx.svc.sink, ctx.run_id, volume_id, 1);
+            let outcome = match rep_of.get(&i) {
+                Some(rep) => match outcomes.get(rep) {
+                    Some(o) => sibling_outcome(&mut cache, r, o)?,
+                    None => continue, // representative vanished (cannot happen)
+                },
+                None => hash_row(ctx, &mut cache, r)?,
+            };
+            match &outcome {
+                HashOutcome::Small(p, f) => small.push((r.id, *p, *f)),
+                HashOutcome::Large(p) => large.push((r.id, *p)),
+                HashOutcome::Err(e) => errors.push(e.clone()),
             }
+            if reps.contains(&i) {
+                outcomes.insert(i, outcome);
+            }
+            send_chunk(ctx, &mut small, false, small_wrap)?;
+            send_chunk(ctx, &mut large, false, Batch::PrefixHashed)?;
+            send_chunk(ctx, &mut errors, false, Batch::Error)?;
         }
-        ctx.writer.send(small_batch)?;
-        ctx.writer.send(Batch::PrefixHashed(partnered))?;
-        ctx.writer.send(Batch::UniquePrefix(unique))?;
-        send_errors(ctx, &mut errors)?;
-        ctx.writer.send(Batch::PhaseComplete {
-            run_id: ctx.run_id,
-            volume_id,
-            phase: Phase::PrefixDone,
-        })?;
-    }
+        Ok(())
+    })();
+    // Hand over finished work even when the loop stopped (cancel, error).
+    send_chunk(ctx, &mut small, true, small_wrap)?;
+    send_chunk(ctx, &mut large, true, Batch::PrefixHashed)?;
+    send_chunk(ctx, &mut errors, true, Batch::Error)?;
+    res?;
+
+    // Unique prefixes are classified in one writer-side statement, in the same
+    // transaction as the phase marker, over every state-2 row of this run (including
+    // rows committed before a crash).
+    ctx.writer.send(Batch::MarkPrefixSingletons {
+        volume_id,
+        run_id: ctx.run_id,
+    })?;
+    ctx.writer.send(Batch::PhaseComplete {
+        run_id: ctx.run_id,
+        volume_id,
+        phase: Phase::PrefixDone,
+    })?;
     ctx.writer.flush()?;
     emit_finished(
         ctx.svc.sink,
@@ -234,11 +201,21 @@ fn hardlink_reps(rows: &[FileEntry]) -> HashMap<usize, usize> {
     rep_of
 }
 
-fn send_errors(ctx: &Ctx, errors: &mut Vec<ErrRow>) -> Result<()> {
-    if !errors.is_empty() {
-        ctx.writer.send(Batch::Error(std::mem::take(errors)))?;
-    }
-    Ok(())
+/// A hardlink sibling copies its representative's outcome (4.4a rule 3).
+fn sibling_outcome(
+    cache: &mut PathCache<'_>,
+    r: &FileEntry,
+    rep: &HashOutcome,
+) -> Result<HashOutcome> {
+    Ok(match rep {
+        HashOutcome::Err(e) => {
+            let mut e2 = e.clone();
+            e2.file_row_id = Some(r.id);
+            e2.path = Some(cache.file_path(r.folder_id, &r.name)?);
+            HashOutcome::Err(e2)
+        }
+        other => other.clone(),
+    })
 }
 
 /// Re-stat and compare. `Ok(false)` means the file changed during the read.
@@ -249,11 +226,15 @@ pub(crate) fn unchanged(ctx: &Ctx, native: &Path, r: &FileEntry) -> Result<bool>
 /// Pure comparison of a stat against the stored row. Split out so the worker
 /// pool can judge a stat that was taken on another thread.
 pub(crate) fn meta_matches(md: &FileMeta, r: &FileEntry) -> bool {
-    let ctime_ok = match (r.ctime_ns, md.ctime_ns) {
+    md.size == r.size && md.mtime_ns == r.mtime_ns && ctime_matches(r.ctime_ns, md.ctime_ns)
+}
+
+/// ctime is compared only when both sides have one (FAT, pre-1970 on Windows).
+pub(crate) fn ctime_matches(a: Option<i64>, b: Option<i64>) -> bool {
+    match (a, b) {
         (Some(a), Some(b)) => a == b,
         _ => true,
-    };
-    md.size == r.size && md.mtime_ns == r.mtime_ns && ctime_ok
+    }
 }
 
 pub(crate) fn changed_err(ctx: &Ctx, r: &FileEntry, path: &RawPath) -> ErrRow {

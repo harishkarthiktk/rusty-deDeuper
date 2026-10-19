@@ -14,7 +14,7 @@ use crate::progress::{emit_advance, emit_finished, emit_started, PhaseProgress};
 use crate::traits::{AccessPattern, ContentReader, ReadTarget};
 
 use super::pass_prefix::{changed_err, io_err, unchanged};
-use super::{Ctx, PathCache};
+use super::{send_chunk, Ctx, PathCache, RESULT_CHUNK};
 
 /// Which file of a compared pair a read error came from.
 #[derive(Clone, Copy)]
@@ -86,23 +86,33 @@ pub fn run(ctx: &Ctx, volume_id: i64) -> Result<()> {
     }
     groups.sort_unstable_by_key(|g| g.first().map(|r| r.id));
 
-    for group in &groups {
-        ctx.svc.cancel.check()?;
-        let verdicts = verify_group(ctx, &mut cache, group)?;
-        for (r, verdict) in group.iter().zip(verdicts) {
-            match verdict {
-                None => verified.push(r.id),
-                Some(e) => errors.push(e),
+    let res = (|| -> Result<()> {
+        for group in &groups {
+            ctx.svc.cancel.check()?;
+            let verdicts = verify_group(ctx, &mut cache, group)?;
+            for (r, verdict) in group.iter().zip(verdicts) {
+                match verdict {
+                    None => verified.push(r.id),
+                    Some(e) => errors.push(e),
+                }
+            }
+            // One advance per row, so the sum equals `total`.
+            emit_advance(ctx.svc.sink, ctx.run_id, volume_id, group.len() as u64);
+            // Whole groups only. Errors go first: a commit that splits the two batches
+            // must never leave a lone mismatched member in state 3, which a resume
+            // would promote as a singleton.
+            if verified.len() + errors.len() >= RESULT_CHUNK {
+                send_chunk(ctx, &mut errors, true, Batch::Error)?;
+                send_chunk(ctx, &mut verified, true, Batch::Verified)?;
             }
         }
-        // One advance per row, so the sum equals `total`.
-        emit_advance(ctx.svc.sink, ctx.run_id, volume_id, group.len() as u64);
-    }
+        Ok(())
+    })();
+    // Hand over finished groups even when the loop stopped (cancel, error).
+    send_chunk(ctx, &mut errors, true, Batch::Error)?;
+    send_chunk(ctx, &mut verified, true, Batch::Verified)?;
+    res?;
 
-    ctx.writer.send(Batch::Verified(verified))?;
-    if !errors.is_empty() {
-        ctx.writer.send(Batch::Error(errors))?;
-    }
     ctx.writer.send(Batch::PhaseComplete {
         run_id: ctx.run_id,
         volume_id,

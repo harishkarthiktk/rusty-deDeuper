@@ -35,11 +35,26 @@ pub fn check_config_guard(conn: &Connection, cfg: &Config) -> Result<()> {
     if mismatch {
         if cfg.force {
             tracing::warn!("hash config changed; wiping hashes because --force was given");
-            conn.execute(
-                "UPDATE files SET prefix_hash=NULL, full_hash=NULL, prefix_bytes=NULL, state=0",
+            // One transaction: a crash must not leave wiped rows with the old meta.
+            // `new_unchecked` because this takes `&Connection`.
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            tx.execute(
+                "UPDATE files SET prefix_hash=NULL, full_hash=NULL, prefix_bytes=NULL, \
+                 state=0, err=NULL WHERE state <> -1",
                 [],
             )?;
-            init_meta(conn, cfg, now_unix_ns())?;
+            // State 0 is what pass_enumerate produced, so no running run may claim more.
+            tx.execute(
+                "UPDATE run_volumes SET phase_reached=MIN(phase_reached, ?1) \
+                 WHERE run_id IN (SELECT id FROM scan_runs WHERE status='running')",
+                [Phase::Enumerated.as_i64()],
+            )?;
+            tx.execute("DELETE FROM dup_groups", [])?;
+            init_meta(&tx, cfg, now_unix_ns())?;
+            tx.commit()?;
         } else {
             return Err(CoreError::HashConfigMismatch(format!(
                 "db={algo}:{}/{} current={}:{}/{}",
@@ -106,7 +121,7 @@ pub fn plan_resume(
         if info.uuid != db_uuid {
             if !cfg.force {
                 return Err(CoreError::VolumeMismatch {
-                    mount: info.mount.to_display(),
+                    mount: info.mount.to_terminal().into_owned(),
                     db_uuid,
                     found_uuid: info.uuid,
                 });

@@ -8,7 +8,7 @@ use crate::config::{Config, VerifyMode};
 use crate::db::ids::IdAllocator;
 use crate::db::writer::{spawn_writer, Batch};
 use crate::db::{self, queries};
-use crate::error::Result;
+use crate::error::{CoreError, Result};
 use crate::model::{now_unix_ns, Phase};
 
 use super::{
@@ -30,6 +30,7 @@ pub fn run_scan(
     opts: &ScanOptions,
 ) -> Result<i64> {
     let now = now_unix_ns();
+    let _lock = db::lock::acquire(db_path)?; // held until run_scan returns
     let db = db::Db::open(db_path, cfg)?;
 
     resume::check_config_guard(&db.conn, cfg)?;
@@ -74,7 +75,7 @@ pub fn run_scan(
 
     let read = db::Db::open_readonly(db_path)?.conn;
     let ids = IdAllocator::seed(&read)?;
-    let writer = spawn_writer(db.conn, cfg.prefix_total() as i64);
+    let writer = spawn_writer(db.conn, cfg.prefix_total() as i64)?;
     let ctx = Ctx {
         cfg,
         run_id,
@@ -84,15 +85,52 @@ pub fn run_scan(
         svc,
     };
 
+    let passes = run_passes(&ctx, &volumes, &phases, opts.stop_after);
+    // `ctx` is not used after this point, so `writer` can be moved (no Drop on Ctx).
+    // A failed or cancelled pass still joins the writer, so every batch already sent
+    // is committed.
+    let stopped = merge_writer_result(passes, writer.shutdown())?;
+
+    if !stopped {
+        let mut db2 = db::Db::open(db_path, cfg)?;
+        // A fresh timestamp: `now` is the run's start, and `finished_at` orders runs.
+        let finished = now_unix_ns();
+        // One IMMEDIATE transaction: a concurrent `report` sees either the old groups with
+        // the old latest run or the new ones with the new run, never a mix. IMMEDIATE
+        // because the block starts with a read.
+        let tx = db2
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for v in &volumes {
+            let phase = queries::get_phase(&tx, run_id, v.volume_id)?;
+            if phase < Phase::GroupsDone {
+                queries::recompute_groups(&tx, v.volume_id, run_id, finished)?;
+                queries::set_run_volume_phase(&tx, run_id, v.volume_id, Phase::GroupsDone)?;
+            }
+        }
+        queries::finish_run(&tx, run_id, finished)?;
+        tx.commit()?;
+    }
+
+    Ok(run_id)
+}
+
+/// Runs the passes for every volume. Returns `true` when a stop request ended the run early.
+fn run_passes(
+    ctx: &Ctx,
+    volumes: &[VolumeScan],
+    phases: &HashMap<i64, Phase>,
+    stop_after_opt: Option<i64>,
+) -> Result<bool> {
     let mut stopped = false;
     // With `--verify` off there is no Verified commit; treat a stop request at
     // Verified as a stop at FullDone so the hook always has a real boundary.
-    let mut stop_after = opts.stop_after;
-    if cfg.verify != VerifyMode::Byte && stop_after == Some(Phase::Verified.as_i64()) {
+    let mut stop_after = stop_after_opt;
+    if ctx.cfg.verify != VerifyMode::Byte && stop_after == Some(Phase::Verified.as_i64()) {
         stop_after = Some(Phase::FullDone.as_i64());
     }
 
-    for v in &volumes {
+    for v in volumes {
         let mut phase = *phases.get(&v.volume_id).unwrap_or(&Phase::None);
         if stop_after == Some(0) {
             stopped = true;
@@ -100,7 +138,7 @@ pub fn run_scan(
         }
 
         if phase < Phase::Enumerated {
-            pass_enumerate::run(&ctx, v)?;
+            pass_enumerate::run(ctx, v)?;
             phase = Phase::Enumerated;
             if stop_hit(stop_after, phase) {
                 stopped = true;
@@ -108,7 +146,7 @@ pub fn run_scan(
             }
         }
         if phase < Phase::SizeDone {
-            pass_size::run(&ctx, v.volume_id)?;
+            pass_size::run(ctx, v.volume_id)?;
             phase = Phase::SizeDone;
             if stop_hit(stop_after, phase) {
                 stopped = true;
@@ -116,7 +154,7 @@ pub fn run_scan(
             }
         }
         if phase < Phase::PrefixDone {
-            pass_prefix::run(&ctx, v.volume_id)?;
+            pass_prefix::run(ctx, v.volume_id)?;
             phase = Phase::PrefixDone;
             if stop_hit(stop_after, phase) {
                 stopped = true;
@@ -124,7 +162,7 @@ pub fn run_scan(
             }
         }
         if phase < Phase::FullDone {
-            pass_full::run(&ctx, v.volume_id)?;
+            pass_full::run(ctx, v.volume_id)?;
             phase = Phase::FullDone;
             if stop_hit(stop_after, phase) {
                 stopped = true;
@@ -133,15 +171,15 @@ pub fn run_scan(
         }
         // Runs even when pass_full was skipped on resume, so rows an interrupted
         // verify-on run left in state 3 do not stay there. Before groups recompute.
-        if cfg.verify != VerifyMode::Byte {
+        if ctx.cfg.verify != VerifyMode::Byte {
             ctx.writer.send(Batch::PromotePending {
                 volume_id: v.volume_id,
-                run_id,
+                run_id: ctx.run_id,
             })?;
             ctx.writer.flush()?;
         }
-        if cfg.verify == VerifyMode::Byte && phase < Phase::Verified {
-            pass_verify::run(&ctx, v.volume_id)?;
+        if ctx.cfg.verify == VerifyMode::Byte && phase < Phase::Verified {
+            pass_verify::run(ctx, v.volume_id)?;
             phase = Phase::Verified;
             if stop_hit(stop_after, phase) {
                 stopped = true;
@@ -155,21 +193,20 @@ pub fn run_scan(
         }
     }
 
-    writer.shutdown()?;
+    Ok(stopped)
+}
 
-    if !stopped {
-        let db2 = db::Db::open(db_path, cfg)?;
-        for v in &volumes {
-            let phase = queries::get_phase(&db2.conn, run_id, v.volume_id)?;
-            if phase < Phase::GroupsDone {
-                queries::recompute_groups(&db2.conn, v.volume_id, now)?;
-                queries::set_run_volume_phase(&db2.conn, run_id, v.volume_id, Phase::GroupsDone)?;
-            }
+/// Prefer the writer's real error over the `WriterDied` a pass saw when sending.
+fn merge_writer_result(passes: Result<bool>, writer: Result<()>) -> Result<bool> {
+    match (passes, writer) {
+        (Ok(stopped), Ok(())) => Ok(stopped),
+        (Ok(_), Err(w)) | (Err(CoreError::WriterDied), Err(w)) => Err(w),
+        (Err(e), Err(w)) => {
+            tracing::error!("db writer also failed: {w}");
+            Err(e)
         }
-        queries::finish_run(&db2.conn, run_id, now)?;
+        (Err(e), Ok(())) => Err(e),
     }
-
-    Ok(run_id)
 }
 
 fn stop_hit(stop_after: Option<i64>, phase: Phase) -> bool {

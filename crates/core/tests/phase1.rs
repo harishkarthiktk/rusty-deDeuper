@@ -142,6 +142,7 @@ fn to_meta(md: &fs::Metadata) -> FileMeta {
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0);
     FileMeta {
+        dev: None,
         file_id,
         nlink,
         size: md.len() as i64,
@@ -484,6 +485,9 @@ fn rescan_reuses_hashes_and_removes_deleted() {
     assert!(gone.is_none(), "deleted file row should be removed");
 }
 
+// The fixture's `to_meta` supplies `file_id` (the inode) only on Unix, and move detection
+// needs a file id.
+#[cfg(unix)]
 #[test]
 fn move_detection_keeps_id_and_reads_nothing() {
     let e = env();

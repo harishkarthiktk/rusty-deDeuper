@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, Transaction};
 
+use crate::db::queries;
 use crate::error::CoreError;
 use crate::model::{ErrRow, FileEntry, FolderRow, Hash, Phase};
 
@@ -35,6 +36,12 @@ pub enum Batch {
         run_id: i64,
     },
     Error(Vec<ErrRow>),
+    /// Move this run's state-2 rows whose prefix hash is unique to -4. Sent right before
+    /// `PhaseComplete{PrefixDone}` so both commit in one transaction.
+    MarkPrefixSingletons {
+        volume_id: i64,
+        run_id: i64,
+    },
     PhaseComplete {
         run_id: i64,
         volume_id: i64,
@@ -47,6 +54,9 @@ pub enum Batch {
         run_id: i64,
         volume_id: i64,
         root_folder_ids: Vec<i64>,
+        /// Folders the walker could not read. Their subtrees keep their rows until a run
+        /// that can read them.
+        protected_folder_ids: Vec<i64>,
     },
     Checkpoint,
     /// Commit everything pending, then ack. Needed so the pipeline's read
@@ -68,6 +78,7 @@ impl Batch {
             Batch::Error(v) => v.len(),
             Batch::PhaseComplete { .. }
             | Batch::DeleteStale { .. }
+            | Batch::MarkPrefixSingletons { .. }
             | Batch::PromotePending { .. }
             | Batch::Checkpoint
             | Batch::Flush(_)
@@ -78,7 +89,7 @@ impl Batch {
 
 pub struct WriterHandle {
     tx: SyncSender<Batch>,
-    join: JoinHandle<Result<(), CoreError>>,
+    join: Option<JoinHandle<Result<(), CoreError>>>,
 }
 
 impl WriterHandle {
@@ -93,15 +104,48 @@ impl WriterHandle {
         rx.recv().map_err(|_| CoreError::WriterDied)?
     }
 
-    pub fn shutdown(self) -> Result<(), CoreError> {
-        let _ = self.tx.send(Batch::Shutdown);
-        self.join.join().map_err(|_| CoreError::WriterDied)?
+    /// Commit everything sent so far and join the thread. Returns the writer's real
+    /// error, not the `WriterDied` a sender saw.
+    pub fn shutdown(mut self) -> Result<(), CoreError> {
+        self.join_inner()
     }
+
+    fn join_inner(&mut self) -> Result<(), CoreError> {
+        let Some(join) = self.join.take() else {
+            return Ok(());
+        };
+        // Ignored: a send error means the writer already exited; join reports why.
+        let _ = self.tx.send(Batch::Shutdown);
+        match join.join() {
+            Ok(res) => res,
+            Err(payload) => Err(CoreError::Other(format!(
+                "db writer panicked: {}",
+                panic_message(payload.as_ref())
+            ))),
+        }
+    }
+}
+
+impl Drop for WriterHandle {
+    fn drop(&mut self) {
+        // Safety net for unwinding and early returns: commit what was sent and join.
+        if let Err(e) = self.join_inner() {
+            tracing::error!("db writer failed during drop: {e}");
+        }
+    }
+}
+
+/// Text of a panic payload (`&str` or `String`), for error messages.
+pub(crate) fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
 }
 
 /// Spawn the writer thread. `prefix_total` is `F + L` from the config; the writer
 /// needs it to store `prefix_bytes` from the `(id, hash)` batches defined in 4.5.
-pub fn spawn_writer(conn: Connection, prefix_total: i64) -> WriterHandle {
+pub fn spawn_writer(conn: Connection, prefix_total: i64) -> Result<WriterHandle, CoreError> {
     spawn_writer_with(conn, prefix_total, BATCH_ROWS, BATCH_MS)
 }
 
@@ -112,16 +156,18 @@ pub fn spawn_writer_with(
     prefix_total: i64,
     max_rows: usize,
     max_ms: u64,
-) -> WriterHandle {
+) -> Result<WriterHandle, CoreError> {
     let (tx, rx) = sync_channel::<Batch>(4);
     let join = std::thread::Builder::new()
         .name("db-writer".into())
         .spawn(move || {
             run(conn, rx, prefix_total, max_rows, max_ms)
                 .inspect_err(|e| tracing::error!("db-writer failed: {e}"))
-        })
-        .expect("spawn db-writer");
-    WriterHandle { tx, join }
+        })?;
+    Ok(WriterHandle {
+        tx,
+        join: Some(join),
+    })
 }
 
 fn run(
@@ -134,8 +180,9 @@ fn run(
     let mut pending: Vec<Batch> = Vec::new();
     let mut rows = 0usize;
     let mut since = Instant::now();
+    let max_wait = Duration::from_millis(max_ms);
     loop {
-        let timeout = Duration::from_millis(max_ms).saturating_sub(since.elapsed());
+        let timeout = max_wait.saturating_sub(since.elapsed());
         match rx.recv_timeout(timeout) {
             Ok(Batch::Shutdown) => {
                 commit(&mut conn, &mut pending, prefix_total)?;
@@ -171,7 +218,9 @@ fn run(
             Ok(b) => {
                 rows += b.row_count();
                 pending.push(b);
-                if rows >= max_rows {
+                // `recv_timeout` returns queued messages even past the deadline, so the
+                // time-based commit must also be checked here, not only on Timeout.
+                if rows >= max_rows || since.elapsed() >= max_wait {
                     commit(&mut conn, &mut pending, prefix_total)?;
                     rows = 0;
                     since = Instant::now();
@@ -226,46 +275,22 @@ fn apply(tx: &Transaction<'_>, b: Batch, prefix_total: i64) -> Result<(), CoreEr
             }
         }
         Batch::Enumerated(rows) => {
-            let mut stmt = tx.prepare_cached(
-                "INSERT INTO files(id,volume_id,folder_id,name,file_id,nlink,size,mtime_ns,\
-                 ctime_ns,attrs,prefix_hash,full_hash,prefix_bytes,state,err,scanned_at,\
-                 last_seen_run_id) \
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17) \
-                 ON CONFLICT(volume_id,folder_id,name) DO UPDATE SET \
-                 size=excluded.size, mtime_ns=excluded.mtime_ns, ctime_ns=excluded.ctime_ns, \
-                 file_id=excluded.file_id, nlink=excluded.nlink, attrs=excluded.attrs, \
-                 prefix_hash=excluded.prefix_hash, full_hash=excluded.full_hash, \
-                 prefix_bytes=excluded.prefix_bytes, state=excluded.state, err=excluded.err, \
-                 scanned_at=excluded.scanned_at, last_seen_run_id=excluded.last_seen_run_id \
-                 ON CONFLICT(id) DO UPDATE SET \
-                 folder_id=excluded.folder_id, name=excluded.name, size=excluded.size, \
-                 mtime_ns=excluded.mtime_ns, ctime_ns=excluded.ctime_ns, \
-                 file_id=excluded.file_id, nlink=excluded.nlink, attrs=excluded.attrs, \
-                 prefix_hash=excluded.prefix_hash, full_hash=excluded.full_hash, \
-                 prefix_bytes=excluded.prefix_bytes, state=excluded.state, err=excluded.err, \
-                 scanned_at=excluded.scanned_at, last_seen_run_id=excluded.last_seen_run_id",
-            )?;
             for f in rows {
-                stmt.execute(params![
-                    f.id,
-                    f.volume_id,
-                    f.folder_id,
-                    f.name.as_bytes(),
-                    f.file_id,
-                    f.nlink,
-                    f.size,
-                    f.mtime_ns,
-                    f.ctime_ns,
-                    f.attrs,
-                    f.prefix_hash.as_ref().map(|h| h.as_bytes().as_slice()),
-                    f.full_hash.as_ref().map(|h| h.as_bytes().as_slice()),
-                    f.prefix_bytes,
-                    f.state.as_i64(),
-                    f.err,
-                    f.scanned_at,
-                    f.last_seen_run_id,
-                ])?;
+                queries::upsert_file(tx, &f)?;
             }
+        }
+        Batch::MarkPrefixSingletons { volume_id, run_id } => {
+            // Counts -4 rows of this run too, so a resumed pass cannot orphan a partner.
+            tx.prepare_cached(
+                "UPDATE files SET state=-4 \
+                 WHERE volume_id=?1 AND last_seen_run_id=?2 AND state=2 \
+                 AND prefix_hash IN ( \
+                   SELECT prefix_hash FROM files \
+                   WHERE volume_id=?1 AND last_seen_run_id=?2 AND state IN (2,-4) \
+                     AND prefix_hash IS NOT NULL \
+                   GROUP BY prefix_hash HAVING COUNT(*)=1)",
+            )?
+            .execute(params![volume_id, run_id])?;
         }
         Batch::SizeCandidate(ids) => {
             let mut stmt = tx.prepare_cached("UPDATE files SET state=1 WHERE id=?1")?;
@@ -374,35 +399,49 @@ fn apply(tx: &Transaction<'_>, b: Batch, prefix_total: i64) -> Result<(), CoreEr
             run_id,
             volume_id,
             root_folder_ids,
+            protected_folder_ids,
         } => {
             if root_folder_ids.is_empty() {
                 return Ok(());
             }
-            let list = root_folder_ids
-                .iter()
-                .map(|i| i.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql_files = format!(
+            let join = |ids: &[i64]| {
+                ids.iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let list = join(&root_folder_ids);
+            // The clause is built only for a non-empty list, so `NOT IN (NULL)` never occurs.
+            let (root_guard, step_guard) = if protected_folder_ids.is_empty() {
+                (String::new(), String::new())
+            } else {
+                let prot = join(&protected_folder_ids);
+                (
+                    format!(" AND id NOT IN ({prot})"),
+                    format!(" WHERE f.id NOT IN ({prot})"),
+                )
+            };
+            let cte = format!(
                 "WITH RECURSIVE sub(id) AS ( \
-                   SELECT id FROM folders WHERE id IN ({list}) \
+                   SELECT id FROM folders WHERE id IN ({list}){root_guard} \
                    UNION ALL \
-                   SELECT f.id FROM folders f JOIN sub s ON f.parent_id = s.id \
-                 ) \
-                 DELETE FROM files WHERE volume_id=?1 AND last_seen_run_id < ?2 \
-                 AND folder_id IN (SELECT id FROM sub)"
+                   SELECT f.id FROM folders f JOIN sub s ON f.parent_id = s.id{step_guard} \
+                 ) "
             );
-            tx.execute(&sql_files, params![volume_id, run_id])?;
-            let sql_folders = format!(
-                "WITH RECURSIVE sub(id) AS ( \
-                   SELECT id FROM folders WHERE id IN ({list}) \
-                   UNION ALL \
-                   SELECT f.id FROM folders f JOIN sub s ON f.parent_id = s.id \
-                 ) \
-                 DELETE FROM folders WHERE volume_id=?1 AND last_seen_run_id IS NOT NULL \
-                 AND last_seen_run_id < ?2 AND id IN (SELECT id FROM sub)"
-            );
-            tx.execute(&sql_folders, params![volume_id, run_id])?;
+            tx.execute(
+                &format!(
+                    "{cte}DELETE FROM files WHERE volume_id=?1 AND last_seen_run_id < ?2 \
+                     AND folder_id IN (SELECT id FROM sub)"
+                ),
+                params![volume_id, run_id],
+            )?;
+            tx.execute(
+                &format!(
+                    "{cte}DELETE FROM folders WHERE volume_id=?1 AND last_seen_run_id IS NOT NULL \
+                     AND last_seen_run_id < ?2 AND id IN (SELECT id FROM sub)"
+                ),
+                params![volume_id, run_id],
+            )?;
         }
         Batch::Checkpoint | Batch::Flush(_) | Batch::Shutdown => {}
     }
@@ -528,7 +567,7 @@ mod tests {
         }
 
         let writer_conn = crate::db::Db::open(&path, &Config::default()).unwrap().conn;
-        let handle = spawn_writer_with(writer_conn, 20 * 1024, 2, 60_000);
+        let handle = spawn_writer_with(writer_conn, 20 * 1024, 2, 60_000).unwrap();
         // 2 rows in one batch reaches the threshold; auto-commit, no explicit Flush.
         handle.send(Batch::SizeCandidate(vec![1, 2])).unwrap();
 
@@ -586,7 +625,7 @@ mod tests {
 
         let writer_conn = crate::db::Db::open(&path, &Config::default()).unwrap().conn;
         // High row threshold and no time flush: only Shutdown can commit this.
-        let handle = spawn_writer_with(writer_conn, 20 * 1024, 1_000_000, 600_000);
+        let handle = spawn_writer_with(writer_conn, 20 * 1024, 1_000_000, 600_000).unwrap();
         handle.send(Batch::SizeCandidate(vec![1])).unwrap();
         handle.shutdown().unwrap();
 

@@ -8,7 +8,9 @@ pub mod cancel;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod exclude;
 pub mod hash;
+pub mod identity;
 pub mod index;
 pub mod lookup;
 pub mod model;
@@ -18,6 +20,7 @@ pub mod progress;
 pub mod report;
 pub mod scheduler;
 pub mod storage_profile;
+pub mod time;
 pub mod traits;
 
 pub use error::{CoreError, Result};

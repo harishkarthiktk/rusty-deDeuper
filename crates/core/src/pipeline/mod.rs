@@ -20,7 +20,7 @@ use crate::cancel::Token;
 use crate::config::Config;
 use crate::db::ids::IdAllocator;
 use crate::db::queries;
-use crate::db::writer::WriterHandle;
+use crate::db::writer::{Batch, WriterHandle};
 use crate::error::Result;
 use crate::path::RawPath;
 use crate::traits::{ContentReader, Enumerator, Hasher, PathCodec, VolumeIdentity};
@@ -47,6 +47,25 @@ pub struct Ctx<'a> {
     pub read: &'a Connection,
     pub ids: &'a IdAllocator,
     pub svc: &'a Services<'a>,
+}
+
+/// Rows per streamed result chunk. A crash loses at most one writer window plus this
+/// many unsent rows (plan: "kill -9 and restart must lose at most one batch window").
+pub(crate) const RESULT_CHUNK: usize = 5_000;
+
+/// Send `buf` as one batch once it holds `RESULT_CHUNK` rows (or always, with `force`).
+/// Per-id transitions are idempotent and resume selects by state, so a partial commit
+/// is safe.
+pub(crate) fn send_chunk<T>(
+    ctx: &Ctx,
+    buf: &mut Vec<T>,
+    force: bool,
+    wrap: fn(Vec<T>) -> Batch,
+) -> Result<()> {
+    if !buf.is_empty() && (force || buf.len() >= RESULT_CHUNK) {
+        ctx.writer.send(wrap(std::mem::take(buf)))?;
+    }
+    Ok(())
 }
 
 /// One volume and the roots this run scans on it.

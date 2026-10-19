@@ -223,6 +223,7 @@ pub enum FsType {
     Xfs,
     Btrfs,
     Apfs,
+    Hfs,
     Other,
 }
 
@@ -236,19 +237,23 @@ impl FsType {
             FsType::Xfs => "xfs",
             FsType::Btrfs => "btrfs",
             FsType::Apfs => "apfs",
+            FsType::Hfs => "hfs",
             FsType::Other => "other",
         }
     }
 
     pub fn parse(s: &str) -> FsType {
         match s.to_ascii_lowercase().as_str() {
-            "ntfs" => FsType::Ntfs,
-            "fat32" | "vfat" | "fat" => FsType::Fat32,
+            // "ntfs3" is the Linux in-kernel NTFS driver.
+            "ntfs" | "ntfs3" => FsType::Ntfs,
+            // "msdos" is macOS's name for FAT.
+            "fat32" | "vfat" | "fat" | "msdos" => FsType::Fat32,
             "exfat" => FsType::Exfat,
             "ext4" | "ext2" | "ext3" => FsType::Ext4,
             "xfs" => FsType::Xfs,
             "btrfs" => FsType::Btrfs,
-            "apfs" | "hfs" | "hfs+" => FsType::Apfs,
+            "apfs" => FsType::Apfs,
+            "hfs" | "hfs+" => FsType::Hfs,
             _ => FsType::Other,
         }
     }
@@ -455,6 +460,43 @@ mod tests {
         assert!(
             matches!(got, Err(CoreError::InvalidArg(ref msg)) if msg.contains("-5")),
             "size -5 should be InvalidArg with the value in its message, got {got:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fs_type_parse_tests {
+    use super::FsType;
+
+    #[test]
+    fn fs_type_parse_should_map_known_names_when_given_platform_spellings() {
+        let cases = [
+            ("ntfs", FsType::Ntfs),
+            ("ntfs3", FsType::Ntfs),
+            ("fat32", FsType::Fat32),
+            ("vfat", FsType::Fat32),
+            ("msdos", FsType::Fat32),
+            ("exFAT", FsType::Exfat),
+            ("ext4", FsType::Ext4),
+            ("apfs", FsType::Apfs),
+            ("hfs", FsType::Hfs),
+            ("hfs+", FsType::Hfs),
+            ("fuseblk", FsType::Other),
+            ("ReFS", FsType::Other),
+            ("", FsType::Other),
+        ];
+        for (name, want) in cases {
+            assert_eq!(FsType::parse(name), want, "parse({name:?})");
+        }
+    }
+
+    #[test]
+    fn fs_type_as_str_should_return_hfs_label_when_variant_is_hfs() {
+        assert_eq!(FsType::Hfs.as_str(), "hfs");
+        assert_eq!(
+            FsType::parse(FsType::Hfs.as_str()),
+            FsType::Hfs,
+            "round trip"
         );
     }
 }

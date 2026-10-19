@@ -7,8 +7,14 @@ use crate::error::Result;
 
 use super::Ctx;
 
-/// Delete files/folders not seen this run, under the given root folder ids.
-pub fn delete_stale(ctx: &Ctx, volume_id: i64, root_folder_ids: &[i64]) -> Result<()> {
+/// Queue deletion of files/folders not seen this run, under the given root folder ids.
+/// No flush: the caller sends `PhaseComplete` next, so both commit in one transaction.
+pub fn delete_stale(
+    ctx: &Ctx,
+    volume_id: i64,
+    root_folder_ids: &[i64],
+    protected_folder_ids: &[i64],
+) -> Result<()> {
     if root_folder_ids.is_empty() {
         return Ok(());
     }
@@ -16,7 +22,6 @@ pub fn delete_stale(ctx: &Ctx, volume_id: i64, root_folder_ids: &[i64]) -> Resul
         run_id: ctx.run_id,
         volume_id,
         root_folder_ids: root_folder_ids.to_vec(),
-    })?;
-    ctx.writer.flush()?;
-    Ok(())
+        protected_folder_ids: protected_folder_ids.to_vec(),
+    })
 }

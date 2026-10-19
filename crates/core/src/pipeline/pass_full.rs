@@ -3,8 +3,10 @@
 //! it stops in state 3 until `pass_verify`.
 //!
 //! With `queue_depth > 1` only the reads and stats run on worker threads. Row
-//! decisions, path lookups and batches stay on the calling thread, in row order,
-//! so the output does not depend on the depth.
+//! decisions and batches stay on the calling thread. Results stream to the writer in
+//! bounded chunks as they arrive, so a crash or Ctrl-C keeps finished work. The final
+//! DB state does not depend on the depth (each update is by row id), but batches reach
+//! the writer in completion order, not row order.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -15,7 +17,7 @@ use crate::cancel::Token;
 use crate::config::VerifyMode;
 use crate::db::queries;
 use crate::db::writer::Batch;
-use crate::error::{CoreError, Result};
+use crate::error::Result;
 use crate::hash::hash_full_target;
 use crate::model::{ErrRow, FileEntry, Hash, Phase, State};
 use crate::path::RawPath;
@@ -24,14 +26,17 @@ use crate::scheduler::Scheduler;
 use crate::traits::{AccessPattern, ContentReader, FileMeta, ReadTarget};
 
 use super::pass_prefix::{changed_err, io_err, meta_matches, unchanged};
-use super::{Ctx, PathCache};
+use super::{send_chunk, Ctx, PathCache};
 
 type Hashed = Vec<(i64, Hash)>;
 
 /// One file for a worker to hash. `idx` is the row position, so the result can
-/// be put back in row order.
+/// be matched back to its row.
 struct Job {
     idx: usize,
+    /// The path as stored, for the error row. Built on the planning thread because
+    /// `PathCache` reads through a connection that must not leave it.
+    raw: RawPath,
     path: PathBuf,
     size: u64,
     /// Owned copy of the row's file id. A worker borrows it for its `ReadTarget`.
@@ -44,15 +49,17 @@ struct WorkerResult {
     meta: Result<FileMeta>,
 }
 
-/// What `plan_rows` decided for one row. Kept per row so `finish_rows` emits the
-/// batches in row order without deciding again.
-enum Slot {
-    /// A stored hash, kept as is.
-    Reused(Hash),
-    /// Sent to a worker; its result is judged in `finish_rows`.
-    Job,
-    /// Could not be planned (corrupt size). Recorded directly, no worker involved.
-    Failed(ErrRow),
+/// Result buffers for the pass, flushed to the writer in bounded chunks.
+struct Out {
+    hashed: Hashed,
+    errors: Vec<ErrRow>,
+    /// `FullHashed`, or `FullHashedPending` under `--verify=byte`.
+    wrap: fn(Hashed) -> Batch,
+}
+
+fn flush_out(ctx: &Ctx, out: &mut Out, force: bool) -> Result<()> {
+    send_chunk(ctx, &mut out.hashed, force, out.wrap)?;
+    send_chunk(ctx, &mut out.errors, force, Batch::Error)
 }
 
 pub fn run(ctx: &Ctx, volume_id: i64) -> Result<()> {
@@ -79,22 +86,25 @@ pub fn run(ctx: &Ctx, volume_id: i64) -> Result<()> {
         },
     );
 
+    let mut out = Out {
+        hashed: Vec::new(),
+        errors: Vec::new(),
+        wrap: if ctx.cfg.verify == VerifyMode::Byte {
+            Batch::FullHashedPending
+        } else {
+            Batch::FullHashed
+        },
+    };
     let depth = scheduler.queue_depth();
-    let (hashed, errors) = if depth > 1 {
-        hash_pooled(ctx, volume_id, &rows, &mut cache, depth)?
+    let res = if depth > 1 {
+        hash_pooled(ctx, volume_id, &rows, &mut cache, depth, &mut out)
     } else {
-        hash_sequential(ctx, volume_id, &rows, &mut cache)?
+        hash_sequential(ctx, volume_id, &rows, &mut cache, &mut out)
     };
+    // Hand over finished work even when the pass stopped (cancel, error).
+    flush_out(ctx, &mut out, true)?;
+    res?;
 
-    let full_batch = if ctx.cfg.verify == VerifyMode::Byte {
-        Batch::FullHashedPending(hashed)
-    } else {
-        Batch::FullHashed(hashed)
-    };
-    ctx.writer.send(full_batch)?;
-    if !errors.is_empty() {
-        ctx.writer.send(Batch::Error(errors))?;
-    }
     ctx.writer.send(Batch::PhaseComplete {
         run_id: ctx.run_id,
         volume_id,
@@ -120,22 +130,23 @@ fn hash_sequential(
     volume_id: i64,
     rows: &[FileEntry],
     cache: &mut PathCache<'_>,
-) -> Result<(Hashed, Vec<ErrRow>)> {
-    let mut hashed: Hashed = Vec::new();
-    let mut errors: Vec<ErrRow> = Vec::new();
+    out: &mut Out,
+) -> Result<()> {
     for r in rows {
         ctx.svc.cancel.check()?;
         // One advance per row, whether its hash is reused or computed.
         emit_advance(ctx.svc.sink, ctx.run_id, volume_id, 1);
         if let Some(f) = reusable_hash(ctx, r) {
-            hashed.push((r.id, f));
+            out.hashed.push((r.id, f));
+            flush_out(ctx, out, false)?;
             continue;
         }
         let path = cache.file_path(r.folder_id, &r.name)?;
         let size = match r.size_bytes() {
             Ok(size) => size,
             Err(e) => {
-                errors.push(io_err(ctx, r, &path, e));
+                out.errors.push(io_err(ctx, r, &path, e));
+                flush_out(ctx, out, false)?;
                 continue;
             }
         };
@@ -147,32 +158,40 @@ fn hash_sequential(
         };
         match hash_full_target(ctx.svc.reader, target, size, ctx.cfg.profile.buf_size) {
             Ok(h) => match unchanged(ctx, &native, r) {
-                Ok(true) => hashed.push((r.id, h)),
-                Ok(false) => errors.push(changed_err(ctx, r, &path)),
-                Err(e) => errors.push(io_err(ctx, r, &path, e)),
+                Ok(true) => out.hashed.push((r.id, h)),
+                Ok(false) => out.errors.push(changed_err(ctx, r, &path)),
+                Err(e) => out.errors.push(io_err(ctx, r, &path, e)),
             },
-            Err(e) => errors.push(io_err(ctx, r, &path, e)),
+            Err(e) => out.errors.push(io_err(ctx, r, &path, e)),
         }
+        flush_out(ctx, out, false)?;
     }
-    Ok((hashed, errors))
+    Ok(())
 }
 
-/// The `queue_depth > 1` path: plan on this thread, hash on workers, then judge
-/// on this thread in row order.
+/// The `queue_depth > 1` path: plan on this thread, hash on workers, judge each
+/// result on this thread as it arrives.
 fn hash_pooled(
     ctx: &Ctx,
     volume_id: i64,
     rows: &[FileEntry],
     cache: &mut PathCache<'_>,
     depth: usize,
-) -> Result<(Hashed, Vec<ErrRow>)> {
-    let (slots, jobs) = plan_rows(ctx, volume_id, rows, cache)?;
-    let results = hash_parallel(ctx, volume_id, jobs, rows.len(), depth)?;
-    // A cancelled run may have skipped jobs. Checking here turns that into
-    // `Cancelled` before `finish_rows` expects a result for every job. The flag
-    // never clears, so a pass here means no worker saw it set.
-    ctx.svc.cancel.check()?;
-    finish_rows(ctx, rows, cache, slots, results)
+    out: &mut Out,
+) -> Result<()> {
+    let jobs = plan_rows(ctx, volume_id, rows, cache, out)?;
+    hash_parallel(ctx, &jobs, depth, &mut |job, res| {
+        emit_advance(ctx.svc.sink, ctx.run_id, volume_id, 1);
+        let r = &rows[job.idx];
+        match judge(ctx, r, &job.raw, res) {
+            Ok(h) => out.hashed.push((r.id, h)),
+            Err(row) => out.errors.push(row),
+        }
+        flush_out(ctx, out, false)
+    })?;
+    // A cancelled run may have skipped jobs. The flag never clears, so a pass here
+    // means no worker saw it set.
+    ctx.svc.cancel.check()
 }
 
 /// Walks rows in order on this thread. Stored hashes are kept in place, a row
@@ -187,46 +206,44 @@ fn plan_rows(
     volume_id: i64,
     rows: &[FileEntry],
     cache: &mut PathCache<'_>,
-) -> Result<(Vec<Slot>, Vec<Job>)> {
-    let mut slots = Vec::with_capacity(rows.len());
+    out: &mut Out,
+) -> Result<Vec<Job>> {
     let mut jobs = Vec::new();
     for (idx, r) in rows.iter().enumerate() {
         ctx.svc.cancel.check()?;
-        let slot = if let Some(h) = reusable_hash(ctx, r) {
-            Slot::Reused(h)
+        if let Some(h) = reusable_hash(ctx, r) {
+            out.hashed.push((r.id, h));
         } else {
-            let path = cache.file_path(r.folder_id, &r.name)?;
+            let raw = cache.file_path(r.folder_id, &r.name)?;
             match r.size_bytes() {
                 Ok(size) => {
                     jobs.push(Job {
                         idx,
-                        path: ctx.svc.codec.raw_to_path(&path),
+                        path: ctx.svc.codec.raw_to_path(&raw),
+                        raw,
                         size,
                         file_id: r.file_id.clone(),
                     });
-                    Slot::Job
+                    continue;
                 }
-                Err(e) => Slot::Failed(io_err(ctx, r, &path, e)),
+                Err(e) => out.errors.push(io_err(ctx, r, &raw, e)),
             }
-        };
-        if !matches!(slot, Slot::Job) {
-            emit_advance(ctx.svc.sink, ctx.run_id, volume_id, 1);
         }
-        slots.push(slot);
+        emit_advance(ctx.svc.sink, ctx.run_id, volume_id, 1);
+        flush_out(ctx, out, false)?;
     }
-    Ok((slots, jobs))
+    Ok(jobs)
 }
 
 /// Hashes `jobs` on up to `depth` scoped threads. Workers claim jobs from a shared
 /// counter, so one slow file does not hold up the rest. Results return over a
-/// channel and are stored by row index.
+/// channel and `on_result` runs on this thread in completion order.
 fn hash_parallel(
     ctx: &Ctx,
-    volume_id: i64,
-    jobs: Vec<Job>,
-    rows_len: usize,
+    jobs: &[Job],
     depth: usize,
-) -> Result<Vec<Option<WorkerResult>>> {
+    on_result: &mut dyn FnMut(&Job, WorkerResult) -> Result<()>,
+) -> Result<()> {
     // Copy the shared references out of `ctx`. Capturing `ctx` would send the
     // non-`Sync` connection toward the workers.
     let reader = ctx.svc.reader;
@@ -235,16 +252,14 @@ fn hash_parallel(
     let workers = depth.min(jobs.len());
     let next = AtomicUsize::new(0);
     let (tx, rx) = mpsc::channel::<(usize, WorkerResult)>();
-    let mut results: Vec<Option<WorkerResult>> = Vec::with_capacity(rows_len);
-    results.resize_with(rows_len, || None);
 
-    // Set when a spawn fails, so the workers that did start stop claiming jobs.
+    // Set when a spawn fails or a result callback errs, so workers stop claiming jobs.
     let abort = AtomicBool::new(false);
 
     thread::scope(|s| -> Result<()> {
         for _ in 0..workers {
             let tx = tx.clone();
-            let (jobs, next, abort) = (&jobs, &next, &abort);
+            let (next, abort) = (&next, &abort);
             if let Err(e) = thread::Builder::new().spawn_scoped(s, move || {
                 run_worker(reader, cancel, jobs, next, abort, chunk, &tx);
             }) {
@@ -254,18 +269,19 @@ fn hash_parallel(
         }
         // Drop our sender so `rx` ends once every worker has exited.
         drop(tx);
-        for (idx, res) in rx {
-            if let Some(slot) = results.get_mut(idx) {
-                *slot = Some(res);
+        for (k, res) in rx {
+            if let Err(e) = on_result(&jobs[k], res) {
+                abort.store(true, Ordering::Relaxed);
+                // Returning drops `rx`, so a worker's next send fails and it exits.
+                return Err(e);
             }
-            emit_advance(ctx.svc.sink, ctx.run_id, volume_id, 1);
         }
         Ok(())
-    })?;
-    Ok(results)
+    })
 }
 
-/// Claims job indices until none are left or the run is cancelled.
+/// Claims job indices until none are left or the run is cancelled. Sends the job
+/// index, not the row index.
 fn run_worker(
     reader: &dyn ContentReader,
     cancel: &Token,
@@ -284,7 +300,7 @@ fn run_worker(
             break;
         };
         // A closed channel means the receiver is gone, so nothing can be reported.
-        if tx.send((job.idx, hash_job(reader, job, chunk))).is_err() {
+        if tx.send((k, hash_job(reader, job, chunk))).is_err() {
             break;
         }
     }
@@ -300,39 +316,6 @@ fn hash_job(reader: &dyn ContentReader, job: &Job, chunk: usize) -> WorkerResult
         hash: hash_full_target(reader, target, job.size, chunk),
         meta: reader.metadata(&job.path),
     }
-}
-
-/// Judges every row in order on this thread. Builds `hashed` and `errors` the
-/// same way the sequential path does, so batch contents do not depend on depth.
-fn finish_rows(
-    ctx: &Ctx,
-    rows: &[FileEntry],
-    cache: &mut PathCache<'_>,
-    slots: Vec<Slot>,
-    results: Vec<Option<WorkerResult>>,
-) -> Result<(Hashed, Vec<ErrRow>)> {
-    let mut hashed: Hashed = Vec::new();
-    let mut errors: Vec<ErrRow> = Vec::new();
-    for ((r, slot), result) in rows.iter().zip(slots).zip(results) {
-        match slot {
-            Slot::Reused(f) => hashed.push((r.id, f)),
-            Slot::Failed(row) => errors.push(row),
-            Slot::Job => {
-                let Some(res) = result else {
-                    return Err(CoreError::Other(format!(
-                        "hash worker returned no result for row {}",
-                        r.id
-                    )));
-                };
-                let path = cache.file_path(r.folder_id, &r.name)?;
-                match judge(ctx, r, &path, res) {
-                    Ok(h) => hashed.push((r.id, h)),
-                    Err(row) => errors.push(row),
-                }
-            }
-        }
-    }
-    Ok((hashed, errors))
 }
 
 /// The sequential path's rule for one hashed row: keep the hash only if a fresh

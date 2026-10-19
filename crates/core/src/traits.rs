@@ -12,8 +12,21 @@ use crate::path::RawPath;
 /// What the walker found at one path.
 #[derive(Clone, Debug)]
 pub enum WalkItem {
-    Dir { path: RawPath },
-    File { path: RawPath, meta: FileMeta },
+    Dir {
+        path: RawPath,
+    },
+    File {
+        path: RawPath,
+        meta: FileMeta,
+    },
+    /// An entry the walker could not read. `is_dir` is true when the failed path is (or
+    /// may be) a directory: its subtree was not enumerated.
+    Error {
+        path: RawPath,
+        is_dir: bool,
+        kind: crate::model::ErrorKind,
+        message: String,
+    },
 }
 
 /// Filesystem metadata, normalized into plain integers/bytes (no `cfg` in core).
@@ -21,6 +34,9 @@ pub enum WalkItem {
 pub struct FileMeta {
     /// Stable file identity: inode / NTFS FRN / APFS file id. `None` where absent.
     pub file_id: Option<Vec<u8>>,
+    /// Device the entry was observed on this run: `st_dev` on Unix. Runtime only, never
+    /// persisted as identity (not stable across reboots or re-plugs). `None` when unknown.
+    pub dev: Option<u64>,
     pub nlink: i64,
     pub size: i64,
     pub mtime_ns: i64,
@@ -253,6 +269,7 @@ mod tests {
     #[test]
     fn size_bytes_should_return_value_when_non_negative() {
         let meta = FileMeta {
+            dev: None,
             file_id: None,
             nlink: 1,
             size: 4096,
@@ -271,6 +288,7 @@ mod tests {
     #[test]
     fn size_bytes_should_reject_negative() {
         let meta = FileMeta {
+            dev: None,
             file_id: None,
             nlink: 1,
             size: -5,

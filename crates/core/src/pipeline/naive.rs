@@ -31,6 +31,7 @@ struct Rec {
     size: i64,
     /// `size` checked once at enumeration, used for hashing and stats.
     bytes: u64,
+    /// `(dev, file_id)` from `identity::run_key`; `None` means a per-row key.
     file_id_key: Option<Vec<u8>>,
 }
 
@@ -72,6 +73,10 @@ pub fn scan_naive(
     for root in roots {
         cancel.check()?;
         enumr.walk(root, cfg, &mut |item| {
+            if matches!(item, WalkItem::Error { .. }) {
+                stats.files_errored += 1;
+                return Ok(());
+            }
             let WalkItem::File { path, meta } = item else {
                 return Ok(());
             };
@@ -106,7 +111,7 @@ pub fn scan_naive(
                 volume_id: 0,
                 size: meta.size,
                 bytes,
-                file_id_key: meta.file_id,
+                file_id_key: crate::identity::run_key(&meta),
             });
             Ok(())
         })?;

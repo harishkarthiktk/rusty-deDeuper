@@ -169,6 +169,7 @@ fn to_meta(md: &fs::Metadata) -> FileMeta {
     };
     let (file_id, nlink) = inode_and_links(md);
     FileMeta {
+        dev: None,
         file_id,
         nlink,
         size: md.len() as i64,

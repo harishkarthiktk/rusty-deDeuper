@@ -196,37 +196,55 @@ pub fn folder_path(conn: &Connection, folder_id: i64) -> Result<Option<RawPath>>
 // files
 // ---------------------------------------------------------------------------
 
+/// Single upsert statement shared by the writer and `lookup`. A path conflict refreshes
+/// the row in place. An id conflict is a move (the row keeps its id and changes path);
+/// it may only take a row last seen in an earlier run, so a zero-change execute means an
+/// id was handed out twice in one run.
+const UPSERT_FILE_SQL: &str = "INSERT INTO files(id,volume_id,folder_id,name,file_id,nlink,size,\
+     mtime_ns,ctime_ns,attrs,prefix_hash,full_hash,prefix_bytes,state,err,scanned_at,\
+     last_seen_run_id) \
+     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17) \
+     ON CONFLICT(volume_id,folder_id,name) DO UPDATE SET \
+       size=excluded.size, mtime_ns=excluded.mtime_ns, ctime_ns=excluded.ctime_ns, \
+       file_id=excluded.file_id, nlink=excluded.nlink, attrs=excluded.attrs, \
+       prefix_hash=excluded.prefix_hash, full_hash=excluded.full_hash, \
+       prefix_bytes=excluded.prefix_bytes, state=excluded.state, err=excluded.err, \
+       scanned_at=excluded.scanned_at, last_seen_run_id=excluded.last_seen_run_id \
+     ON CONFLICT(id) DO UPDATE SET \
+       folder_id=excluded.folder_id, name=excluded.name, size=excluded.size, \
+       mtime_ns=excluded.mtime_ns, ctime_ns=excluded.ctime_ns, \
+       file_id=excluded.file_id, nlink=excluded.nlink, attrs=excluded.attrs, \
+       prefix_hash=excluded.prefix_hash, full_hash=excluded.full_hash, \
+       prefix_bytes=excluded.prefix_bytes, state=excluded.state, err=excluded.err, \
+       scanned_at=excluded.scanned_at, last_seen_run_id=excluded.last_seen_run_id \
+     WHERE files.last_seen_run_id IS NOT excluded.last_seen_run_id";
+
 pub fn upsert_file(conn: &Connection, f: &FileEntry) -> Result<()> {
-    conn.execute(
-        "INSERT INTO files(id,volume_id,folder_id,name,file_id,nlink,size,mtime_ns,ctime_ns,\
-         attrs,prefix_hash,full_hash,prefix_bytes,state,err,scanned_at,last_seen_run_id) \
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17) \
-         ON CONFLICT(volume_id,folder_id,name) DO UPDATE SET \
-         size=excluded.size, mtime_ns=excluded.mtime_ns, ctime_ns=excluded.ctime_ns, \
-         file_id=excluded.file_id, nlink=excluded.nlink, attrs=excluded.attrs, \
-         prefix_hash=excluded.prefix_hash, full_hash=excluded.full_hash, \
-         prefix_bytes=excluded.prefix_bytes, state=excluded.state, err=excluded.err, \
-         scanned_at=excluded.scanned_at, last_seen_run_id=excluded.last_seen_run_id",
-        params![
-            f.id,
-            f.volume_id,
-            f.folder_id,
-            f.name.as_bytes(),
-            f.file_id,
-            f.nlink,
-            f.size,
-            f.mtime_ns,
-            f.ctime_ns,
-            f.attrs,
-            f.prefix_hash.as_ref().map(|h| h.as_bytes().as_slice()),
-            f.full_hash.as_ref().map(|h| h.as_bytes().as_slice()),
-            f.prefix_bytes,
-            f.state.as_i64(),
-            f.err,
-            f.scanned_at,
-            f.last_seen_run_id,
-        ],
-    )?;
+    let changed = conn.prepare_cached(UPSERT_FILE_SQL)?.execute(params![
+        f.id,
+        f.volume_id,
+        f.folder_id,
+        f.name.as_bytes(),
+        f.file_id,
+        f.nlink,
+        f.size,
+        f.mtime_ns,
+        f.ctime_ns,
+        f.attrs,
+        f.prefix_hash.as_ref().map(|h| h.as_bytes().as_slice()),
+        f.full_hash.as_ref().map(|h| h.as_bytes().as_slice()),
+        f.prefix_bytes,
+        f.state.as_i64(),
+        f.err,
+        f.scanned_at,
+        f.last_seen_run_id,
+    ])?;
+    if changed == 0 {
+        return Err(crate::error::CoreError::IdConflict {
+            id: f.id,
+            run_id: f.last_seen_run_id,
+        });
+    }
     Ok(())
 }
 
@@ -587,7 +605,10 @@ fn folder_row(conn: &Connection, folder_id: i64) -> Result<Option<(i64, Vec<u8>,
 
 /// Idempotent recompute: delete this volume's groups, then insert groups with
 /// more than one distinct inode. See 4.7 step 5.
-pub fn recompute_groups(conn: &Connection, volume_id: i64, now: i64) -> Result<u64> {
+/// Idempotent recompute of one volume's groups from the rows live in `run_id` (the
+/// report's scope, plan P1.4). Callers run it inside the transaction that also marks the
+/// run finished, so readers never see a half-swapped table.
+pub fn recompute_groups(conn: &Connection, volume_id: i64, run_id: i64, now: i64) -> Result<u64> {
     conn.execute("DELETE FROM dup_groups WHERE volume_id=?1", [volume_id])?;
     let n = conn.execute(
         "INSERT INTO dup_groups(volume_id,full_hash,size,member_count,distinct_inodes,\
@@ -596,12 +617,41 @@ pub fn recompute_groups(conn: &Connection, volume_id: i64, now: i64) -> Result<u
                 COUNT(DISTINCT COALESCE(file_id, id)), \
                 size*(COUNT(DISTINCT COALESCE(file_id, id))-1), NULL, 0, ?2 \
          FROM files \
-         WHERE volume_id=?1 AND state IN (3,4,5) AND full_hash IS NOT NULL \
+         WHERE volume_id=?1 AND last_seen_run_id=?3 \
+           AND state IN (3,4,5) AND full_hash IS NOT NULL \
          GROUP BY full_hash, size \
          HAVING COUNT(DISTINCT COALESCE(file_id, id)) > 1",
-        params![volume_id, now],
+        params![volume_id, now, run_id],
     )?;
     Ok(n as u64)
+}
+
+/// Recompute one `(volume_id, full_hash)` group after an out-of-run change
+/// (`lookup --insert`), instead of the whole volume.
+pub fn recompute_group_for_hash(
+    conn: &Connection,
+    volume_id: i64,
+    run_id: i64,
+    full_hash: &Hash,
+    now: i64,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM dup_groups WHERE volume_id=?1 AND full_hash=?2",
+        params![volume_id, full_hash.as_bytes()],
+    )?;
+    conn.execute(
+        "INSERT INTO dup_groups(volume_id,full_hash,size,member_count,distinct_inodes,\
+         wasted_logical,wasted_physical,sharing_kind,computed_at) \
+         SELECT volume_id, full_hash, size, COUNT(*), \
+                COUNT(DISTINCT COALESCE(file_id, id)), \
+                size*(COUNT(DISTINCT COALESCE(file_id, id))-1), NULL, 0, ?3 \
+         FROM files \
+         WHERE volume_id=?1 AND full_hash=?2 AND last_seen_run_id=?4 AND state IN (3,4,5) \
+         GROUP BY full_hash, size \
+         HAVING COUNT(DISTINCT COALESCE(file_id, id)) > 1",
+        params![volume_id, full_hash.as_bytes(), now, run_id],
+    )?;
+    Ok(())
 }
 
 pub struct GroupRow {
@@ -612,10 +662,13 @@ pub struct GroupRow {
     pub wasted_logical: i64,
 }
 
+/// Stored `dup_groups` rows, most wasted first. The report no longer pairs these with
+/// members (the orders differ); it folds groups from [`volume_group_members`] instead.
 pub fn list_groups(conn: &Connection, volume_id: i64, min_wasted: i64) -> Result<Vec<GroupRow>> {
     let mut stmt = conn.prepare(
         "SELECT full_hash,size,member_count,distinct_inodes,wasted_logical FROM dup_groups \
-         WHERE volume_id=?1 AND wasted_logical>=?2 ORDER BY full_hash",
+         WHERE volume_id=?1 AND wasted_logical>=?2 \
+         ORDER BY wasted_logical DESC, full_hash",
     )?;
     let rows = stmt
         .query_map(params![volume_id, min_wasted], |r| {
@@ -632,56 +685,26 @@ pub fn list_groups(conn: &Connection, volume_id: i64, min_wasted: i64) -> Result
     Ok(rows)
 }
 
-/// Group count and summed `wasted_logical` for a volume, counting only groups that
-/// [`volume_group_members`] would list for `run_id`: at least `min_wasted` wasted bytes
-/// and at least two member rows from that run. Both are zero when no group matches.
-pub fn group_totals(
-    conn: &Connection,
-    volume_id: i64,
-    run_id: i64,
-    min_wasted: i64,
-) -> Result<(i64, i64)> {
-    Ok(conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(g.wasted_logical),0) FROM dup_groups g \
-         WHERE g.volume_id=?1 AND g.wasted_logical>=?2 \
-         AND (SELECT COUNT(*) FROM files f \
-              WHERE f.volume_id=g.volume_id AND f.full_hash=g.full_hash \
-              AND f.state IN (3,4,5) AND f.last_seen_run_id=?3) >= 2",
-        params![volume_id, min_wasted, run_id],
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-    )?)
+/// Identity used to collapse hard links. `file_id` is a BLOB and `id` an INTEGER,
+/// so the two variants never compare equal (same rule as `COALESCE(file_id, id)`).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum InodeKey {
+    FileId(Vec<u8>),
+    Row(i64),
 }
 
-/// Members of a group (paths), restricted to the latest run for the volume.
-pub fn group_members(
-    conn: &Connection,
-    volume_id: i64,
-    full_hash: &Hash,
-    run_id: i64,
-) -> Result<Vec<(i64, i64, RawPath, i64)>> {
-    let mut stmt = conn.prepare(
-        "SELECT f.id, f.folder_id, f.name, f.size FROM files f \
-         WHERE f.volume_id=?1 AND f.full_hash=?2 AND f.state IN (3,4,5) \
-         AND f.last_seen_run_id=?3",
-    )?;
-    let rows = stmt
-        .query_map(params![volume_id, full_hash.as_bytes(), run_id], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                RawPath::new(r.get::<_, Vec<u8>>(2)?),
-                r.get::<_, i64>(3)?,
-            ))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
+/// One listed member of a duplicate group, before path resolution.
+pub struct GroupMemberRow {
+    pub full_hash: Hash,
+    pub size: i64,
+    pub inode: InodeKey,
+    pub folder_id: i64,
+    pub name: RawPath,
 }
 
-/// One member row from [`volume_group_members`]: `(full_hash, file row id, folder_id, name, size)`.
-pub type GroupMemberRow = (Hash, i64, i64, RawPath, i64);
-
-/// Members of every group on a volume in one pass, ordered by hash then file row id.
-/// Same filters as [`group_members`], applied to the groups [`list_groups`] would return.
+/// Member rows of every `dup_groups` group on a volume that are live in `run_id`,
+/// ordered by `(full_hash, size, file row id)` so equal keys are adjacent.
+/// `min_wasted` prefilters on the stored total; callers re-check it on the listed rows.
 pub fn volume_group_members(
     conn: &Connection,
     volume_id: i64,
@@ -689,22 +712,25 @@ pub fn volume_group_members(
     min_wasted: i64,
 ) -> Result<Vec<GroupMemberRow>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT g.full_hash, f.id, f.folder_id, f.name, f.size FROM dup_groups g \
-         JOIN files f ON f.volume_id=g.volume_id AND f.full_hash=g.full_hash \
+        "SELECT f.full_hash, f.size, f.file_id, f.id, f.folder_id, f.name \
+         FROM dup_groups g \
+         JOIN files f ON f.volume_id=g.volume_id AND f.full_hash=g.full_hash AND f.size=g.size \
          WHERE g.volume_id=?1 AND g.wasted_logical>=?2 \
-         AND f.full_hash IS NOT NULL AND f.state IN (3,4,5) AND f.last_seen_run_id=?3 \
-         ORDER BY g.full_hash, f.id",
+           AND f.state IN (3,4,5) AND f.last_seen_run_id=?3 \
+         ORDER BY f.full_hash, f.size, f.id",
     )?;
     let rows = stmt
         .query_map(params![volume_id, min_wasted, run_id], |r| {
             let h: Vec<u8> = r.get(0)?;
-            Ok((
-                Hash::from_slice(&h).unwrap_or(Hash([0; 16])),
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-                RawPath::new(r.get::<_, Vec<u8>>(3)?),
-                r.get::<_, i64>(4)?,
-            ))
+            let file_id: Option<Vec<u8>> = r.get(2)?;
+            let id: i64 = r.get(3)?;
+            Ok(GroupMemberRow {
+                full_hash: Hash::from_slice(&h).unwrap_or(Hash([0; 16])),
+                size: r.get(1)?,
+                inode: file_id.map_or(InodeKey::Row(id), InodeKey::FileId),
+                folder_id: r.get(4)?,
+                name: RawPath::new(r.get::<_, Vec<u8>>(5)?),
+            })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
@@ -727,9 +753,21 @@ pub fn insert_run(conn: &Connection, cli_args: &str, profile: &str, now: i64) ->
 }
 
 pub fn finish_run(conn: &Connection, run_id: i64, now: i64) -> Result<()> {
-    conn.execute(
-        "UPDATE scan_runs SET status='finished', finished_at=?1 WHERE id=?2",
+    let n = conn.execute(
+        "UPDATE scan_runs SET status='finished', finished_at=?1 WHERE id=?2 AND status='running'",
         params![now, run_id],
+    )?;
+    if n == 0 {
+        tracing::warn!(run_id, "run was no longer running; not marked finished");
+    }
+    Ok(())
+}
+
+/// Records which enumerator produced the run's file list (see `scan_runs.enumerator`).
+pub fn set_run_enumerator(conn: &Connection, run_id: i64, enumerator: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE scan_runs SET enumerator=?1 WHERE id=?2",
+        params![enumerator, run_id],
     )?;
     Ok(())
 }
@@ -889,8 +927,14 @@ pub fn stale_count(conn: &Connection, volume_id: i64, run_id: i64) -> Result<i64
     )?)
 }
 
-pub fn total_files(conn: &Connection) -> Result<i64> {
-    Ok(conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?)
+/// File counts seen by one run on one volume: `(enumerated, skipped, errored)`.
+pub fn run_file_counts(conn: &Connection, volume_id: i64, run_id: i64) -> Result<(i64, i64, i64)> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(state=-1),0), COALESCE(SUM(state=-2),0) \
+         FROM files WHERE volume_id=?1 AND last_seen_run_id=?2",
+        params![volume_id, run_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?)
 }
 
 #[cfg(test)]
@@ -1026,7 +1070,7 @@ mod tests {
             )
             .unwrap();
         }
-        recompute_groups(&conn, 1, 0).unwrap();
+        recompute_groups(&conn, 1, 1, 0).unwrap();
         let g = list_groups(&conn, 1, 0).unwrap();
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].distinct_inodes, 2);
