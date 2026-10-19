@@ -36,9 +36,14 @@ const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
 const PLACEHOLDER_ATTRIBUTES: u32 =
     FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
 
-/// Reparse tags that make a file a link. Other tags (cloud, dedup, WOF) stay regular files.
-/// Unconfirmed against real volumes; the Windows self-check test verifies the set.
+/// Microsoft reparse-tag bit: the reparse point names another file system object. std (and
+/// so walkdir) treats exactly these as symlinks on Windows. Cloud, dedup and WOF tags do not
+/// carry it, so those entries stay regular. Unconfirmed against real volumes; the Windows
+/// self-check test verifies the classification.
+const IO_REPARSE_TAG_NAME_SURROGATE: u32 = 0x2000_0000;
+#[cfg(test)]
 const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+#[cfg(test)]
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 
 /// Which `$FILE_NAME` namespace a name was stored under.
@@ -114,6 +119,21 @@ impl VolumeTree {
         }
     }
 
+    /// Builds a tree from `facts` with the same filtering and budget check as [`Self::push`].
+    ///
+    /// The first record that breaks the budget fails the whole build, so no partial tree escapes.
+    pub fn from_facts(
+        root_record: u64,
+        mem_budget: usize,
+        facts: impl IntoIterator<Item = RecordFacts>,
+    ) -> Result<Self, BudgetExceeded> {
+        let mut tree = Self::new(root_record, mem_budget);
+        for record in facts {
+            tree.push(record)?;
+        }
+        Ok(tree)
+    }
+
     /// Stores one record. Unused records, metafiles, and DOS-only names are dropped here,
     /// so they never reach the index.
     ///
@@ -145,6 +165,20 @@ impl VolumeTree {
         Ok(())
     }
 
+    /// Stored records in ascending record-number order, as [`Self::push`] kept them.
+    pub fn records_iter(&self) -> impl ExactSizeIterator<Item = &RecordFacts> {
+        self.records.values()
+    }
+
+    /// Drops a stored record and releases its estimated cost from the budget.
+    ///
+    /// Does nothing when the record is not stored.
+    pub fn remove(&mut self, record: u64) {
+        if let Some(facts) = self.records.remove(&record) {
+            self.used_bytes = self.used_bytes.saturating_sub(record_cost(&facts));
+        }
+    }
+
     /// Visits every walk item under the root without collecting them.
     ///
     /// Order: the root directory first, then every other directory in path byte order (a
@@ -161,11 +195,21 @@ impl VolumeTree {
     ///
     /// Paths are `root_prefix` joined with the on-disk names, so they match the paths the
     /// generic walker yields for the same root. Each hard-link name yields its own file item.
-    /// Directories with a reparse point are yielded as symlink files and never descended.
+    /// Directories with a name-surrogate reparse point are yielded as symlink files and never descended.
     ///
     /// `to_component` converts one UTF-16 name to a path component (the caller uses the
     /// path codec on the wide name). A visitor error stops emission at that item and is
     /// returned unchanged.
+    /// Checks the scan root before anything is visited. An empty success would let the
+    /// rescan delete every row under the root.
+    pub fn check_root(&self) -> Result<(), &'static str> {
+        match self.records.get(&self.root) {
+            None => Err("root record is not in the index (metafile range or unreadable)"),
+            Some(f) if kind_of(f) != EntryKind::Directory => Err("root record is not a directory"),
+            Some(_) => Ok(()),
+        }
+    }
+
     pub fn emit_items<E>(
         self,
         root_prefix: &RawPath,
@@ -173,6 +217,7 @@ impl VolumeTree {
         visit: &mut dyn FnMut(WalkItem) -> Result<(), E>,
     ) -> Result<(), E> {
         let Self { root, records, .. } = self;
+        // `check_root` makes these early returns unreachable in practice.
         let Some(root_facts) = records.get(&root) else {
             return Ok(());
         };
@@ -332,21 +377,27 @@ fn reach_directories(
 
 fn path_of(item: &WalkItem) -> &RawPath {
     match item {
-        WalkItem::Dir { path } | WalkItem::File { path, .. } => path,
+        WalkItem::Dir { path } | WalkItem::File { path, .. } | WalkItem::Error { path, .. } => path,
     }
 }
 
 /// Classifies a record as directory, symlink or regular file.
 ///
-/// A directory with any reparse point is a symlink (junction, mount point, or a cloud
-/// folder), so its contents are never walked. A file is a symlink only for the symlink or
-/// mount-point tag. Other reparse tags on files stay regular.
+/// A record is a link only when its reparse tag is a name surrogate (symlink, junction,
+/// mount point, LX symlink), the same rule std and walkdir apply. A cloud directory
+/// (OneDrive) is therefore walked, like the walker does. If the tag could not be read,
+/// a reparse directory is not descended (a conservative `Symlink`) and a file stays regular.
 pub fn kind_of(f: &RecordFacts) -> EntryKind {
-    match (f.is_dir, has_reparse_point(f), f.reparse_tag) {
-        (true, true, _) => EntryKind::Symlink,
-        (true, false, _) => EntryKind::Directory,
-        (false, _, Some(IO_REPARSE_TAG_SYMLINK | IO_REPARSE_TAG_MOUNT_POINT)) => EntryKind::Symlink,
-        (false, _, _) => EntryKind::RegularFile,
+    let reparse = has_reparse_point(f);
+    let surrogate = f
+        .reparse_tag
+        .is_some_and(|t| t & IO_REPARSE_TAG_NAME_SURROGATE != 0);
+    let unknown_dir_reparse = f.is_dir && reparse && f.reparse_tag.is_none();
+    match (f.is_dir, reparse && surrogate) {
+        (_, true) => EntryKind::Symlink,
+        (true, false) if unknown_dir_reparse => EntryKind::Symlink,
+        (true, false) => EntryKind::Directory,
+        (false, false) => EntryKind::RegularFile,
     }
 }
 
@@ -383,6 +434,7 @@ pub fn file_meta_of(f: &RecordFacts, links: i64) -> Option<FileMeta> {
         attr_bits |= attrs::HARDLINK;
     }
     Some(FileMeta {
+        dev: None,
         file_id: Some(file_id),
         nlink: links,
         size,
@@ -497,7 +549,7 @@ mod tests {
             .iter()
             .filter_map(|item| match item {
                 WalkItem::File { path, meta } => Some((path.to_display(), meta.clone())),
-                WalkItem::Dir { .. } => None,
+                WalkItem::Dir { .. } | WalkItem::Error { .. } => None,
             })
             .collect()
     }
@@ -1008,6 +1060,7 @@ mod tests {
                 kinds.push(match item {
                     WalkItem::Dir { .. } => "dir",
                     WalkItem::File { .. } => "file",
+                    WalkItem::Error { .. } => "error",
                 });
                 Ok(())
             });
@@ -1016,6 +1069,78 @@ mod tests {
             kinds,
             ["dir", "dir", "file"],
             "the root and the subdirectory must both precede the file"
+        );
+    }
+
+    #[test]
+    fn remove_should_drop_record_and_release_budget() {
+        let mut tree = build(5, vec![root_dir()]);
+        let before = tree.used_bytes;
+        tree.push(file(30, vec![win32(5, "x")]))
+            .expect("test budget is large enough");
+        tree.remove(30);
+        assert_eq!(
+            tree.used_bytes, before,
+            "removing a record must release exactly the cost it added"
+        );
+        assert!(
+            tree.records_iter().all(|facts| facts.record != 30),
+            "a removed record must no longer be stored"
+        );
+    }
+
+    #[test]
+    fn remove_should_do_nothing_when_record_absent() {
+        let mut tree = build(5, vec![root_dir()]);
+        let before = tree.used_bytes;
+        tree.remove(99);
+        assert_eq!(
+            tree.used_bytes, before,
+            "removing an absent record must not change the budget"
+        );
+        assert_eq!(
+            tree.records_iter().count(),
+            1,
+            "removing an absent record must not drop stored records"
+        );
+    }
+
+    #[test]
+    fn records_iter_should_yield_in_record_order() {
+        let tree = build(
+            SCAN_ROOT,
+            vec![
+                file(40, vec![win32(SCAN_ROOT, "c")]),
+                dir(25, vec![win32(SCAN_ROOT, "b")]),
+                root_at(SCAN_ROOT),
+            ],
+        );
+        let order: Vec<u64> = tree.records_iter().map(|facts| facts.record).collect();
+        assert_eq!(
+            order,
+            [SCAN_ROOT, 25, 40],
+            "records must be yielded in ascending record-number order"
+        );
+    }
+
+    #[test]
+    fn from_facts_should_match_push_when_same_records() {
+        let built = VolumeTree::from_facts(SCAN_ROOT, 1 << 24, nested_records())
+            .expect("test budget is large enough");
+        let pushed = build(SCAN_ROOT, nested_records());
+        assert_eq!(
+            built.records_iter().collect::<Vec<_>>(),
+            pushed.records_iter().collect::<Vec<_>>(),
+            "from_facts must store the same records as push, in the same order"
+        );
+    }
+
+    #[test]
+    fn from_facts_should_error_when_budget_too_small() {
+        let result = VolumeTree::from_facts(5, 16, vec![root_dir()]);
+        assert!(
+            matches!(result, Err(BudgetExceeded { limit_bytes: 16 })),
+            "a budget too small for one record must fail with BudgetExceeded"
         );
     }
 }

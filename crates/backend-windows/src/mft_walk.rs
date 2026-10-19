@@ -6,6 +6,7 @@
 use std::error::Error;
 use std::fmt;
 use std::io::{Read, Seek};
+use std::sync::Arc;
 
 use ntfs::Ntfs;
 
@@ -13,17 +14,33 @@ use dedupe_core::error::{CoreError, Result as CoreResult};
 use dedupe_core::path::RawPath;
 use dedupe_core::traits::WalkItem;
 
-use crate::records::{extract_record, RecordError};
+use crate::records::{ensure_mft_runlist_in_base, extract_record, RecordError};
 use crate::sector::SectorReader;
 use crate::tree::{BudgetExceeded, RecordFacts, VolumeTree};
 
 /// Cache chunk for the sector reader. A multiple of 4 KiB, so each volume read covers many
 /// records, and a multiple of every common sector size.
-const READ_CHUNK_BYTES: u64 = 1 << 20;
+const READ_CHUNK_BYTES: u64 = 4 << 20;
 /// How often the walk polls the cancel flag, counted in records and in visited items.
 const CANCEL_CHECK_INTERVAL: u64 = 4096;
-/// Record errors up to this count are tolerated even on a small volume.
-const MIN_RECORD_ERROR_LIMIT: u64 = 1000;
+
+/// What the record-read loop reports. Progress only; the walk never depends on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MftEvent {
+    /// The walk will read `records` record slots.
+    Started { records: u64 },
+    /// `done` slots have been read so far.
+    Records { done: u64 },
+    /// A cached index was loaded and holds `records` records. Sent before any journal entry is applied.
+    CacheLoaded { records: u64 },
+    /// `entries` journal entries were applied, re-reading `reread` distinct records.
+    DeltaApplied { entries: u64, reread: u64 },
+    /// The `$MFT` attempt ended, by success, fallback, or stop.
+    Finished,
+}
+
+/// Receives [`MftEvent`]s. Shared so the cli can hold the other end.
+pub type MftObserver = Arc<dyn Fn(MftEvent) + Send + Sync>;
 
 /// Volume layout from `FSCTL_GET_NTFS_VOLUME_DATA`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +69,9 @@ pub trait RecordSource {
 
     /// Reads one record. `Ok(None)` means the slot holds no file.
     fn record(&mut self, number: u64) -> Result<Option<RecordFacts>, RecordError>;
+
+    /// Forgets any cached bytes before a retry. Default: nothing is cached.
+    fn invalidate(&mut self) {}
 }
 
 /// Reads records from a volume image through the `ntfs` crate.
@@ -75,11 +95,17 @@ impl<R: Read + Seek> NtfsRecordSource<R> {
             geom.total_bytes,
         );
         let ntfs = Ntfs::new(&mut fs)?;
+        // `Ntfs::file` re-reads record 0 for every record. Pin its chunk so those reads never
+        // evict the streaming window.
+        if let Some(mft) = ntfs.mft_position().value() {
+            fs.pin(mft.get());
+        }
         if u64::from(ntfs.file_record_size()) != geom.bytes_per_record {
             return Err(RecordError::Corrupt(
                 "boot sector record size differs from the volume geometry",
             ));
         }
+        ensure_mft_runlist_in_base(&ntfs, &mut fs)?;
         Ok(Self {
             fs,
             ntfs,
@@ -96,6 +122,25 @@ impl<R: Read + Seek> RecordSource for NtfsRecordSource<R> {
     fn record(&mut self, number: u64) -> Result<Option<RecordFacts>, RecordError> {
         extract_record(&self.ntfs, &mut self.fs, number)
     }
+
+    fn invalidate(&mut self) {
+        self.fs.invalidate();
+    }
+}
+
+/// One retry, for a record caught mid-write (a fixup mismatch on a live volume). The retry
+/// bypasses the chunk cache.
+fn read_with_retry<S: RecordSource>(
+    source: &mut S,
+    number: u64,
+) -> Result<Option<RecordFacts>, RecordError> {
+    match source.record(number) {
+        Err(_) => {
+            source.invalidate();
+            source.record(number)
+        }
+        ok => ok,
+    }
 }
 
 /// Counters for one completed walk.
@@ -103,7 +148,8 @@ impl<R: Read + Seek> RecordSource for NtfsRecordSource<R> {
 pub struct MftStats {
     /// Record slots looked at, including unused and skipped ones.
     pub records_seen: u64,
-    /// Records that failed to read and were skipped.
+    /// Records that failed to read after one retry. The walk stops at the first, so this is
+    /// 0 for a completed walk.
     pub records_skipped_errors: u64,
     /// Items passed to the visitor.
     pub items_emitted: u64,
@@ -115,14 +161,12 @@ pub enum MftError {
     /// The in-memory index would exceed `mem_budget`. Nothing was visited, so the caller can
     /// fall back to the walker.
     BudgetExceeded(BudgetExceeded),
-    /// More records failed than the limit allows. The MFT read is probably broken, not just a
-    /// few damaged records, so the caller should fall back to the walker.
-    TooManyRecordErrors {
-        errors: u64,
-        limit: u64,
-        /// Display text of the first failed record, for diagnostics.
-        first_error: String,
-    },
+    /// A record could not be read after one retry. Any gap can hide a subtree that the
+    /// rescan would then delete as stale, so the whole MFT result is discarded and the
+    /// caller falls back to the walker.
+    RecordFailed { record: u64, error: RecordError },
+    /// The scan root record is absent, filtered, or not a directory.
+    RootUnusable(&'static str),
     /// The cancel flag was set.
     Cancelled,
     /// The visitor returned an error. The walk stopped at that item.
@@ -133,14 +177,10 @@ impl fmt::Display for MftError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BudgetExceeded(err) => write!(f, "{err}"),
-            Self::TooManyRecordErrors {
-                errors,
-                limit,
-                first_error,
-            } => write!(
-                f,
-                "{errors} MFT records failed to read (limit {limit}); first error: {first_error}"
-            ),
+            Self::RecordFailed { record, error } => {
+                write!(f, "MFT record {record} could not be read: {error}")
+            }
+            Self::RootUnusable(why) => write!(f, "scan root is not usable on the MFT path: {why}"),
             Self::Cancelled => write!(f, "MFT walk cancelled"),
             Self::Visit(err) => write!(f, "visitor failed: {err}"),
         }
@@ -152,12 +192,17 @@ impl Error for MftError {
         match self {
             Self::BudgetExceeded(err) => Some(err),
             Self::Visit(err) => Some(err),
-            Self::TooManyRecordErrors { .. } | Self::Cancelled => None,
+            Self::RecordFailed { error, .. } => Some(error),
+            Self::RootUnusable(_) | Self::Cancelled => None,
         }
     }
 }
 
 /// Walks records `0..source.record_count()` and visits the items under `root_record`.
+///
+/// The walk has two parts. [`read_tree`] reads every record into a [`VolumeTree`]. Then
+/// [`emit_tree`] visits the items under the root. Splitting them lets a caller keep or reuse the
+/// tree between the two steps; `walk_mft` runs both in order.
 ///
 /// Records are read into a [`VolumeTree`] first. That is where memory goes: `mem_budget` counts
 /// the stored record facts, and it is checked before any item is visited. Emission then
@@ -169,14 +214,15 @@ impl Error for MftError {
 /// A visitor error stops the walk at the item that failed. No later item is visited, and the
 /// error is returned as [`MftError::Visit`].
 ///
-/// Per-record errors are counted and skipped. NTFS has no documented way to report an unused
-/// or damaged record, and one bad record must not discard a scan that is otherwise good. The
-/// limit in [`record_error_limit`] catches the other case: when a large share of records fail,
-/// the read itself (geometry, offsets, or the device) is suspect, and the walk returns
-/// [`MftError::TooManyRecordErrors`] so the caller falls back to the walker.
+/// A record that fails is retried once (a torn read of a live record shows up as a fixup
+/// mismatch). If it fails again the walk returns [`MftError::RecordFailed`] and the caller
+/// falls back to the walker: one skipped directory record would hide a subtree that the
+/// rescan then deletes as stale, so there is no tolerance.
 ///
 /// `to_component` converts one UTF-16 name to a path component. `cancelled` is polled every
-/// [`CANCEL_CHECK_INTERVAL`] records and items.
+/// [`CANCEL_CHECK_INTERVAL`] records and items. `on_event` gets [`MftEvent::Started`] once, then
+/// [`MftEvent::Records`] at the same interval as the cancel check.
+#[allow(clippy::too_many_arguments)]
 pub fn walk_mft<S: RecordSource>(
     source: &mut S,
     root_record: u64,
@@ -184,57 +230,88 @@ pub fn walk_mft<S: RecordSource>(
     to_component: &dyn Fn(&[u16]) -> RawPath,
     mem_budget: usize,
     cancelled: &dyn Fn() -> bool,
+    on_event: &dyn Fn(MftEvent),
     visit: &mut dyn FnMut(WalkItem) -> CoreResult<()>,
 ) -> Result<MftStats, MftError> {
+    let (tree, mut stats) = read_tree(source, root_record, mem_budget, cancelled, on_event)?;
+    emit_tree(
+        tree,
+        &mut stats,
+        root_prefix,
+        to_component,
+        cancelled,
+        visit,
+    )?;
+    Ok(stats)
+}
+
+/// Reads every record slot into a [`VolumeTree`] of the items under `root_record`.
+///
+/// This is the first half of [`walk_mft`]. It fails on the first record error that survives a
+/// retry, and checks `mem_budget` on each stored record. `cancelled` and `on_event` behave as in
+/// [`walk_mft`]. The returned stats hold the record counters; `items_emitted` stays zero until
+/// [`emit_tree`] runs.
+pub fn read_tree<S: RecordSource>(
+    source: &mut S,
+    root_record: u64,
+    mem_budget: usize,
+    cancelled: &dyn Fn() -> bool,
+    on_event: &dyn Fn(MftEvent),
+) -> Result<(VolumeTree, MftStats), MftError> {
     let record_count = source.record_count();
-    let error_limit = record_error_limit(record_count);
     let mut tree = VolumeTree::new(root_record, mem_budget);
     let mut stats = MftStats::default();
-    let mut first_error: Option<String> = None;
 
+    on_event(MftEvent::Started {
+        records: record_count,
+    });
     for number in 0..record_count {
-        if number % CANCEL_CHECK_INTERVAL == 0 && cancelled() {
-            return Err(MftError::Cancelled);
+        if number % CANCEL_CHECK_INTERVAL == 0 {
+            if cancelled() {
+                return Err(MftError::Cancelled);
+            }
+            on_event(MftEvent::Records { done: number });
         }
         stats.records_seen += 1;
-        match source.record(number) {
+        match read_with_retry(source, number) {
             Ok(Some(facts)) => tree.push(facts).map_err(MftError::BudgetExceeded)?,
             Ok(None) => {}
-            Err(err) => {
-                first_error.get_or_insert_with(|| err.to_string());
-                stats.records_skipped_errors += 1;
-                if stats.records_skipped_errors > error_limit {
-                    return Err(MftError::TooManyRecordErrors {
-                        errors: stats.records_skipped_errors,
-                        limit: error_limit,
-                        first_error: first_error.unwrap_or_default(),
-                    });
-                }
+            Err(error) => {
+                return Err(MftError::RecordFailed {
+                    record: number,
+                    error,
+                });
             }
         }
     }
+    Ok((tree, stats))
+}
 
+/// Visits the items of a tree from [`read_tree`] and counts them in `stats.items_emitted`.
+///
+/// This is the second half of [`walk_mft`]. It consumes `tree`, so the records are released as
+/// emission proceeds. `cancelled` is polled every [`CANCEL_CHECK_INTERVAL`] items. A visitor
+/// error stops emission and is returned as [`MftError::Visit`].
+pub fn emit_tree(
+    tree: VolumeTree,
+    stats: &mut MftStats,
+    root_prefix: &RawPath,
+    to_component: &dyn Fn(&[u16]) -> RawPath,
+    cancelled: &dyn Fn() -> bool,
+    visit: &mut dyn FnMut(WalkItem) -> CoreResult<()>,
+) -> Result<(), MftError> {
     tree.emit_items(
         root_prefix,
         to_component,
         &mut |item: WalkItem| -> Result<(), MftError> {
-            if stats.items_emitted % CANCEL_CHECK_INTERVAL == 0 && cancelled() {
+            if stats.items_emitted.is_multiple_of(CANCEL_CHECK_INTERVAL) && cancelled() {
                 return Err(MftError::Cancelled);
             }
             visit(item).map_err(MftError::Visit)?;
             stats.items_emitted += 1;
             Ok(())
         },
-    )?;
-    Ok(stats)
-}
-
-/// Largest number of skipped record errors a walk of `record_count` slots tolerates.
-///
-/// The limit is 5% of the slots, with a floor so a small volume is not failed by one bad
-/// record.
-fn record_error_limit(record_count: u64) -> u64 {
-    (record_count / 20).max(MIN_RECORD_ERROR_LIMIT)
+    )
 }
 
 #[cfg(test)]
@@ -272,6 +349,30 @@ mod tests {
                 slots[index] = Some(Err("bad record"));
             }
             Self { slots }
+        }
+    }
+
+    /// Fails the first read of one record, then answers like the inner source. Models a
+    /// torn read of a live record that a retry recovers.
+    struct FlakySource {
+        inner: FakeSource,
+        fail_first_call_of: u64,
+        calls: u32,
+    }
+
+    impl RecordSource for FlakySource {
+        fn record_count(&self) -> u64 {
+            self.inner.record_count()
+        }
+
+        fn record(&mut self, number: u64) -> Result<Option<RecordFacts>, RecordError> {
+            if number == self.fail_first_call_of {
+                self.calls += 1;
+                if self.calls == 1 {
+                    return Err(RecordError::Io(io::Error::other("torn read")));
+                }
+            }
+            self.inner.record(number)
         }
     }
 
@@ -330,8 +431,8 @@ mod tests {
     }
 
     /// Runs a walk over `source`, returning the result and every visited item in order.
-    fn walk(
-        source: &mut FakeSource,
+    fn walk<S: RecordSource>(
+        source: &mut S,
         root_record: u64,
         mem_budget: usize,
         cancel: bool,
@@ -344,6 +445,7 @@ mod tests {
             &to_component,
             mem_budget,
             &|| cancel,
+            &|_| {},
             &mut |item: WalkItem| {
                 visited.push(item);
                 Ok(())
@@ -356,7 +458,9 @@ mod tests {
         items
             .iter()
             .map(|item| match item {
-                WalkItem::Dir { path } | WalkItem::File { path, .. } => path.to_display(),
+                WalkItem::Dir { path }
+                | WalkItem::File { path, .. }
+                | WalkItem::Error { path, .. } => path.to_display(),
             })
             .collect()
     }
@@ -440,59 +544,56 @@ mod tests {
     }
 
     #[test]
-    fn walk_mft_should_skip_errors_and_count_them_when_below_limit() {
+    fn walk_mft_should_fail_when_record_errors_twice() {
         let mut source = FakeSource::new(100, sample_records(), &[40, 41]);
         let (result, visited) = walk(&mut source, SCAN_ROOT, BIG_BUDGET, false);
-        let stats = result.expect("two errors are below the limit");
-        assert_eq!(
-            stats.records_skipped_errors, 2,
-            "each failed record must be counted once"
-        );
-        assert_eq!(
-            visited.len(),
-            3,
-            "good records around the failures must still be visited"
-        );
-    }
-
-    #[test]
-    fn walk_mft_should_succeed_when_errors_equal_limit() {
-        // 1000 slots, all failing: the limit is 1000, and the walk fails only above it.
-        let failing: Vec<usize> = (0..1000).collect();
-        let mut source = FakeSource::new(1000, Vec::new(), &failing);
-        let (result, _) = walk(&mut source, SCAN_ROOT, BIG_BUDGET, false);
         assert!(
-            result.is_ok(),
-            "errors equal to the limit must not fail the walk, got {:?}",
-            result.err()
+            matches!(result, Err(MftError::RecordFailed { record: 40, .. })),
+            "the first record that fails twice must fail the walk, got {result:?}"
+        );
+        assert!(
+            visited.is_empty(),
+            "a failed read must visit nothing, got {visited:?}"
         );
     }
 
     #[test]
-    fn walk_mft_should_return_too_many_errors_when_errors_exceed_limit() {
+    fn walk_mft_should_succeed_when_record_fails_once_then_reads() {
+        let mut source = FlakySource {
+            inner: FakeSource::new(32, sample_records(), &[]),
+            fail_first_call_of: SCAN_ROOT,
+            calls: 0,
+        };
+        let (result, visited) = walk(&mut source, SCAN_ROOT, BIG_BUDGET, false);
+        let stats = result.expect("one retry must recover a torn read");
+        assert_eq!(
+            stats.records_skipped_errors, 0,
+            "a recovered record is not a skipped record"
+        );
+        assert_eq!(visited.len(), 3, "the retried record must still be visited");
+    }
+
+    #[test]
+    fn walk_mft_should_report_record_number_when_record_fails() {
         let failing: Vec<usize> = (0..1001).collect();
         let mut source = FakeSource::new(1001, Vec::new(), &failing);
         let (result, _) = walk(&mut source, SCAN_ROOT, BIG_BUDGET, false);
         assert!(
-            matches!(
-                result,
-                Err(MftError::TooManyRecordErrors { limit: 1000, .. })
-            ),
-            "errors above the limit must fail with TooManyRecordErrors, got {result:?}"
+            matches!(result, Err(MftError::RecordFailed { record: 0, .. })),
+            "the walk must stop at the first failing record, got {result:?}"
         );
     }
 
     #[test]
-    fn walk_mft_should_report_first_error_when_too_many_errors() {
-        let failing: Vec<usize> = (0..1001).collect();
-        let mut source = FakeSource::new(1001, Vec::new(), &failing);
+    fn walk_mft_should_carry_error_text_when_record_fails() {
+        let mut source = FakeSource::new(32, sample_records(), &[3]);
         let (result, _) = walk(&mut source, SCAN_ROOT, BIG_BUDGET, false);
-        let Err(MftError::TooManyRecordErrors { first_error, .. }) = result else {
-            panic!("expected TooManyRecordErrors, got {result:?}");
+        let Err(err @ MftError::RecordFailed { .. }) = result else {
+            panic!("expected RecordFailed, got {result:?}");
         };
         assert!(
-            first_error.contains("bad record"),
-            "the first record error must be carried for diagnostics, got {first_error:?}"
+            err.to_string().contains("bad record"),
+            "the record error must be carried for diagnostics, got {err}"
         );
     }
 
@@ -530,6 +631,7 @@ mod tests {
             &to_component,
             BIG_BUDGET,
             &|| false,
+            &|_| {},
             &mut |_item: WalkItem| Err(CoreError::Other("stop".to_string())),
         );
         assert!(
@@ -549,6 +651,7 @@ mod tests {
             &to_component,
             BIG_BUDGET,
             &|| false,
+            &|_| {},
             &mut |_item: WalkItem| {
                 calls += 1;
                 Err(CoreError::Other("stop".to_string()))
@@ -571,6 +674,7 @@ mod tests {
             &to_component,
             BIG_BUDGET,
             &|| false,
+            &|_| {},
             &mut |_item: WalkItem| {
                 calls += 1;
                 if calls == 2 {
@@ -602,12 +706,41 @@ mod tests {
     }
 
     #[test]
+    fn walk_mft_should_report_started_then_increasing_records_when_observer_set() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let mut source = FakeSource::new(32, sample_records(), &[]);
+        let _ = walk_mft(
+            &mut source,
+            SCAN_ROOT,
+            &prefix(),
+            &to_component,
+            BIG_BUDGET,
+            &|| false,
+            &|ev| events.borrow_mut().push(ev),
+            &mut |_item: WalkItem| Ok(()),
+        );
+        let events = events.into_inner();
+        assert_eq!(
+            events.first(),
+            Some(&MftEvent::Started { records: 32 }),
+            "first event is Started"
+        );
+        assert!(
+            events
+                .iter()
+                .skip(1)
+                .all(|ev| matches!(ev, MftEvent::Records { .. })),
+            "only Records events follow Started: {events:?}"
+        );
+    }
+
+    #[test]
     fn walk_mft_should_emit_file_kind_and_links_when_file_has_one_name() {
         let mut source = FakeSource::new(32, sample_records(), &[]);
         let (_, visited) = walk(&mut source, SCAN_ROOT, BIG_BUDGET, false);
         let file = visited.iter().find_map(|item| match item {
             WalkItem::File { meta, .. } => Some(meta.clone()),
-            WalkItem::Dir { .. } => None,
+            WalkItem::Dir { .. } | WalkItem::Error { .. } => None,
         });
         let Some(meta) = file else {
             panic!("the walk must yield the file, got {visited:?}");
@@ -622,6 +755,41 @@ mod tests {
             meta.attrs & attrs::HARDLINK,
             0,
             "a single-name file must not carry the hardlink attribute"
+        );
+    }
+
+    #[test]
+    fn read_tree_then_emit_tree_should_match_walk_mft_when_same_source() {
+        let mut walked_source = FakeSource::new(32, sample_records(), &[]);
+        let (walked_result, walked) = walk(&mut walked_source, SCAN_ROOT, BIG_BUDGET, false);
+        let walked_stats = walked_result.expect("walk completes");
+
+        let mut split_source = FakeSource::new(32, sample_records(), &[]);
+        let (tree, mut stats) =
+            read_tree(&mut split_source, SCAN_ROOT, BIG_BUDGET, &|| false, &|_| {})
+                .expect("read completes");
+        let mut split = Vec::new();
+        emit_tree(
+            tree,
+            &mut stats,
+            &prefix(),
+            &to_component,
+            &|| false,
+            &mut |item: WalkItem| {
+                split.push(item);
+                Ok(())
+            },
+        )
+        .expect("emit completes");
+
+        assert_eq!(
+            paths(&split),
+            paths(&walked),
+            "read_tree then emit_tree must visit the same items in the same order as walk_mft"
+        );
+        assert_eq!(
+            stats, walked_stats,
+            "read_tree then emit_tree must report the same stats as walk_mft"
         );
     }
 
@@ -654,24 +822,6 @@ mod tests {
             geom.record_count(),
             0,
             "a zero record size must yield zero records, not a division panic"
-        );
-    }
-
-    #[test]
-    fn record_error_limit_should_return_floor_when_volume_is_small() {
-        assert_eq!(
-            record_error_limit(19_999),
-            MIN_RECORD_ERROR_LIMIT,
-            "below 20000 records the 5% share is under the floor, so the floor applies"
-        );
-    }
-
-    #[test]
-    fn record_error_limit_should_return_five_percent_when_volume_is_large() {
-        assert_eq!(
-            record_error_limit(1_000_000),
-            50_000,
-            "above the floor the limit is 5% of the record count"
         );
     }
 }

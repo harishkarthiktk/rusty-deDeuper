@@ -17,6 +17,7 @@ dedupe-backend-generic = { path = "../backend-generic" }
 # Pinned exactly: pre-1.0 crate with no documented whole-MFT iterator; upgrade on purpose.
 ntfs = "=0.4.0"
 tracing.workspace = true
+blake3.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

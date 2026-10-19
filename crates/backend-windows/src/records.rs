@@ -44,6 +44,8 @@ pub enum RecordError {
     /// The record parsed, but breaks a layout rule the crate does not check. The reason names
     /// the rule.
     Corrupt(&'static str),
+    /// A valid layout this reader does not handle. The caller falls back to the walker.
+    Unsupported(&'static str),
 }
 
 impl fmt::Display for RecordError {
@@ -52,6 +54,7 @@ impl fmt::Display for RecordError {
             Self::Ntfs(err) => write!(f, "ntfs: {err}"),
             Self::Io(err) => write!(f, "io: {err}"),
             Self::Corrupt(reason) => write!(f, "corrupt record: {reason}"),
+            Self::Unsupported(reason) => write!(f, "unsupported: {reason}"),
         }
     }
 }
@@ -61,7 +64,7 @@ impl Error for RecordError {
         match self {
             Self::Ntfs(err) => Some(err),
             Self::Io(err) => Some(err),
-            Self::Corrupt(_) => None,
+            Self::Corrupt(_) | Self::Unsupported(_) => None,
         }
     }
 }
@@ -90,11 +93,29 @@ const _: fn() = || {
     assert_send_sync::<RecordError>();
 };
 
+/// Fails when `$MFT` (record 0) has an `$ATTRIBUTE_LIST`. ntfs 0.4.0 locates records from
+/// the base record's `$DATA` runlist only, so records in later extents would be unreadable.
+pub fn ensure_mft_runlist_in_base<T: Read + Seek>(
+    ntfs: &Ntfs,
+    fs: &mut T,
+) -> Result<(), RecordError> {
+    let mft = ntfs.file(fs, 0)?;
+    for attribute in mft.attributes_raw() {
+        if attribute?.ty()? == NtfsAttributeType::AttributeList {
+            return Err(RecordError::Unsupported(
+                "$MFT is fragmented into an attribute list; the MFT fast path does not support it",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Reads record `record` and returns its facts.
 ///
 /// Returns `Ok(None)` for three kinds of record that are not files on their own:
-/// - a record that was never written (no `FILE` signature), which the crate reports as an error
-///   and this function treats as free space;
+/// - a record that was never written (an all-zero signature), which the crate reports as an
+///   error and this function treats as free space. A `BAAD` or unknown signature is a damaged
+///   slot and is an `Err`;
 /// - a record whose IN_USE flag is clear (deleted, or free);
 /// - an extension record, whose base-record reference is non-zero. Its attributes belong to
 ///   the base record, which is the one that is yielded.
@@ -107,7 +128,18 @@ pub fn extract_record<T: Read + Seek>(
 ) -> Result<Option<RecordFacts>, RecordError> {
     let file = match ntfs.file(fs, record) {
         Ok(file) => file,
-        Err(NtfsError::InvalidFileSignature { .. }) => return Ok(None),
+        // Never written: free space.
+        Err(NtfsError::InvalidFileSignature {
+            actual: [0, 0, 0, 0],
+            ..
+        }) => return Ok(None),
+        // "BAAD" (multi-sector transfer failed) or garbage: a damaged slot, not free space.
+        Err(NtfsError::InvalidFileSignature { actual, .. }) if &actual == b"BAAD" => {
+            return Err(RecordError::Corrupt("record is marked BAAD; run chkdsk"));
+        }
+        Err(NtfsError::InvalidFileSignature { .. }) => {
+            return Err(RecordError::Corrupt("record has an unknown signature"));
+        }
         Err(err) => return Err(err.into()),
     };
     if !file.flags().contains(NtfsFileFlags::IN_USE) {
@@ -139,7 +171,8 @@ pub fn extract_record<T: Read + Seek>(
         attrs,
         reparse_tag,
         mtime_ft: info.modification_time().nt_timestamp(),
-        ctime_ft: info.creation_time().nt_timestamp(),
+        // ChangeTime of $STANDARD_INFORMATION, the same instant the walker reads as ChangeTime.
+        ctime_ft: info.mft_record_modification_time().nt_timestamp(),
         size,
         names: file_names(&file, fs)?,
     }))

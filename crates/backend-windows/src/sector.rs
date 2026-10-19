@@ -7,28 +7,67 @@
 
 use std::io::{self, Read, Seek, SeekFrom};
 
+/// One cached aligned window of the source.
+struct Slot {
+    buf: Vec<u8>,
+    /// Source offset of `buf[0]`. Always a multiple of `chunk`.
+    start: u64,
+    /// One past the last valid source offset in `buf`. Equal to `start` when empty.
+    end: u64,
+}
+
+impl Slot {
+    fn empty() -> Self {
+        Slot {
+            buf: Vec::new(),
+            start: 0,
+            end: 0,
+        }
+    }
+
+    fn contains(&self, pos: u64) -> bool {
+        (self.start..self.end).contains(&pos)
+    }
+}
+
 /// Reads arbitrary byte ranges from a source that only accepts aligned requests.
 ///
 /// Invariant: every `read` issued on `inner` has an offset and a length that are
 /// multiples of the sector size. The source is assumed to hold whole sectors.
+///
+/// Two windows are cached: a streaming window for sequential reads, and an optional
+/// pinned window for one hot chunk, so reads of it never evict the stream.
 pub struct SectorReader<R> {
     inner: R,
     sector: u64,
     chunk: u64,
     len: u64,
     pos: u64,
-    cache: Vec<u8>,
-    /// Source offset of `cache[0]`. Always a multiple of `chunk`.
-    cache_start: u64,
-    /// One past the last valid source offset in the cache. Equal to `cache_start` when empty.
-    cache_end: u64,
+    /// Streaming window for sequential record reads.
+    stream: Slot,
+    /// Window pinned to one hot chunk (the `$MFT` record 0 that `Ntfs::file` re-reads).
+    pinned: Slot,
+    /// Chunk-aligned start of the pinned chunk, if any.
+    pin_at: Option<u64>,
 }
 
 impl<R: Read + Seek> SectorReader<R> {
+    /// Keeps the chunk that holds `offset` in its own slot, so reads of it never evict the
+    /// streaming window.
+    pub fn pin(&mut self, offset: u64) {
+        self.pin_at = Some(offset - offset % self.chunk);
+    }
+
+    /// Drops cached bytes so the next read goes to the source. Used to retry a torn record.
+    pub fn invalidate(&mut self) {
+        self.stream.end = self.stream.start;
+        self.pinned.end = self.pinned.start;
+    }
+
     /// Wraps `inner`, a source of `len` bytes.
     ///
     /// A `sector_size` of 0 is treated as 1. `chunk` is rounded down to a multiple of the
-    /// sector size, with a minimum of one sector. The cache buffer is allocated on the
+    /// sector size, with a minimum of one sector. The cache buffers are allocated on the
     /// first read, not here.
     pub fn new(inner: R, sector_size: u64, chunk: u64, len: u64) -> Self {
         let sector = sector_size.max(1);
@@ -39,52 +78,84 @@ impl<R: Read + Seek> SectorReader<R> {
             chunk,
             len,
             pos: 0,
-            cache: Vec::new(),
-            cache_start: 0,
-            cache_end: 0,
+            stream: Slot::empty(),
+            pinned: Slot::empty(),
+            pin_at: None,
         }
     }
 
-    /// Loads the chunk that contains `pos` with aligned requests only.
-    fn fill(&mut self, pos: u64) -> io::Result<()> {
+    /// The slot that serves `pos`, loaded first if it does not hold it yet.
+    fn slot_for(&mut self, pos: u64) -> io::Result<&Slot> {
         let start = pos - pos % self.chunk;
-        let remaining = self.len - start;
-        // Bytes the caller may see from this chunk.
-        let needed = remaining.min(self.chunk);
-        // The last block is requested in whole sectors, capped at one chunk.
-        let request = remaining
-            .checked_next_multiple_of(self.sector)
-            .map_or(self.chunk, |rounded| rounded.min(self.chunk));
-
-        let needed_len = to_usize(needed)?;
-        let request_len = to_usize(request)?;
-        let chunk_len = to_usize(self.chunk)?;
-        if self.cache.len() < chunk_len {
-            self.cache.resize(chunk_len, 0);
+        let use_pinned = self.pin_at == Some(start);
+        let hit = if use_pinned {
+            self.pinned.contains(pos)
+        } else {
+            self.stream.contains(pos)
+        };
+        if !hit {
+            let (inner, sector, chunk, len) = (&mut self.inner, self.sector, self.chunk, self.len);
+            let slot = if use_pinned {
+                &mut self.pinned
+            } else {
+                &mut self.stream
+            };
+            fill_slot(inner, slot, sector, chunk, len, pos)?;
         }
-
-        // Mark the cache empty first so a failed fill cannot serve stale bytes.
-        self.cache_start = start;
-        self.cache_end = start;
-        self.inner.seek(SeekFrom::Start(start))?;
-
-        let mut filled = 0usize;
-        while filled < needed_len {
-            match self.inner.read(&mut self.cache[filled..request_len]) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "source ended before its declared length",
-                    ));
-                }
-                Ok(n) => filled += n,
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-                Err(err) => return Err(err),
-            }
-        }
-        self.cache_end = start + needed;
-        Ok(())
+        Ok(if use_pinned {
+            &self.pinned
+        } else {
+            &self.stream
+        })
     }
+}
+
+/// Loads the chunk that contains `pos` into `slot` with aligned requests only.
+fn fill_slot<R: Read + Seek>(
+    inner: &mut R,
+    slot: &mut Slot,
+    sector: u64,
+    chunk: u64,
+    len: u64,
+    pos: u64,
+) -> io::Result<()> {
+    let start = pos - pos % chunk;
+    let remaining = len - start;
+    // Bytes the caller may see from this chunk.
+    let needed = remaining.min(chunk);
+    // The last block is requested in whole sectors, capped at one chunk.
+    let request = remaining
+        .checked_next_multiple_of(sector)
+        .map_or(chunk, |rounded| rounded.min(chunk));
+
+    let needed_len = to_usize(needed)?;
+    let request_len = to_usize(request)?;
+    let chunk_len = to_usize(chunk)?;
+    if slot.buf.len() < chunk_len {
+        slot.buf.resize(chunk_len, 0);
+    }
+
+    // Mark the slot empty first so a failed fill cannot serve stale bytes.
+    slot.start = start;
+    slot.end = start;
+    inner.seek(SeekFrom::Start(start))?;
+
+    let mut filled = 0usize;
+    while filled < needed_len {
+        match inner.read(&mut slot.buf[filled..request_len]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "source ended before its declared length",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    slot.end = start + needed;
+    Ok(())
 }
 
 impl<R: Read + Seek> Read for SectorReader<R> {
@@ -92,14 +163,13 @@ impl<R: Read + Seek> Read for SectorReader<R> {
         if buf.is_empty() || self.pos >= self.len {
             return Ok(0);
         }
-        if !(self.cache_start..self.cache_end).contains(&self.pos) {
-            self.fill(self.pos)?;
-        }
-        // `fill` guarantees `pos` is inside the cache, so `available` is at least 1.
-        let within = to_usize(self.pos - self.cache_start)?;
-        let available = to_usize(self.cache_end - self.pos)?;
+        let pos = self.pos;
+        let slot = self.slot_for(pos)?;
+        // `slot_for` guarantees `pos` is inside the slot, so `available` is at least 1.
+        let within = to_usize(pos - slot.start)?;
+        let available = to_usize(slot.end - pos)?;
         let n = buf.len().min(available);
-        buf[..n].copy_from_slice(&self.cache[within..within + n]);
+        buf[..n].copy_from_slice(&slot.buf[within..within + n]);
         self.pos += to_u64(n)?;
         Ok(n)
     }
@@ -173,7 +243,7 @@ mod tests {
             let offset = self.inner.position();
             self.requests.push((offset, buf.len()));
             let len = to_u64(buf.len())?;
-            if offset % self.sector != 0 || len % self.sector != 0 {
+            if !offset.is_multiple_of(self.sector) || !len.is_multiple_of(self.sector) {
                 return Err(io::Error::other(format!(
                     "unaligned read at offset {offset} length {len}"
                 )));
@@ -435,11 +505,9 @@ mod tests {
             reader.seek(SeekFrom::Start(offset)).expect("seek");
             read_n(&mut reader, 37).expect("read");
         }
-        let all_aligned = reader
-            .inner
-            .requests
-            .iter()
-            .all(|&(offset, len)| offset % SECTOR == 0 && len as u64 % SECTOR == 0);
+        let all_aligned = reader.inner.requests.iter().all(|&(offset, len)| {
+            offset.is_multiple_of(SECTOR) && (len as u64).is_multiple_of(SECTOR)
+        });
         assert!(
             all_aligned,
             "every source request must be sector aligned, got {:?}",

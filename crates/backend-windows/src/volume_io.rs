@@ -11,6 +11,7 @@ use crate::mft_walk::VolumeGeometry;
 const VOLUME_DATA_LEN: usize = 96;
 /// Field offsets inside `NTFS_VOLUME_DATA_BUFFER`, little-endian. The Windows-only layout test
 /// checks each one against the windows-sys struct, so a drift fails the Windows build.
+const OFFSET_VOLUME_SERIAL: usize = 0;
 const OFFSET_TOTAL_CLUSTERS: usize = 16;
 const OFFSET_BYTES_PER_SECTOR: usize = 40;
 const OFFSET_BYTES_PER_CLUSTER: usize = 44;
@@ -33,7 +34,9 @@ pub fn raw_volume_path(volume_root: &[u16]) -> Option<Vec<u16>> {
 
 /// Device name for a root whose trailing backslashes are already removed.
 fn device_name(root: &str) -> Option<String> {
-    if let Some(letter) = drive_letter(root) {
+    // A canonicalized scan root arrives as `\\?\C:\`, so accept the verbatim prefix too.
+    let bare = root.strip_prefix(r"\\?\").unwrap_or(root);
+    if let Some(letter) = drive_letter(bare) {
         return Some(format!(r"\\.\{letter}:"));
     }
     let guid = root.strip_prefix(r"\\?\Volume{")?.strip_suffix('}')?;
@@ -57,6 +60,16 @@ fn is_guid(text: &str) -> bool {
             8 | 13 | 18 | 23 => byte == b'-',
             _ => byte.is_ascii_hexdigit(),
         })
+}
+
+/// `\\?\Volume{GUID}\rest` -> `\\?\Volume{GUID}\`. `None` for any other shape.
+pub fn guid_volume_prefix(final_path: &[u16]) -> Option<Vec<u16>> {
+    const HEAD: &str = r"\\?\Volume{";
+    // `\\?\Volume{` + 36 GUID characters + `}`.
+    let prefix_len = HEAD.len() + 36 + 1;
+    let head = String::from_utf16(final_path.get(..prefix_len)?).ok()?;
+    let guid = head.strip_prefix(HEAD)?.strip_suffix('}')?;
+    is_guid(guid).then(|| format!("{head}\\").encode_utf16().collect())
 }
 
 /// Parses an `NTFS_VOLUME_DATA_BUFFER` image into the geometry the MFT walk needs.
@@ -84,6 +97,18 @@ pub fn geometry_from_volume_data(buf: &[u8]) -> Option<VolumeGeometry> {
     })
 }
 
+/// The NTFS volume serial number from an `NTFS_VOLUME_DATA_BUFFER` image, as its raw bits.
+///
+/// Returns `None` when the buffer is shorter than the struct. The field is signed on the wire,
+/// so a negative value keeps its bit pattern.
+pub fn volume_serial_from_volume_data(buf: &[u8]) -> Option<u64> {
+    if buf.len() < VOLUME_DATA_LEN {
+        return None;
+    }
+    // The serial is an opaque 64-bit id, so reinterpret the bits as unsigned.
+    read_i64(buf, OFFSET_VOLUME_SERIAL).map(|serial| serial as u64)
+}
+
 /// The record number inside a file reference, with the reuse count removed.
 pub fn record_number_of(frn: u64) -> u64 {
     frn & RECORD_NUMBER_MASK
@@ -102,7 +127,10 @@ fn read_i64(buf: &[u8], offset: usize) -> Option<i64> {
 }
 
 #[cfg(windows)]
-pub use win32::{frn_of, ntfs_volume_data, open_raw_volume, RawVolume};
+pub use win32::{
+    frn_of, ntfs_volume_data, ntfs_volume_serial, open_raw_volume, resolve_root, RawVolume,
+    ResolvedRoot,
+};
 
 #[cfg(windows)]
 mod win32 {
@@ -120,16 +148,20 @@ mod win32 {
     use dedupe_backend_generic::win_sys::{open_handle, to_wide_nul, OwnedHandle};
     use windows_sys::Win32::Foundation::{FILETIME, GENERIC_READ};
     use windows_sys::Win32::Storage::FileSystem::{
-        GetFileInformationByHandle, ReadFile, SetFilePointerEx, BY_HANDLE_FILE_INFORMATION,
-        FILE_BEGIN, FILE_CURRENT, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        GetFileInformationByHandle, GetFinalPathNameByHandleW, ReadFile, SetFilePointerEx,
+        BY_HANDLE_FILE_INFORMATION, FILE_BEGIN, FILE_CURRENT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        VOLUME_NAME_GUID,
     };
     use windows_sys::Win32::System::Ioctl::{
         FSCTL_GET_NTFS_VOLUME_DATA, GET_LENGTH_INFORMATION, IOCTL_DISK_GET_LENGTH_INFO,
     };
     use windows_sys::Win32::System::IO::DeviceIoControl;
 
-    use super::{geometry_from_volume_data, raw_volume_path, VOLUME_DATA_LEN};
+    use super::{
+        geometry_from_volume_data, guid_volume_prefix, raw_volume_path,
+        volume_serial_from_volume_data, VOLUME_DATA_LEN,
+    };
     use crate::mft_walk::VolumeGeometry;
 
     /// `GET_LENGTH_INFORMATION` is one little-endian i64. A `const` assert keeps the byte
@@ -166,6 +198,14 @@ mod win32 {
         Ok(RawVolume { handle, len })
     }
 
+    impl RawVolume {
+        /// Runs a control code that takes `input` and writes into `out`, and returns how many
+        /// bytes the kernel wrote. Used for the USN journal controls, which take a request record.
+        pub fn ioctl(&self, code: u32, input: &[u8], out: &mut [u8]) -> io::Result<usize> {
+            ioctl_io(&self.handle, code, input, out)
+        }
+    }
+
     /// NTFS geometry of an open volume, from `FSCTL_GET_NTFS_VOLUME_DATA`.
     ///
     /// Fails for a volume that is not NTFS, because the control code is then rejected.
@@ -180,16 +220,20 @@ mod win32 {
         })
     }
 
-    /// The 64-bit file reference (file index) of `path`. Directories are included.
-    pub fn frn_of(path: &Path) -> io::Result<u64> {
-        // Read-attributes access needs no read rights. Backup semantics let the call open a
-        // directory, which a plain file open refuses.
-        let handle = open_handle(
-            &to_wide_nul(path.as_os_str()),
-            FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_FLAG_BACKUP_SEMANTICS,
-        )?;
+    /// The NTFS volume serial number, from `FSCTL_GET_NTFS_VOLUME_DATA`. It keys the cache file.
+    pub fn ntfs_volume_serial(vol: &RawVolume) -> io::Result<u64> {
+        let mut buf = [0u8; VOLUME_DATA_LEN];
+        let written = ioctl_output(&vol.handle, FSCTL_GET_NTFS_VOLUME_DATA, &mut buf)?;
+        volume_serial_from_volume_data(&buf[..written]).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "NTFS volume data is missing or malformed",
+            )
+        })
+    }
+
+    /// `BY_HANDLE_FILE_INFORMATION` of an open handle.
+    fn by_handle_info(handle: &OwnedHandle) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
         let mut info = BY_HANDLE_FILE_INFORMATION {
             dwFileAttributes: 0,
             ftCreationTime: ZERO_FILETIME,
@@ -202,13 +246,78 @@ mod win32 {
             nFileIndexHigh: 0,
             nFileIndexLow: 0,
         };
-        // SAFETY: `handle` is a live handle this frame owns. `info` is a live, writable
+        // SAFETY: `handle` is a live handle the caller owns. `info` is a live, writable
         // `BY_HANDLE_FILE_INFORMATION`, and it is read only after the call reports success.
         let ok = unsafe { GetFileInformationByHandle(handle.raw(), &mut info) };
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
+        Ok(info)
+    }
+
+    /// Opens `path` for attribute reads, following any link (like walkdir's root). Read
+    /// attributes access needs no read rights, and backup semantics let the call open a
+    /// directory, which a plain file open refuses.
+    fn open_for_attributes(path: &Path) -> io::Result<OwnedHandle> {
+        open_handle(
+            &to_wide_nul(path.as_os_str()),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_BACKUP_SEMANTICS,
+        )
+    }
+
+    /// The 64-bit file reference (file index) of `path`. Directories are included.
+    pub fn frn_of(path: &Path) -> io::Result<u64> {
+        let info = by_handle_info(&open_for_attributes(path)?)?;
         Ok((u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow))
+    }
+
+    /// The scan root as the file system sees it after following any link.
+    pub struct ResolvedRoot {
+        /// File reference of the (followed) root directory.
+        pub frn: u64,
+        /// `dwVolumeSerialNumber` of the volume that really holds the root.
+        pub serial_low: u32,
+        /// `\\?\Volume{GUID}\`, the raw volume to read.
+        pub volume_root: Vec<u16>,
+    }
+
+    /// Opens the root once, following links, and reads its file index, volume serial and
+    /// GUID volume path from that one handle. The volume and the record number therefore
+    /// always describe the same object, even when the root is a junction.
+    pub fn resolve_root(path: &Path) -> io::Result<ResolvedRoot> {
+        let handle = open_for_attributes(path)?;
+        let info = by_handle_info(&handle)?;
+        let mut buf = vec![0u16; 512];
+        let len = loop {
+            let cap = u32::try_from(buf.len()).map_err(io::Error::other)?;
+            // SAFETY: `handle` is live; `buf` is writable for `cap` u16 units and that
+            // count is passed.
+            let n = unsafe {
+                GetFinalPathNameByHandleW(handle.raw(), buf.as_mut_ptr(), cap, VOLUME_NAME_GUID)
+            };
+            if n == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let n = usize::try_from(n).map_err(io::Error::other)?;
+            if n < buf.len() {
+                break n;
+            }
+            // `n` is the required size including the NUL.
+            buf.resize(n + 1, 0);
+        };
+        let volume_root = guid_volume_prefix(&buf[..len]).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "final path has no volume GUID prefix",
+            )
+        })?;
+        Ok(ResolvedRoot {
+            frn: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+            serial_low: info.dwVolumeSerialNumber,
+            volume_root,
+        })
     }
 
     /// Length of the volume in bytes, from `IOCTL_DISK_GET_LENGTH_INFO`.
@@ -240,6 +349,47 @@ mod win32 {
                 code,
                 null(),
                 0,
+                out.as_mut_ptr().cast(),
+                out_len,
+                &mut returned,
+                null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let written = usize::try_from(returned).map_err(io::Error::other)?;
+        Ok(written.min(out.len()))
+    }
+
+    /// Runs a `DeviceIoControl` that takes an input record and returns how many bytes the kernel
+    /// wrote. An empty `input` is passed as a null pointer with length 0.
+    fn ioctl_io(
+        handle: &OwnedHandle,
+        code: u32,
+        input: &[u8],
+        out: &mut [u8],
+    ) -> io::Result<usize> {
+        let in_len = u32::try_from(input.len()).map_err(io::Error::other)?;
+        let in_ptr = if input.is_empty() {
+            null()
+        } else {
+            input.as_ptr().cast()
+        };
+        let out_len = u32::try_from(out.len()).map_err(io::Error::other)?;
+        let mut returned: u32 = 0;
+        // SAFETY: `handle` is a live handle owned by the caller. `input` is readable for
+        // `in_len` bytes, and that exact length is passed, so the kernel reads only inside it
+        // (an empty input is passed as null with length 0, so nothing is read). `out` is
+        // writable for `out_len` bytes and that exact length is passed, so the kernel cannot
+        // write past it. `returned` is a live u32 out-parameter. The overlapped pointer is null,
+        // so the call is synchronous and no pointer outlives it.
+        let ok = unsafe {
+            DeviceIoControl(
+                handle.raw(),
+                code,
+                in_ptr,
+                in_len,
                 out.as_mut_ptr().cast(),
                 out_len,
                 &mut returned,
@@ -371,6 +521,15 @@ mod tests {
             raw_volume_path(&wide("C:\\")),
             Some(nul_wide("\\\\.\\C:")),
             "C:\\ should map to \\\\.\\C:"
+        );
+    }
+
+    #[test]
+    fn raw_volume_path_should_return_device_name_when_root_has_verbatim_prefix() {
+        assert_eq!(
+            raw_volume_path(&wide("\\\\?\\C:\\")),
+            Some(nul_wide("\\\\.\\C:")),
+            "\\\\?\\C:\\ should map to \\\\.\\C:"
         );
     }
 
@@ -519,6 +678,27 @@ mod tests {
             "the largest record number is 48 bits and must survive the mask"
         );
     }
+
+    #[test]
+    fn volume_serial_from_volume_data_should_read_offset_zero_when_buffer_long_enough() {
+        let mut buf = volume_data_image(512, 4096, 1024, 1000, 40960);
+        put(&mut buf, OFFSET_VOLUME_SERIAL, &(-2i64).to_le_bytes());
+        assert_eq!(
+            volume_serial_from_volume_data(&buf),
+            Some(u64::MAX - 1),
+            "the serial is the i64 at offset 0, and a negative value keeps its bit pattern"
+        );
+    }
+
+    #[test]
+    fn volume_serial_from_volume_data_should_return_none_when_buffer_short() {
+        let buf = volume_data_image(512, 4096, 1024, 1000, 40960);
+        assert_eq!(
+            volume_serial_from_volume_data(&buf[..VOLUME_DATA_LEN - 1]),
+            None,
+            "one byte short of the struct must not be parsed"
+        );
+    }
 }
 
 /// Layout check for the Win32 struct. It compiles only for Windows, so `cargo check --target
@@ -531,7 +711,7 @@ mod layout_tests {
 
     use super::{
         OFFSET_BYTES_PER_CLUSTER, OFFSET_BYTES_PER_RECORD, OFFSET_BYTES_PER_SECTOR,
-        OFFSET_MFT_VALID_LENGTH, OFFSET_TOTAL_CLUSTERS, VOLUME_DATA_LEN,
+        OFFSET_MFT_VALID_LENGTH, OFFSET_TOTAL_CLUSTERS, OFFSET_VOLUME_SERIAL, VOLUME_DATA_LEN,
     };
 
     #[test]
@@ -540,6 +720,11 @@ mod layout_tests {
             size_of::<NTFS_VOLUME_DATA_BUFFER>(),
             VOLUME_DATA_LEN,
             "struct size differs from the parser's buffer length"
+        );
+        assert_eq!(
+            offset_of!(NTFS_VOLUME_DATA_BUFFER, VolumeSerialNumber),
+            OFFSET_VOLUME_SERIAL,
+            "VolumeSerialNumber offset differs"
         );
         assert_eq!(
             offset_of!(NTFS_VOLUME_DATA_BUFFER, TotalClusters),

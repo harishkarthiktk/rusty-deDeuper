@@ -121,6 +121,9 @@ impl Row {
                 ctime_ns: meta.ctime_ns,
                 attrs: meta.attrs & !attrs::HARDLINK,
             },
+            WalkItem::Error { path, message, .. } => {
+                panic!("walk error at {:?}: {message}", path.as_bytes())
+            }
         }
     }
 }

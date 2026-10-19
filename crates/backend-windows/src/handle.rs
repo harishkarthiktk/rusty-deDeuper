@@ -38,7 +38,8 @@ fn plan_open(
 
 /// Decodes a stored file id as an NTFS file reference. Only the 8-byte form is accepted,
 /// little-endian, which is what `frn.to_le_bytes()` writes. Other lengths are not NTFS ids
-/// and must not be passed to `OpenFileById`.
+/// and must not be passed to `OpenFileById`. ReFS ids are 16 bytes (`FILE_ID_128`) and are
+/// rejected here on purpose: they never reach `OpenFileById` and fall back to the path.
 fn file_id_to_frn(bytes: &[u8]) -> Option<i64> {
     let array: [u8; 8] = bytes.try_into().ok()?;
     Some(i64::from_le_bytes(array))
@@ -63,17 +64,20 @@ mod win32 {
     use std::os::windows::fs::FileExt;
     use std::os::windows::io::FromRawHandle;
     use std::path::Path;
-    use std::ptr::null;
+    use std::ptr::{null, null_mut};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex, PoisonError};
+    use std::sync::{Arc, PoisonError, RwLock};
 
-    use dedupe_backend_generic::win_sys::{open_handle, to_wide_nul, volume_root, OwnedHandle};
+    use dedupe_backend_generic::win_sys::{
+        open_handle, to_wide_nul, volume_root_cached, OwnedHandle,
+    };
     use dedupe_backend_generic::FsContentReader;
     use dedupe_core::error::Result;
     use dedupe_core::traits::{AccessPattern, ContentReader, FileHandle, FileMeta, ReadTarget};
     use windows_sys::Win32::Foundation::{FALSE, GENERIC_READ, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        FileIdType, GetFileSizeEx, OpenFileById, FILE_FLAGS_AND_ATTRIBUTES,
+        FileIdType, GetFileInformationByHandle, GetFileSizeEx, GetVolumeInformationByHandleW,
+        OpenFileById, ReOpenFile, BY_HANDLE_FILE_INFORMATION, FILE_FLAGS_AND_ATTRIBUTES,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_FLAG_RANDOM_ACCESS,
         FILE_FLAG_SEQUENTIAL_SCAN, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_SHARE_DELETE,
         FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -99,7 +103,9 @@ mod win32 {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file length is negative"))
     }
 
-    /// Volume-root handle used only as the hint for `OpenFileById`.
+    /// Volume-root handle used only as the hint for `OpenFileById`. Only NTFS hints are
+    /// cached as usable: other file systems either lack stable 64-bit ids or were never
+    /// validated.
     struct VolumeHint(OwnedHandle);
 
     // SAFETY: the hint is only read (its value is passed to `OpenFileById`). It is never closed
@@ -142,6 +148,61 @@ mod win32 {
         }
     }
 
+    /// True when `h` is a handle on an NTFS volume.
+    fn is_ntfs(h: &OwnedHandle) -> bool {
+        let mut name = [0u16; 32];
+        // SAFETY: `h` is live. Only the file-system-name buffer is requested, and its
+        // length in units is passed; every other out-parameter is null.
+        let ok = unsafe {
+            GetVolumeInformationByHandleW(
+                h.raw(),
+                null_mut(),
+                0,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                name.as_mut_ptr(),
+                u32::try_from(name.len()).unwrap_or(0),
+            )
+        };
+        let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+        let ntfs: Vec<u16> = "NTFS".encode_utf16().collect();
+        ok != FALSE && name[..len] == ntfs[..]
+    }
+
+    /// The handle really is file `frn`. Guards file systems that ignore the sequence
+    /// number, and ids that resolve to a different file.
+    fn handle_is(handle: &OwnedHandle, frn: i64) -> bool {
+        // SAFETY: integers only; the all-zero pattern is valid.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `handle` is live and `info` is a writable out-parameter of the right size.
+        if unsafe { GetFileInformationByHandle(handle.raw(), &mut info) } == FALSE {
+            return false;
+        }
+        let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+        u64::from_ne_bytes(frn.to_ne_bytes()) == index
+    }
+
+    /// Same file, new handle with the overlapped flag. No second id or path resolution.
+    fn reopen_overlapped(handle: &OwnedHandle, access: AccessPattern) -> io::Result<OwnedHandle> {
+        // SAFETY: `handle` is live. `ReOpenFile` returns a new handle we own, or
+        // `INVALID_HANDLE_VALUE`.
+        let raw = unsafe {
+            ReOpenFile(
+                handle.raw(),
+                GENERIC_READ,
+                SHARE_ALL,
+                pattern_flags(access) | FILE_FLAG_OVERLAPPED,
+            )
+        };
+        if raw == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `raw` is a fresh handle from a successful `ReOpenFile`; the guard is its
+        // only closer.
+        Ok(unsafe { OwnedHandle::from_raw(raw) })
+    }
+
     /// Opens file reference `frn` on the volume that `hint` belongs to.
     fn open_by_id(
         hint: &VolumeHint,
@@ -182,9 +243,10 @@ mod win32 {
         inner: FsContentReader,
         read_ahead: usize,
         chunk: usize,
-        /// Volume-root hints keyed by UTF-16 root. `None` records a volume whose hint could not
-        /// be opened, so the failure is not retried for every file.
-        hints: Mutex<HashMap<Vec<u16>, Option<Arc<VolumeHint>>>>,
+        /// Volume-root hints keyed by volume root (`GetVolumePathNameW` text). `None` records a
+        /// volume whose hint could not be opened, so the failure is not retried for every file.
+        /// Read-locked on hits; write-locked only on a miss.
+        hints: RwLock<HashMap<Arc<str>, Option<Arc<VolumeHint>>>>,
         /// Opens made by this reader. Added to the inner reader's count in `opens`.
         opens: AtomicU64,
     }
@@ -197,26 +259,43 @@ mod win32 {
                 inner: FsContentReader::new(),
                 read_ahead,
                 chunk,
-                hints: Mutex::new(HashMap::new()),
+                hints: RwLock::new(HashMap::new()),
                 opens: AtomicU64::new(0),
             }
         }
 
         /// The hint handle for the volume that holds `path`, opened once per volume.
+        ///
+        /// The root comes from the per-directory memo in `volume_root_cached`, so a warm call
+        /// costs no `GetVolumePathNameW`. A warm hit takes only the read lock.
         fn hint_for(&self, path: &Path) -> Option<Arc<VolumeHint>> {
-            let root = volume_root(path)?;
-            let key = to_wide_nul(&root);
+            let root = volume_root_cached(path)?;
             // A poisoned lock still holds valid entries, so it is recovered, not propagated.
-            let mut hints = self.hints.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(cached) = hints.get(&key) {
+            let hit = self
+                .hints
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&*root)
+                .cloned();
+            if let Some(cached) = hit {
+                return cached;
+            }
+            let mut hints = self.hints.write().unwrap_or_else(PoisonError::into_inner);
+            // Double-checked: another worker may have opened this volume while we waited.
+            if let Some(cached) = hints.get(&*root) {
                 return cached.clone();
             }
-            // Opened under the lock. That serializes only the first open per volume, and it
-            // stops two workers from opening the same hint at once.
-            let opened = open_handle(&key, GENERIC_READ, SHARE_ALL, FILE_FLAG_BACKUP_SEMANTICS)
-                .ok()
-                .map(|handle| Arc::new(VolumeHint(handle)));
-            hints.insert(key, opened.clone());
+            // Opened under the write lock, so two workers never open the same hint at once.
+            let opened = open_handle(
+                &to_wide_nul(&*root),
+                GENERIC_READ,
+                SHARE_ALL,
+                FILE_FLAG_BACKUP_SEMANTICS,
+            )
+            .ok()
+            .filter(is_ntfs)
+            .map(|handle| Arc::new(VolumeHint(handle)));
+            hints.insert(root, opened.clone());
             opened
         }
 
@@ -229,7 +308,10 @@ mod win32 {
             if let Some(frn) = t.file_id.and_then(file_id_to_frn) {
                 if let Some(hint) = self.hint_for(t.path) {
                     match open_by_id(&hint, frn, flags) {
-                        Ok(handle) => return Ok(handle),
+                        Ok(handle) if handle_is(&handle, frn) => return Ok(handle),
+                        Ok(_) => {
+                            tracing::debug!("open by id returned another file; opening by path");
+                        }
                         Err(err) => {
                             tracing::debug!(error = %err, "open by file id failed; opening by path");
                         }
@@ -242,12 +324,6 @@ mod win32 {
                 SHARE_ALL,
                 flags,
             )
-        }
-
-        /// Opens the target for overlapped reads of `length` bytes.
-        fn open_overlapped(&self, t: ReadTarget<'_>, length: u64) -> io::Result<OverlappedFile> {
-            let handle = self.open_handle_for(t, pattern_flags(t.access) | FILE_FLAG_OVERLAPPED)?;
-            OverlappedFile::new(handle, self.read_ahead, self.chunk, length)
         }
     }
 
@@ -283,17 +359,23 @@ mod win32 {
             self.opens.fetch_add(1, Ordering::Relaxed);
 
             // The length decides between sync and overlapped, and the overlapped flag can only
-            // be set at open time. So the sync handle is opened first, to learn the length.
-            // Opening again for overlapped reads costs one extra open per large sequential file.
+            // be set at open time. So the sync handle is opened first, to learn the length,
+            // and `ReOpenFile` derives the overlapped handle from it (no second id or path
+            // resolution, so it cannot land on a different file).
             let length = file_len(&handle).ok();
             if let (OpenKind::Overlapped, Some(length)) = (
                 plan_open(t.access, self.read_ahead, length, self.chunk),
                 length,
             ) {
-                match self.open_overlapped(t, length) {
-                    Ok(file) => return Ok(Box::new(file)),
+                match reopen_overlapped(&handle, t.access)
+                    .and_then(|h| OverlappedFile::new(h, self.read_ahead, self.chunk, length))
+                {
+                    Ok(file) => {
+                        self.opens.fetch_add(1, Ordering::Relaxed);
+                        return Ok(Box::new(file));
+                    }
                     Err(err) => {
-                        tracing::debug!(error = %err, "overlapped open failed; using a sync handle");
+                        tracing::debug!(error = %err, "overlapped reopen failed; using a sync handle");
                     }
                 }
             }

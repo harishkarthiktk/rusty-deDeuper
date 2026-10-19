@@ -16,6 +16,7 @@ pub mod enumerator;
 pub mod filetime;
 #[cfg(any(windows, test))]
 pub mod handle;
+pub mod mft_cache;
 pub mod mft_walk;
 #[cfg(windows)]
 mod overlapped;
@@ -23,13 +24,16 @@ pub mod readahead;
 pub mod records;
 pub mod sector;
 pub mod tree;
+pub mod usn;
 pub mod volume_io;
 
 pub use caps::{choose_mode, Capabilities, FallbackReason, Mode};
 #[cfg(windows)]
-pub use enumerator::{AutoEnumerator, EnumNotices};
+pub use enumerator::{AutoEnumerator, CacheConfig, EnumNotices};
 #[cfg(windows)]
 pub use handle::HandleReader;
+#[cfg(windows)]
+pub use mft_walk::{MftEvent, MftObserver};
 /// Exposed for `tests/handle_reader.rs` only. Not part of the crate's API.
 #[cfg(windows)]
 #[doc(hidden)]
