@@ -28,5 +28,9 @@ windows-sys = { workspace = true, features = [
     "Win32_Security",
 ] }
 
-[lints]
-workspace = true
+[lints.clippy]
+# Mirrors [workspace.lints.clippy] (all/perf = deny); cargo rejects `workspace = true`
+# together with per-crate overrides.
+all = "deny"
+perf = "deny"
+undocumented_unsafe_blocks = "warn"

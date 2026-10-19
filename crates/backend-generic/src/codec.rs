@@ -61,7 +61,18 @@ fn os_str_to_raw(path: &OsStr) -> RawPath {
 #[cfg(windows)]
 fn raw_to_os_string(path: &RawPath) -> OsString {
     use std::os::windows::ffi::OsStringExt;
-    OsString::from_wide(&wtf8::decode(&path.0))
+    let units = match wtf8::decode(&path.0) {
+        Ok(units) => units,
+        Err(offset) => {
+            tracing::warn!(
+                offset,
+                len = path.0.len(),
+                "malformed WTF-8 in stored path; substituting U+FFFD"
+            );
+            wtf8::decode_lossy(&path.0)
+        }
+    };
+    OsString::from_wide(&units)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -101,48 +112,81 @@ pub mod wtf8 {
         out
     }
 
-    /// Decode WTF-8 bytes back to UTF-16 units.
-    pub fn decode(bytes: &[u8]) -> Vec<u16> {
-        let mut units = Vec::new();
+    /// Strictly decode WTF-8 bytes to UTF-16 units.
+    ///
+    /// Rejects truncated sequences, bad continuation bytes, overlong forms and
+    /// code points above U+10FFFF. Returns the byte offset of the first byte of
+    /// the first malformed sequence on error. Unpaired surrogates (3-byte forms)
+    /// are accepted.
+    pub fn decode(bytes: &[u8]) -> Result<Vec<u16>, usize> {
+        let mut units = Vec::with_capacity(bytes.len());
         let mut i = 0;
         while i < bytes.len() {
-            let b0 = bytes[i];
-            if b0 < 0x80 {
-                units.push(b0 as u16);
-                i += 1;
-            } else if b0 >> 5 == 0b110 {
-                if i + 1 >= bytes.len() {
-                    break;
+            let (cp, len) = next_code_point(bytes, i)?;
+            push_units(&mut units, cp);
+            i += len;
+        }
+        Ok(units)
+    }
+
+    /// Lossy WTF-8 decode: each byte of a malformed sequence becomes U+FFFD and
+    /// decoding resumes at the next byte. Valid input matches [`decode`].
+    pub fn decode_lossy(bytes: &[u8]) -> Vec<u16> {
+        let mut units = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            match next_code_point(bytes, i) {
+                Ok((cp, len)) => {
+                    push_units(&mut units, cp);
+                    i += len;
                 }
-                let cp = (((b0 & 0x1f) as u32) << 6) | (bytes[i + 1] & 0x3f) as u32;
-                units.push(cp as u16);
-                i += 2;
-            } else if b0 >> 4 == 0b1110 {
-                if i + 2 >= bytes.len() {
-                    break;
+                Err(_) => {
+                    units.push(0xFFFD);
+                    i += 1;
                 }
-                let cp = (((b0 & 0x0f) as u32) << 12)
-                    | (((bytes[i + 1] & 0x3f) as u32) << 6)
-                    | (bytes[i + 2] & 0x3f) as u32;
-                units.push(cp as u16); // surrogate or BMP, both fit in u16
-                i += 3;
-            } else if b0 >> 3 == 0b11110 {
-                if i + 3 >= bytes.len() {
-                    break;
-                }
-                let cp = (((b0 & 0x07) as u32) << 18)
-                    | (((bytes[i + 1] & 0x3f) as u32) << 12)
-                    | (((bytes[i + 2] & 0x3f) as u32) << 6)
-                    | (bytes[i + 3] & 0x3f) as u32;
-                let cp = cp.saturating_sub(0x10000);
-                units.push(0xD800 + ((cp >> 10) as u16));
-                units.push(0xDC00 + ((cp & 0x3ff) as u16));
-                i += 4;
-            } else {
-                i += 1;
             }
         }
         units
+    }
+
+    /// Decode the sequence starting at `i`, returning (code point, byte length).
+    /// On a malformed sequence returns `Err(i)`.
+    fn next_code_point(bytes: &[u8], i: usize) -> Result<(u32, usize), usize> {
+        let b0 = bytes[i];
+        if b0 < 0x80 {
+            return Ok((b0 as u32, 1));
+        }
+        let (len, min, mut cp) = match b0 {
+            0xC2..=0xDF => (2, 0x80, (b0 & 0x1f) as u32),
+            0xE0..=0xEF => (3, 0x800, (b0 & 0x0f) as u32),
+            0xF0..=0xF4 => (4, 0x1_0000, (b0 & 0x07) as u32),
+            // Continuation bytes, 0xC0/0xC1 (always overlong), and 0xF5..=0xFF.
+            _ => return Err(i),
+        };
+        if i + len > bytes.len() {
+            return Err(i);
+        }
+        for &b in &bytes[i + 1..i + len] {
+            if b & 0xC0 != 0x80 {
+                return Err(i);
+            }
+            cp = (cp << 6) | (b & 0x3f) as u32;
+        }
+        if cp < min || cp > 0x10_FFFF {
+            return Err(i);
+        }
+        Ok((cp, len))
+    }
+
+    /// Append UTF-16 units for one code point (a surrogate pair above the BMP).
+    fn push_units(units: &mut Vec<u16>, cp: u32) {
+        if cp >= 0x1_0000 {
+            let v = cp - 0x1_0000;
+            units.push(0xD800 + (v >> 10) as u16);
+            units.push(0xDC00 + (v & 0x3ff) as u16);
+        } else {
+            units.push(cp as u16);
+        }
     }
 
     fn push_wtf8_3(out: &mut Vec<u8>, cp: u32) {
@@ -189,7 +233,7 @@ mod wtf8_tests {
 
     fn round_trip(units: &[u16]) {
         let bytes = wtf8::encode(units.iter().copied());
-        assert_eq!(wtf8::decode(&bytes), units);
+        assert_eq!(wtf8::decode(&bytes), Ok(units.to_vec()));
     }
 
     #[test]
@@ -207,7 +251,78 @@ mod wtf8_tests {
         let lo = &[0xDC00];
         let bytes = wtf8::encode(hi.iter().copied());
         assert_eq!(bytes.len(), 3); // 3-byte WTF-8, not valid UTF-8
-        assert_eq!(wtf8::decode(&bytes), hi);
-        assert_eq!(wtf8::decode(&wtf8::encode(lo.iter().copied())), lo);
+        assert_eq!(wtf8::decode(&bytes), Ok(hi.to_vec()));
+        assert_eq!(
+            wtf8::decode(&wtf8::encode(lo.iter().copied())),
+            Ok(lo.to_vec())
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_three_byte() {
+        // U+20AC (E2 82 AC) cut after two bytes.
+        assert_eq!(wtf8::decode(&[0xE2, 0x82]), Err(0));
+    }
+
+    #[test]
+    fn rejects_bad_continuation() {
+        // Second byte is ASCII '(' instead of a continuation byte.
+        assert_eq!(wtf8::decode(&[0xE2, 0x28, 0xAC]), Err(0));
+    }
+
+    #[test]
+    fn rejects_overlong_four_byte() {
+        // F0 80 80 80 encodes U+0000 in four bytes.
+        assert_eq!(wtf8::decode(&[0xF0, 0x80, 0x80, 0x80]), Err(0));
+    }
+
+    #[test]
+    fn rejects_above_max_code_point() {
+        // F4 90 80 80 encodes U+110000.
+        assert_eq!(wtf8::decode(&[b'a', 0xF4, 0x90, 0x80, 0x80]), Err(1));
+    }
+
+    #[test]
+    fn lossy_replaces_malformed_bytes() {
+        // Valid 'a', then a truncated 3-byte lead, then 'b'.
+        let units = wtf8::decode_lossy(&[b'a', 0xE2, 0x82, b'b']);
+        assert_eq!(units, vec![b'a' as u16, 0xFFFD, 0xFFFD, b'b' as u16]);
+    }
+
+    #[test]
+    fn round_trip_should_preserve_lone_high_surrogate_before_pair() {
+        // A lone high surrogate followed by a high+low pair must not be merged.
+        let units = [0xD800u16, 0xD83D, 0xDE00];
+        let bytes = wtf8::encode(units.iter().copied());
+        assert_eq!(wtf8::decode(&bytes), Ok(units.to_vec()));
+    }
+
+    #[test]
+    fn decode_should_accept_encoded_surrogate_form() {
+        // WTF-8 3-byte forms: U+D800 is ED A0 80, U+DC00 is ED B0 80.
+        assert_eq!(wtf8::decode(&[0xED, 0xA0, 0x80]), Ok(vec![0xD800]));
+        assert_eq!(wtf8::decode(&[0xED, 0xB0, 0x80]), Ok(vec![0xDC00]));
+        assert_eq!(
+            wtf8::encode([0xD800u16].into_iter()),
+            vec![0xED, 0xA0, 0x80]
+        );
+    }
+
+    #[test]
+    fn decode_should_return_empty_when_input_empty() {
+        assert_eq!(wtf8::decode(&[]), Ok(Vec::<u16>::new()));
+        assert!(wtf8::decode_lossy(&[]).is_empty());
+        assert!(wtf8::encode(std::iter::empty::<u16>()).is_empty());
+    }
+
+    #[test]
+    fn decode_lossy_should_resume_after_bad_byte() {
+        // 0xFF is never valid. The decoder must emit U+FFFD and continue with 'a'.
+        assert_eq!(wtf8::decode_lossy(&[0xFF, b'a']), vec![0xFFFD, b'a' as u16]);
+        // Bad continuation: E2 fails, '(' is valid, lone AC is a stray continuation byte.
+        assert_eq!(
+            wtf8::decode_lossy(&[0xE2, 0x28, 0xAC]),
+            vec![0xFFFD, 0x28, 0xFFFD]
+        );
     }
 }

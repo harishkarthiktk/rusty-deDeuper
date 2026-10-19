@@ -39,22 +39,164 @@ impl StorageProbe for GenericStorageProbe {
     }
 }
 
+/// Remote-ness of the filesystem holding a path. SQLite WAL needs shared memory and
+/// working file locks, which network filesystems do not provide reliably.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FsLocality {
+    Local,
+    /// NFS, SMB/CIFS, FUSE, Ceph, or a Windows network drive.
+    Remote,
+    /// WSL's 9p/drvfs mounts: local disk behind a network-style protocol. Usually works.
+    Virtualized,
+    Unknown,
+}
+
+/// Classifies the filesystem holding `path` (an existing file or directory). Any failure
+/// is `Unknown`, so a missing probe never blocks a scan.
+pub fn fs_locality(path: &Path) -> FsLocality {
+    #[cfg(target_os = "linux")]
+    {
+        locality_linux(path)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        locality_macos(path)
+    }
+    #[cfg(windows)]
+    {
+        locality_windows(path)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = path;
+        FsLocality::Unknown
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn locality_linux(path: &Path) -> FsLocality {
+    // Magic numbers from <linux/magic.h>. `f_type` is signed on some targets, so mask it.
+    const NFS: u64 = 0x6969;
+    const SMB: u64 = 0x517B;
+    const SMB2: u64 = 0xFE53_4D42;
+    const CIFS: u64 = 0xFF53_4D42;
+    const FUSE: u64 = 0x6573_5546;
+    const CEPH: u64 = 0x00C3_6400;
+    const V9FS: u64 = 0x0102_1997;
+    let Ok(st) = rustix::fs::statfs(path) else {
+        return FsLocality::Unknown;
+    };
+    match (st.f_type as u64) & 0xFFFF_FFFF {
+        NFS | SMB | SMB2 | CIFS | FUSE | CEPH => FsLocality::Remote,
+        V9FS => FsLocality::Virtualized,
+        _ => FsLocality::Local,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn locality_macos(path: &Path) -> FsLocality {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return FsLocality::Unknown;
+    };
+    // SAFETY: `libc::statfs` is plain old data; all-zero is a valid value.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is NUL-terminated and outlives the call; `st` is writable.
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+        return FsLocality::Unknown;
+    }
+    if st.f_flags & (libc::MNT_LOCAL as u32) == 0 {
+        FsLocality::Remote
+    } else {
+        FsLocality::Local
+    }
+}
+
+#[cfg(windows)]
+fn locality_windows(path: &Path) -> FsLocality {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumePathNameW};
+    // From <winbase.h>.
+    const DRIVE_REMOTE: u32 = 4;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut root = vec![0u16; wide.len().max(260) + 1];
+    let len = root.len() as u32;
+    // SAFETY: `wide` is NUL-terminated; `root` is writable for `len` units.
+    if unsafe { GetVolumePathNameW(wide.as_ptr(), root.as_mut_ptr(), len) } == 0 {
+        return FsLocality::Unknown;
+    }
+    // SAFETY: `root` holds a NUL-terminated volume root written by the call above.
+    if unsafe { GetDriveTypeW(root.as_ptr()) } == DRIVE_REMOTE {
+        FsLocality::Remote
+    } else {
+        FsLocality::Local
+    }
+}
+
 /// Sysfs lookup. Pure path building and flag parsing live here so they can be
 /// unit-tested without touching the real `/sys` tree.
 #[cfg(any(target_os = "linux", test))]
 mod sysfs {
-    use std::path::PathBuf;
-    // Only the linux probe uses these. The test-only build on other targets must not warn.
+    use std::path::{Path, PathBuf};
+    // Only the linux probe uses this. The test-only build on other targets must not warn.
     #[cfg(target_os = "linux")]
-    use std::{io::ErrorKind, path::Path};
+    use std::io::ErrorKind;
 
     /// `rotational` flag of the block device backing `path`, or `None` when unknown.
+    /// Anonymous devices (major 0: btrfs, ZFS, bcachefs, overlay) have no sysfs node, so
+    /// they resolve through the backing devices listed in `/proc/self/mountinfo`.
     #[cfg(target_os = "linux")]
     pub(super) fn rotational(path: &Path) -> Option<bool> {
+        rotational_inner(path, 0)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn rotational_inner(path: &Path, depth: u8) -> Option<bool> {
         let st = rustix::fs::stat(path).ok()?;
         let major = rustix::fs::major(st.st_dev);
         let minor = rustix::fs::minor(st.st_dev);
+        if major != 0 {
+            return rotational_of_dev(major, minor);
+        }
+        // Overlay recursion goes one level deep; anything deeper is unknown.
+        if depth > 1 {
+            return None;
+        }
+        let canon = std::fs::canonicalize(path).ok()?;
+        let info = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+        let entries: Vec<MountEntry> = info.lines().filter_map(parse_mountinfo_line).collect();
+        let mount = mount_for(&entries, &canon)?;
+        match mount.fstype.as_str() {
+            "btrfs" => combine(
+                btrfs_devices(&mount.source)?
+                    .into_iter()
+                    .map(|(major, minor)| rotational_of_dev(major, minor)),
+            ),
+            "bcachefs" => combine(mount.source.split(':').map(|node| {
+                dev_of_node(Path::new(node))
+                    .and_then(|(major, minor)| rotational_of_dev(major, minor))
+            })),
+            "zfs" => combine(
+                zpool_devices(mount.source.split('/').next()?)?
+                    .iter()
+                    .map(|node| {
+                        dev_of_node(node).and_then(|(major, minor)| rotational_of_dev(major, minor))
+                    }),
+            ),
+            "overlay" => {
+                overlay_dir(&mount.super_opts).and_then(|dir| rotational_inner(&dir, depth + 1))
+            }
+            _ => None,
+        }
+    }
 
+    /// Queue flag of the block device `major:minor`, with the parent disk as fallback for partitions.
+    #[cfg(target_os = "linux")]
+    fn rotational_of_dev(major: u32, minor: u32) -> Option<bool> {
         match std::fs::read_to_string(queue_flag_path(major, minor)) {
             Ok(raw) => parse_rotational(&raw),
             // Partitions have no `queue/` directory of their own; the parent disk does.
@@ -65,6 +207,81 @@ mod sysfs {
             }
             Err(_) => None,
         }
+    }
+
+    /// `(major, minor)` of the block device node at `node`, or `None` if it is not a block device.
+    #[cfg(target_os = "linux")]
+    fn dev_of_node(node: &Path) -> Option<(u32, u32)> {
+        let st = rustix::fs::stat(node).ok()?;
+        if rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::BlockDevice {
+            return None;
+        }
+        Some((rustix::fs::major(st.st_rdev), rustix::fs::minor(st.st_rdev)))
+    }
+
+    /// Every device of the btrfs filesystem that contains `source`: the source itself plus the
+    /// members listed under the matching `/sys/fs/btrfs/<fsid>/devices/` directory.
+    #[cfg(target_os = "linux")]
+    fn btrfs_devices(source: &str) -> Option<Vec<(u32, u32)>> {
+        let source_path = Path::new(source);
+        let mut devs = vec![dev_of_node(source_path)?];
+        let name = source_path.file_name()?.to_str()?;
+        for fsid in std::fs::read_dir("/sys/fs/btrfs")
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let Ok(members) = std::fs::read_dir(fsid.path().join("devices")) else {
+                continue;
+            };
+            let names: Vec<String> = members
+                .flatten()
+                .map(|m| m.file_name().to_string_lossy().into_owned())
+                .collect();
+            if names.iter().any(|n| n == name) {
+                for member in names.iter().filter_map(|n| sysfs_block_dev(n)) {
+                    if !devs.contains(&member) {
+                        devs.push(member);
+                    }
+                }
+                break;
+            }
+        }
+        Some(devs)
+    }
+
+    /// `major:minor` of the named block device, read from `/sys/class/block/<name>/dev`.
+    #[cfg(target_os = "linux")]
+    fn sysfs_block_dev(name: &str) -> Option<(u32, u32)> {
+        let raw = std::fs::read_to_string(format!("/sys/class/block/{name}/dev")).ok()?;
+        parse_major_minor(&raw)
+    }
+
+    /// Device nodes of a ZFS pool from `zpool list -vHPL <pool>`, under the shared timeout helper.
+    #[cfg(target_os = "linux")]
+    fn zpool_devices(pool: &str) -> Option<Vec<PathBuf>> {
+        use std::time::Duration;
+        const ZPOOL_TIMEOUT: Duration = Duration::from_secs(5);
+        let mut cmd = std::process::Command::new("zpool");
+        cmd.args(["list", "-vHPL", pool]);
+        let stdout = super::output_with_timeout(cmd, ZPOOL_TIMEOUT)?;
+        Some(parse_zpool_devices(std::str::from_utf8(&stdout).ok()?))
+    }
+
+    /// One `/proc/self/mountinfo` line: `id parent maj:min root mount_point opts [optional...] - fstype source super_opts`.
+    /// Uses the volume module's octal unescape, which exists only on linux.
+    #[cfg(target_os = "linux")]
+    pub(super) fn parse_mountinfo_line(line: &str) -> Option<MountEntry> {
+        use crate::volume::imp::unescape_octal;
+        let (left, right) = line.split_once(" - ")?;
+        let mount_point = left.split(' ').nth(4)?;
+        let mut fields = right.split(' ');
+        Some(MountEntry {
+            mount_point: PathBuf::from(unescape_octal(mount_point)),
+            fstype: fields.next()?.to_owned(),
+            source: unescape_octal(fields.next()?),
+            super_opts: fields.next().unwrap_or("").to_owned(),
+        })
     }
 
     /// `/sys/dev/block/<major>:<minor>/queue/rotational`.
@@ -88,6 +305,110 @@ mod sysfs {
             _ => None,
         }
     }
+
+    /// One parsed `/proc/self/mountinfo` entry. Paths and sources are already unescaped.
+    #[derive(Debug, PartialEq)]
+    pub(super) struct MountEntry {
+        pub mount_point: PathBuf,
+        pub fstype: String,
+        pub source: String,
+        pub super_opts: String,
+    }
+
+    /// Parses `major:minor` as printed by sysfs `dev` files.
+    pub(super) fn parse_major_minor(raw: &str) -> Option<(u32, u32)> {
+        let (major, minor) = raw.trim().split_once(':')?;
+        Some((major.parse().ok()?, minor.parse().ok()?))
+    }
+
+    /// Longest mount point that is a component-wise prefix of `path` (already canonical).
+    /// Longest prefix, not a `major:minor` match, because nested btrfs subvolumes share the
+    /// anonymous dev of their parent mount but get no line of their own.
+    pub(super) fn mount_for<'a>(entries: &'a [MountEntry], path: &Path) -> Option<&'a MountEntry> {
+        entries
+            .iter()
+            .filter(|e| path.starts_with(&e.mount_point))
+            .max_by_key(|e| e.mount_point.components().count())
+    }
+
+    /// Combines per-device answers: any rotational device gives `Some(true)` (the HDD policy is
+    /// the safe one for mixed arrays), all non-rotational give `Some(false)`, otherwise unknown.
+    pub(super) fn combine(flags: impl IntoIterator<Item = Option<bool>>) -> Option<bool> {
+        let mut seen = false;
+        let mut all_known = true;
+        for flag in flags {
+            seen = true;
+            match flag {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => all_known = false,
+            }
+        }
+        (seen && all_known).then_some(false)
+    }
+
+    /// Overlay directory to probe: `upperdir=` when present, else the first `lowerdir=` entry.
+    pub(super) fn overlay_dir(super_opts: &str) -> Option<PathBuf> {
+        fn opt_value<'a>(opts: &'a str, key: &str) -> Option<&'a str> {
+            opts.split(',').find_map(|opt| opt.strip_prefix(key))
+        }
+        if let Some(upper) = opt_value(super_opts, "upperdir=") {
+            return Some(PathBuf::from(upper));
+        }
+        let lower = opt_value(super_opts, "lowerdir=")?.split(':').next()?;
+        (!lower.is_empty()).then(|| PathBuf::from(lower))
+    }
+
+    /// Device nodes from `zpool list -vHPL` output: the `/dev/...` tokens, one per vdev leaf.
+    pub(super) fn parse_zpool_devices(text: &str) -> Vec<PathBuf> {
+        text.split_whitespace()
+            .filter(|tok| tok.starts_with("/dev/"))
+            .map(PathBuf::from)
+            .collect()
+    }
+}
+
+/// Runs `cmd` and returns its stdout on a zero exit status, or `None` on spawn
+/// failure, non-zero exit, or when `timeout` elapses (the child is then killed and reaped).
+/// stdin and stderr are discarded. stdout is drained on a thread so a full pipe cannot
+/// deadlock. On timeout that thread is detached rather than joined, in case a grandchild
+/// still holds the pipe open.
+// Unused only on unix targets other than macOS and Linux (both callers are cfg-gated to those).
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+#[cfg(unix)]
+pub(crate) fn output_with_timeout(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut out = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        out.read_to_end(&mut buf).map(|_| buf)
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return reader.join().ok()?.ok(),
+            Ok(Some(_)) => return None,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                // Timed out or try_wait failed: kill and reap; reader thread detached.
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
 }
 
 /// macOS probe: `statfs` finds the device node behind the path, and `diskutil`
@@ -97,26 +418,25 @@ mod macos {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
-    use std::process::{Command, Stdio};
+    use std::process::Command;
+    use std::time::Duration;
 
+    use super::output_with_timeout;
     use super::plist::parse_solid_state;
 
     /// Absolute path so a hostile `PATH` cannot substitute another `diskutil`.
     const DISKUTIL: &str = "/usr/sbin/diskutil";
 
+    /// Upper bound on the `diskutil` call so a wedged disk cannot hang the scan.
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
     /// `SolidState` flag of the device backing `path`, or `None` when unknown.
     pub(super) fn solid_state(path: &Path) -> Option<bool> {
         let device = mounted_device(path)?;
-        let output = Command::new(DISKUTIL)
-            .args(["info", "-plist", device.as_str()])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let xml = std::str::from_utf8(&output.stdout).ok()?;
+        let mut cmd = Command::new(DISKUTIL);
+        cmd.args(["info", "-plist", device.as_str()]);
+        let stdout = output_with_timeout(cmd, PROBE_TIMEOUT)?;
+        let xml = std::str::from_utf8(&stdout).ok()?;
         parse_solid_state(xml)
     }
 
@@ -289,9 +609,47 @@ mod plist {
 mod tests {
     use super::plist::parse_solid_state;
     use super::seek_penalty::interpret_seek_penalty;
-    use super::sysfs::{parent_queue_flag_path, parse_rotational, queue_flag_path};
+    #[cfg(target_os = "linux")]
+    use super::sysfs::parse_mountinfo_line;
+    use super::sysfs::{
+        combine, mount_for, overlay_dir, parent_queue_flag_path, parse_major_minor,
+        parse_rotational, parse_zpool_devices, queue_flag_path, MountEntry,
+    };
     use super::volume_device_path;
+    use std::path::Path;
     use std::path::PathBuf;
+
+    #[cfg(unix)]
+    #[test]
+    fn output_with_timeout_should_return_stdout_for_fast_command() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "echo hi"]);
+        let out = super::output_with_timeout(cmd, std::time::Duration::from_secs(5));
+        assert_eq!(
+            out,
+            Some(b"hi\n".to_vec()),
+            "a fast successful command should return its stdout, got {out:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_with_timeout_should_return_none_when_deadline_passes() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 10"]);
+        let started = std::time::Instant::now();
+        let out = super::output_with_timeout(cmd, std::time::Duration::from_millis(100));
+        let elapsed = started.elapsed();
+        assert_eq!(
+            out, None,
+            "a command past its deadline should give None, got {out:?}"
+        );
+        // The spec expects about 1 s; the bound is loose so a loaded CI host does not flake.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "timeout should return well before the 10 s sleep ends, took {elapsed:?}"
+        );
+    }
 
     /// A `DEVICE_SEEK_PENALTY_DESCRIPTOR` reply: Version 1, Size 12, then the flag byte.
     fn seek_penalty_bytes(incurs_seek_penalty: u8) -> [u8; 12] {
@@ -534,6 +892,298 @@ mod tests {
         assert_eq!(
             device, None,
             "a folder mount addresses a directory, not the volume, and should give None, got {device:?}"
+        );
+    }
+
+    fn mount(mount_point: &str, fstype: &str) -> MountEntry {
+        MountEntry {
+            mount_point: PathBuf::from(mount_point),
+            fstype: fstype.to_owned(),
+            source: String::new(),
+            super_opts: String::new(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_mountinfo_line_should_return_btrfs_subvolume_entry() {
+        let line = "36 35 0:32 /@home /home rw,relatime shared:1 - btrfs /dev/sda2 rw,subvolid=257,subvol=/@home";
+        assert_eq!(
+            parse_mountinfo_line(line),
+            Some(MountEntry {
+                mount_point: PathBuf::from("/home"),
+                fstype: "btrfs".to_owned(),
+                source: "/dev/sda2".to_owned(),
+                super_opts: "rw,subvolid=257,subvol=/@home".to_owned(),
+            }),
+            "btrfs subvolume line should keep the device and the subvol option"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_mountinfo_line_should_return_zfs_dataset_entry() {
+        let line = "40 30 0:45 / /tank/data rw,relatime shared:20 - zfs tank/data rw,xattr,noacl";
+        assert_eq!(
+            parse_mountinfo_line(line),
+            Some(MountEntry {
+                mount_point: PathBuf::from("/tank/data"),
+                fstype: "zfs".to_owned(),
+                source: "tank/data".to_owned(),
+                super_opts: "rw,xattr,noacl".to_owned(),
+            }),
+            "ZFS dataset line should split the pool/dataset source"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_mountinfo_line_should_return_overlay_upperdir_entry() {
+        let line = "100 30 0:60 / / rw,relatime shared:50 - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/ABC:/var/lib/docker/overlay2/l/DEF,upperdir=/var/lib/docker/overlay2/xyz/diff,workdir=/var/lib/docker/overlay2/xyz/work";
+        let entry = parse_mountinfo_line(line);
+        assert_eq!(
+            entry.as_ref().map(|e| e.fstype.as_str()),
+            Some("overlay"),
+            "overlay line should report fstype overlay, got {entry:?}"
+        );
+        assert_eq!(
+            entry.as_ref().and_then(|e| overlay_dir(&e.super_opts)),
+            Some(PathBuf::from("/var/lib/docker/overlay2/xyz/diff")),
+            "overlay super options should yield the upperdir, got {entry:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_mountinfo_line_should_unescape_space_in_mount_point() {
+        let line = "55 30 8:3 / /mnt/my\\040disk rw,relatime shared:9 - ext4 /dev/sdb1 rw";
+        assert_eq!(
+            parse_mountinfo_line(line).map(|e| e.mount_point),
+            Some(PathBuf::from("/mnt/my disk")),
+            "\\040 in the mount point should decode to a space"
+        );
+    }
+
+    #[test]
+    fn mount_for_should_pick_longest_component_prefix() {
+        let entries = vec![mount("/", "ext4"), mount("/home", "btrfs")];
+        let fstype = |p: &str| mount_for(&entries, Path::new(p)).map(|e| e.fstype.clone());
+        assert_eq!(
+            fstype("/home/user/a"),
+            Some("btrfs".to_owned()),
+            "the deeper /home mount should win over /"
+        );
+        assert_eq!(
+            fstype("/homework/a"),
+            Some("ext4".to_owned()),
+            "/homework must not match /home, the check is component-wise"
+        );
+    }
+
+    #[test]
+    fn mount_for_should_return_none_when_no_mount_contains_path() {
+        let entries = vec![mount("/home", "btrfs")];
+        assert!(
+            mount_for(&entries, Path::new("/srv/data")).is_none(),
+            "a path outside every mount point should give None"
+        );
+    }
+
+    #[test]
+    fn combine_should_follow_truth_table() {
+        assert_eq!(
+            combine(Vec::<Option<bool>>::new()),
+            None,
+            "no devices is unknown"
+        );
+        assert_eq!(
+            combine([Some(false), Some(false)]),
+            Some(false),
+            "all non-rotational devices give Some(false)"
+        );
+        assert_eq!(
+            combine([Some(false), Some(true)]),
+            Some(true),
+            "one rotational device makes the whole set rotational"
+        );
+        assert_eq!(
+            combine([None, Some(true)]),
+            Some(true),
+            "a rotational device wins even when another is unknown"
+        );
+        assert_eq!(
+            combine([Some(false), None]),
+            None,
+            "an unknown device with no rotational one leaves the set unknown"
+        );
+        assert_eq!(combine([None]), None, "a single unknown device is unknown");
+    }
+
+    #[test]
+    fn overlay_dir_should_prefer_upperdir_then_first_lowerdir() {
+        assert_eq!(
+            overlay_dir("rw,lowerdir=/l1:/l2,upperdir=/u,workdir=/w"),
+            Some(PathBuf::from("/u")),
+            "upperdir should win over lowerdir"
+        );
+        assert_eq!(
+            overlay_dir("ro,lowerdir=/l1:/l2"),
+            Some(PathBuf::from("/l1")),
+            "without upperdir the first lowerdir entry should be used"
+        );
+        assert_eq!(
+            overlay_dir("rw,relatime"),
+            None,
+            "no dir option should give None"
+        );
+    }
+
+    #[test]
+    fn parse_zpool_devices_should_keep_only_dev_tokens() {
+        let text =
+            "tank\t1.81T\t1.20T\n\tmirror-0\t1.81T\n\t\t/dev/sda\t1.81T\n\t\t/dev/sdb\t1.81T\n";
+        assert_eq!(
+            parse_zpool_devices(text),
+            vec![PathBuf::from("/dev/sda"), PathBuf::from("/dev/sdb")],
+            "only the /dev/ leaf tokens should be kept"
+        );
+    }
+
+    #[test]
+    fn parse_major_minor_should_read_sysfs_dev_file() {
+        assert_eq!(
+            parse_major_minor("8:16\n"),
+            Some((8, 16)),
+            "sysfs dev file should parse"
+        );
+        assert_eq!(
+            parse_major_minor("garbage"),
+            None,
+            "non-numeric content should give None"
+        );
+    }
+
+    #[test]
+    fn mount_for_should_return_none_when_entries_empty() {
+        assert!(
+            mount_for(&[], Path::new("/home/user")).is_none(),
+            "an empty mount table should give None for any path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_locality_should_return_unknown_when_path_missing() {
+        let missing = Path::new("/definitely/not/a/real/dedupe/path");
+        let locality = super::fs_locality(missing);
+        assert_eq!(
+            locality,
+            super::FsLocality::Unknown,
+            "a path that cannot be stat-ed should be Unknown, got {locality:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fs_locality_should_not_report_remote_when_path_is_temp_dir() {
+        let locality = super::fs_locality(&std::env::temp_dir());
+        assert_ne!(
+            locality,
+            super::FsLocality::Remote,
+            "the temp dir is normally local disk or tmpfs, got {locality:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_mountinfo_line_should_return_none_when_line_empty() {
+        assert!(
+            parse_mountinfo_line("").is_none(),
+            "an empty mountinfo line should give None"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_mountinfo_line_should_return_none_when_lines_malformed() {
+        let lines = [
+            "garbage",
+            "36 35 98:0 /mnt/a rw,noatime shared:1 - ext4",
+            "36 35 98:0 /mnt/b",
+            "36 35 98:0 - ext4 /dev/sda1 rw",
+        ];
+        for line in lines {
+            let parsed = parse_mountinfo_line(line);
+            assert!(
+                parsed.is_none(),
+                "malformed line {line:?} should be skipped, got {parsed:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_mountinfo_line_should_keep_valid_entry_when_malformed_lines_surround_it() {
+        let lines = [
+            "garbage",
+            "36 35 98:0 / /mnt/ok rw - ext4 /dev/sdb rw",
+            "36 35 98:0 /mnt/bad",
+        ];
+        let parsed: Vec<MountEntry> = lines
+            .iter()
+            .filter_map(|line| parse_mountinfo_line(line))
+            .collect();
+        assert_eq!(
+            parsed.len(),
+            1,
+            "only the well-formed line should survive, got {parsed:?}"
+        );
+        assert_eq!(
+            parsed[0].mount_point,
+            PathBuf::from("/mnt/ok"),
+            "the surviving entry should keep its mount point"
+        );
+    }
+
+    #[test]
+    fn parse_zpool_devices_should_collect_leaves_when_mirrors_and_raidz_present() {
+        let text = [
+            "tank 7.27T 3.10T 4.17T -",
+            "\tmirror-0 3.63T 1.50T 2.13T -",
+            "\t\t/dev/sda 3.63T - - -",
+            "\t\t/dev/sdb 3.63T - - -",
+            "\traidz1-1 3.63T 1.60T 2.03T -",
+            "\t\t/dev/nvme0n1p3 1.00T - - -",
+            "\t\t/dev/nvme1n1p3 1.00T - - -",
+            "\t\t/dev/nvme2n1p3 1.00T - - -",
+            "\tlogs",
+            "\t\t/dev/sdc 1G - - -",
+        ]
+        .join("\n");
+        assert_eq!(
+            parse_zpool_devices(&text),
+            vec![
+                PathBuf::from("/dev/sda"),
+                PathBuf::from("/dev/sdb"),
+                PathBuf::from("/dev/nvme0n1p3"),
+                PathBuf::from("/dev/nvme1n1p3"),
+                PathBuf::from("/dev/nvme2n1p3"),
+                PathBuf::from("/dev/sdc"),
+            ],
+            "every /dev leaf across mirrors, raidz and logs should be kept in order"
+        );
+    }
+
+    #[test]
+    fn parse_zpool_devices_should_return_empty_when_vdevs_are_file_backed() {
+        let text = "tank 1G 0 1G -\n\t/var/tmp/vdev0 1G 0 1G -\n";
+        assert!(
+            parse_zpool_devices(text).is_empty(),
+            "file-backed vdevs have no /dev node and should give no devices"
+        );
+        assert!(
+            parse_zpool_devices("").is_empty(),
+            "empty zpool output should give no devices"
         );
     }
 }

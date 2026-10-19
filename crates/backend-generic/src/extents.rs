@@ -5,8 +5,6 @@
 //! seeking per file. It is a scheduling hint, never a correctness input.
 
 #[cfg(target_os = "linux")]
-use std::fs::File;
-#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::path::Path;
@@ -16,15 +14,27 @@ use std::path::Path;
 #[cfg(target_os = "linux")]
 const FS_IOC_FIEMAP: u32 = 0xC020_660B;
 
+/// `fe_flags` bits from `<linux/fiemap.h>`. An extent with any of these set has no real
+/// physical location to order by.
+#[cfg(target_os = "linux")]
+const FIEMAP_EXTENT_UNKNOWN: u32 = 0x0000_0002;
+#[cfg(target_os = "linux")]
+const FIEMAP_EXTENT_DELALLOC: u32 = 0x0000_0004;
+#[cfg(target_os = "linux")]
+const FIEMAP_EXTENT_DATA_INLINE: u32 = 0x0000_0200;
+#[cfg(target_os = "linux")]
+const FIEMAP_EXTENT_DATA_TAIL: u32 = 0x0000_0400;
+#[cfg(target_os = "linux")]
+const NO_LOCATION: u32 = FIEMAP_EXTENT_UNKNOWN
+    | FIEMAP_EXTENT_DELALLOC
+    | FIEMAP_EXTENT_DATA_INLINE
+    | FIEMAP_EXTENT_DATA_TAIL;
+
 /// Mirrors `struct fiemap` from `<linux/fiemap.h>`. The kernel's flexible array is
 /// modelled as one trailing element, which matches the layout for `fm_extent_count = 1`.
 #[cfg(target_os = "linux")]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-#[expect(
-    dead_code,
-    reason = "the kernel fills and we read only fm_mapped_extents and fm_extents; the other fields must exist for the layout"
-)]
 struct Fiemap {
     fm_start: u64,
     fm_length: u64,
@@ -39,10 +49,6 @@ struct Fiemap {
 #[cfg(target_os = "linux")]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-#[expect(
-    dead_code,
-    reason = "only fe_physical is read; the remaining fields must exist for the layout"
-)]
 struct FiemapExtent {
     fe_logical: u64,
     fe_physical: u64,
@@ -61,7 +67,7 @@ struct FiemapExtent {
 /// Opening the file is still an error, because the caller just enumerated it.
 #[cfg(target_os = "linux")]
 pub fn first_extent_offset(path: &Path) -> std::io::Result<Option<u64>> {
-    let file = File::open(path)?;
+    let file = crate::reader::open_regular(path)?;
     let mut req = Fiemap {
         fm_length: u64::MAX,
         fm_extent_count: 1,
@@ -84,7 +90,142 @@ pub fn first_extent_offset(path: &Path) -> std::io::Result<Option<u64>> {
     if rc != 0 || req.fm_mapped_extents == 0 {
         return Ok(None);
     }
-    Ok(Some(req.fm_extents[0].fe_physical))
+    Ok(physical_if_located(&req.fm_extents[0]))
+}
+
+/// Physical offset of `ext`, or `None` when its flags mark it as having no real location
+/// (unwritten, delayed-allocation, inline or tail-packed data). Ordering by such an
+/// address would be meaningless.
+#[cfg(target_os = "linux")]
+fn physical_if_located(ext: &FiemapExtent) -> Option<u64> {
+    (ext.fe_flags & NO_LOCATION == 0).then_some(ext.fe_physical)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod fiemap_tests {
+    use super::{first_extent_offset, physical_if_located, FiemapExtent};
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn extent_with_flags(fe_flags: u32) -> FiemapExtent {
+        FiemapExtent {
+            fe_physical: 8192,
+            fe_flags,
+            ..FiemapExtent::default()
+        }
+    }
+
+    /// A temp file removed when the test ends, including on panic. The crate has no
+    /// `tempfile` dev-dependency, so the name is unique by process id, test name and time.
+    struct TempFile(PathBuf);
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            // Best effort: the file may already be gone.
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn write_temp(test_name: &str, bytes: &[u8]) -> io::Result<TempFile> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let name = format!(
+            "dedupe-fiemap-{}-{test_name}-{nanos}.bin",
+            std::process::id()
+        );
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, bytes)?;
+        Ok(TempFile(path))
+    }
+
+    #[test]
+    fn physical_if_located_should_return_none_when_unknown_flag_set() {
+        let got = physical_if_located(&extent_with_flags(0x0000_0002));
+        assert_eq!(
+            got, None,
+            "FIEMAP_EXTENT_UNKNOWN marks no real location, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn physical_if_located_should_return_none_when_delalloc_flag_set() {
+        let got = physical_if_located(&extent_with_flags(0x0000_0004));
+        assert_eq!(
+            got, None,
+            "FIEMAP_EXTENT_DELALLOC has no allocated block yet, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn physical_if_located_should_return_none_when_data_inline_flag_set() {
+        let got = physical_if_located(&extent_with_flags(0x0000_0200));
+        assert_eq!(
+            got, None,
+            "FIEMAP_EXTENT_DATA_INLINE stores data in the inode, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn physical_if_located_should_return_none_when_data_tail_flag_set() {
+        let got = physical_if_located(&extent_with_flags(0x0000_0400));
+        assert_eq!(
+            got, None,
+            "FIEMAP_EXTENT_DATA_TAIL packs data with other files, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn first_extent_offset_should_return_none_when_file_empty() {
+        let file = write_temp("empty", &[]).expect("temp file should be writable");
+        let got = first_extent_offset(&file.0).expect("opening an existing file should succeed");
+        assert_eq!(
+            got, None,
+            "an empty file has no mapped extents, so the offset should be None, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn first_extent_offset_should_not_error_when_file_tiny() {
+        let file = write_temp("tiny", b"abc").expect("temp file should be writable");
+        let got = first_extent_offset(&file.0);
+        assert!(
+            got.is_ok(),
+            "a 3-byte file may be inline or on an unsupported filesystem, but must not error, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn first_extent_offset_should_return_error_when_file_missing() {
+        let missing = Path::new("/nonexistent/dedupe/fiemap/probe.bin");
+        let got = first_extent_offset(missing);
+        assert!(
+            got.is_err(),
+            "a file that cannot be opened is an error, not a None offset, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn physical_if_located_should_return_offset_when_no_flags_set() {
+        let got = physical_if_located(&extent_with_flags(0));
+        assert_eq!(
+            got,
+            Some(8192),
+            "an extent with no flags should keep its physical offset, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn physical_if_located_should_ignore_flags_without_location_meaning() {
+        // LAST (0x1) and ENCODED (0x8) do not change where the data sits.
+        let got = physical_if_located(&extent_with_flags(0x0000_0001 | 0x0000_0008));
+        assert_eq!(
+            got,
+            Some(8192),
+            "LAST and ENCODED should not suppress the offset, got {got:?}"
+        );
+    }
 }
 
 /// Windows lookup. Only the first extent is read through `FSCTL_GET_RETRIEVAL_POINTERS`,
@@ -99,7 +240,7 @@ mod win {
     use std::mem::size_of;
     use std::path::Path;
     use std::ptr::{from_ref, null_mut};
-    use std::sync::{Mutex, OnceLock, PoisonError};
+    use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
     use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -112,7 +253,7 @@ mod win {
     use windows_sys::Win32::System::IO::DeviceIoControl;
 
     use super::{first_lcn, lcn_to_byte_offset};
-    use crate::win_sys::{open_handle, to_wide_nul, volume_root, OwnedHandle};
+    use crate::win_sys::{open_handle, to_wide_nul, volume_root_cached, OwnedHandle};
 
     /// Output length for the retrieval call: the 16-byte header plus room for several
     /// extents. Only the first extent is read, so this just has to hold one.
@@ -179,23 +320,24 @@ mod win {
     /// Bytes per cluster of the volume holding `path`, cached per volume root.
     ///
     /// Every file on a volume asks for the same value, so the cache saves one
-    /// `GetDiskFreeSpaceW` call per file. A poisoned lock still guards a valid map,
-    /// because each insert is a single statement, so the guard is recovered, not propagated.
+    /// `GetDiskFreeSpaceW` call per file. The volume root comes from the per-directory memo
+    /// in `volume_root_cached`, so a warm lookup costs no `GetVolumePathNameW` call. Warm
+    /// hits take a shared lock. A poisoned lock still guards a valid map, because each insert
+    /// is a single statement, so the guard is recovered, not propagated.
     fn bytes_per_cluster(path: &Path) -> Option<u64> {
-        static CACHE: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
-        let root = volume_root(path)?;
-        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        let cached = cache
-            .lock()
+        static CACHE: OnceLock<RwLock<HashMap<Arc<str>, u64>>> = OnceLock::new();
+        let root = volume_root_cached(path)?;
+        let cache = CACHE.get_or_init(Default::default);
+        if let Some(&size) = cache
+            .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&root)
-            .copied();
-        if let Some(size) = cached {
+            .get(&*root)
+        {
             return Some(size);
         }
         let size = cluster_size(&root)?;
         cache
-            .lock()
+            .write()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(root, size);
         Some(size)
