@@ -12,9 +12,13 @@ use anyhow::{Context, Result};
 use dedupe_backend_generic::GenericBackend;
 use dedupe_backend_generic::{GenericPathCodec, GenericStorageProbe, GenericVolumeIdentity};
 #[cfg(windows)]
-use dedupe_backend_windows::{AutoEnumerator, EnumNotices, HandleReader};
+use dedupe_backend_windows::{
+    mft_cache, AutoEnumerator, CacheConfig, EnumNotices, HandleReader, MftObserver,
+};
 use dedupe_core::cancel::Token;
 use dedupe_core::config::Config;
+use dedupe_core::db::queries;
+use dedupe_core::exclude::ExcludeSet;
 use dedupe_core::hash::Blake3Hasher;
 use dedupe_core::pipeline::scan::{run_scan, ScanOptions};
 use dedupe_core::pipeline::{scan_naive, Services};
@@ -24,7 +28,7 @@ use dedupe_core::storage_profile::{self, Profile, StorageKind};
 use dedupe_core::traits::{ContentReader, Enumerator, StorageProbe};
 
 use crate::progress::{should_draw, BarSink};
-use crate::{OutputFormat, ScanArgs};
+use crate::{Resolved, ScanArgs};
 
 /// Smallest read chunk for overlapped reads. A small `--buf-size` would otherwise turn each
 /// overlapped read into a tiny request, which costs more than the overlap saves.
@@ -43,7 +47,53 @@ struct Backend {
     notices: Arc<EnumNotices>,
 }
 
+/// Command line as recorded in `scan_runs.cli_args`. Informational only, so it is lossy
+/// per argument (never panics on non-Unicode) and quotes what would otherwise be ambiguous.
+fn recorded_args() -> String {
+    std::env::args_os()
+        .map(|a| match a.to_str() {
+            Some(s)
+                if !s.is_empty()
+                    && !s.contains(|c: char| c.is_whitespace() || c == '"' || c == '\'') =>
+            {
+                s.to_owned()
+            }
+            _ => format!("{a:?}"), // OsStr Debug escapes invalid bytes
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// SQLite WAL needs shared memory and reliable file locks, which network filesystems do
+/// not provide. Refuse a default location there; warn when the user chose it or when the
+/// disk sits behind WSL's 9p.
+fn check_db_locality(db: &std::path::Path, explicit: bool) -> Result<()> {
+    use dedupe_backend_generic::{fs_locality, FsLocality};
+    // The DB file may not exist yet, so classify the folder that will hold it.
+    let dir = db
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    match (fs_locality(dir), explicit) {
+        (FsLocality::Remote, false) => anyhow::bail!(
+            "database would live on a network filesystem ({}); pass --db <local path>",
+            dir.display()
+        ),
+        (FsLocality::Remote, true) => eprintln!(
+            "note: database is on a network filesystem; SQLite WAL may be unreliable there"
+        ),
+        (FsLocality::Virtualized, _) => eprintln!(
+            "note: database is on a virtualized mount (WSL 9p); SQLite WAL locking may be unreliable"
+        ),
+        _ => {}
+    }
+    Ok(())
+}
+
 pub fn run(args: ScanArgs, cancel: &Token) -> Result<()> {
+    let format = args
+        .format
+        .resolve(args.json, std::io::stdout().is_terminal());
     // Persistence mode: --no-db -> naive (no persistence); --db -> explicit path;
     // otherwise default to <first root>/.dedupe.db.
     let db_path = if args.no_db {
@@ -53,6 +103,9 @@ pub fn run(args: ScanArgs, cancel: &Token) -> Result<()> {
     } else {
         Some(crate::scan_default_db(&args.roots)?)
     };
+    if let Some(db) = &db_path {
+        check_db_locality(db, args.db.is_some())?;
+    }
 
     let hasher = Blake3Hasher;
 
@@ -88,12 +141,30 @@ pub fn run(args: ScanArgs, cancel: &Token) -> Result<()> {
         eprintln!("{note}");
     }
 
+    // Only the DB path reports progress; `--no-db` (naive) keeps the null sink.
+    let draw = should_draw(
+        args.progress,
+        format == Resolved::Json,
+        std::io::stderr().is_terminal(),
+    );
+    let bar_sink = if draw { Some(BarSink::new()) } else { None };
+    #[cfg(windows)]
+    let backend = make_backend(
+        &args,
+        &profile,
+        cancel,
+        bar_sink
+            .as_ref()
+            .map(|bar| crate::progress::mft_observer(bar.multi())),
+    );
+    #[cfg(not(windows))]
     let backend = make_backend(&args, &profile, cancel);
 
     let defaults = Config::default();
     let cfg = Config {
         db_path,
         include_placeholders: args.include_placeholders,
+        exclude: ExcludeSet::new(&args.exclude).context("parse --exclude")?,
         force: args.force,
         one_file_system: !args.cross_mounts,
         verify: args.verify.into(),
@@ -110,16 +181,9 @@ pub fn run(args: ScanArgs, cancel: &Token) -> Result<()> {
     #[cfg(not(feature = "test-hooks"))]
     let stop_after = None;
 
-    // Only the DB path reports progress; `--no-db` (naive) keeps the null sink.
-    let draw = should_draw(
-        args.progress,
-        args.format == OutputFormat::Json,
-        std::io::stderr().is_terminal(),
-    );
-    let sink: SharedSink = if draw {
-        Arc::new(Mutex::new(BarSink::new()))
-    } else {
-        dedupe_core::progress::null_sink()
+    let sink: SharedSink = match bar_sink {
+        Some(bar) => Arc::new(Mutex::new(bar)),
+        None => dedupe_core::progress::null_sink(),
     };
     let svc = Services {
         enumr: &*backend.enumerator,
@@ -142,21 +206,29 @@ pub fn run(args: ScanArgs, cancel: &Token) -> Result<()> {
             cancel,
         )
         .context("scan failed")
-        .map(|(report, _stats)| emit(&report, args.format)),
+        .map(|(report, _stats)| emit(&report, format)),
         Some(db) => {
             let opts = ScanOptions {
-                cli_args: std::env::args().collect::<Vec<_>>().join(" "),
+                cli_args: recorded_args(),
                 resume: args.resume,
                 stop_after,
             };
             run_scan(db, &args.roots, &cfg, &svc, &opts)
                 .context("scan failed")
                 .and_then(|run_id| {
+                    // The enumerator is only known once the walk is over, so it is recorded
+                    // here and not when the run row is created.
+                    let enumerator = enumerator_label(&backend, args.no_mft);
+                    let writer = dedupe_core::db::Db::open(db, &cfg)
+                        .context("open db to record the enumerator")?;
+                    queries::set_run_enumerator(&writer.conn, run_id, enumerator)
+                        .context("record the enumerator")?;
+                    drop(writer);
                     let dbh =
                         dedupe_core::db::Db::open_readonly(db).context("open db for report")?;
                     let report = Report::from_db(&dbh.conn, 0).context("build report")?;
-                    emit(&report, args.format);
-                    eprintln!("scan run {run_id} finished");
+                    emit(&report, format);
+                    eprintln!("scan run {run_id} finished (enumerator: {enumerator})");
                     Ok(())
                 })
         }
@@ -173,16 +245,33 @@ pub fn run(args: ScanArgs, cancel: &Token) -> Result<()> {
 /// Builds the backend for one scan. Windows picks the NTFS fast path with the open-by-id
 /// reader; the reader's overlapped read-ahead depends on the storage profile. The token goes to
 /// the enumerator so Ctrl-C can stop the `$MFT` read, which the trait has no way to receive.
+/// `observer`, when set, draws the `$MFT` read progress.
 #[cfg(windows)]
-fn make_backend(args: &ScanArgs, profile: &Profile, cancel: &Token) -> Backend {
+fn make_backend(
+    args: &ScanArgs,
+    profile: &Profile,
+    cancel: &Token,
+    observer: Option<MftObserver>,
+) -> Backend {
     let notices = Arc::new(EnumNotices::default());
     let chunk = profile.buf_size.max(MIN_OVERLAPPED_CHUNK);
+    // `--no-mft-cache` turns the cache off. Otherwise the directory comes from DEDUPE_CACHE_DIR or
+    // %LOCALAPPDATA%; with neither set, `dir` is `None` and no cache is used.
+    let cache = if args.no_mft_cache {
+        CacheConfig::default()
+    } else {
+        CacheConfig {
+            dir: mft_cache::cache_dir(&|key| std::env::var_os(key)),
+            rebuild: args.rebuild_mft_cache,
+        }
+    };
+    let mut enumerator =
+        AutoEnumerator::new(args.no_mft, Arc::clone(&notices), cancel.clone()).with_cache(cache);
+    if let Some(observer) = observer {
+        enumerator = enumerator.with_observer(observer);
+    }
     Backend {
-        enumerator: Box::new(AutoEnumerator::new(
-            args.no_mft,
-            Arc::clone(&notices),
-            cancel.clone(),
-        )),
+        enumerator: Box::new(enumerator),
         reader: Box::new(HandleReader::new(read_ahead_for(profile), chunk)),
         codec: GenericPathCodec,
         volume: GenericVolumeIdentity,
@@ -190,6 +279,7 @@ fn make_backend(args: &ScanArgs, profile: &Profile, cancel: &Token) -> Backend {
     }
 }
 
+// Non-Windows takes no observer: the `$MFT` path does not exist here, so there is nothing to draw.
 #[cfg(not(windows))]
 fn make_backend(_args: &ScanArgs, _profile: &Profile, _cancel: &Token) -> Backend {
     let generic = GenericBackend::new();
@@ -199,6 +289,21 @@ fn make_backend(_args: &ScanArgs, _profile: &Profile, _cancel: &Token) -> Backen
         codec: generic.codec,
         volume: generic.volume,
     }
+}
+
+/// Which enumerator produced the file list, as stored in `scan_runs.enumerator`.
+#[cfg(windows)]
+fn enumerator_label(backend: &Backend, no_mft: bool) -> &'static str {
+    match (backend.notices.walker_used(), no_mft) {
+        (false, _) => "mft",
+        (true, true) => "walker-forced",
+        (true, false) => "walker-fallback",
+    }
+}
+
+#[cfg(not(windows))]
+fn enumerator_label(_backend: &Backend, _no_mft: bool) -> &'static str {
+    "walker"
 }
 
 /// Notices queued by the enumerator during the scan. Always empty outside Windows.
@@ -223,10 +328,10 @@ fn read_ahead_for(profile: &Profile) -> usize {
     }
 }
 
-fn emit(report: &Report, format: OutputFormat) {
+fn emit(report: &Report, format: Resolved) {
     match format {
-        OutputFormat::Json => println!("{}", report.to_json()),
-        OutputFormat::Human => print!("{}", report.to_human()),
+        Resolved::Json => println!("{}", report.to_json()),
+        Resolved::Human => print!("{}", report.to_human()),
     }
 }
 

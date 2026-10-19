@@ -45,6 +45,12 @@ impl BarSink {
             bars: HashMap::new(),
         }
     }
+
+    /// Shared draw target, so other bars render in the same group.
+    #[cfg(windows)]
+    pub fn multi(&self) -> MultiProgress {
+        self.multi.clone()
+    }
 }
 
 /// Human label for the pass that completes `phase`.
@@ -68,6 +74,48 @@ fn bar_style() -> ProgressStyle {
         "{spinner:.green} {prefix:<12} [{bar:40.cyan/blue}] {pos}/{len} [{elapsed_precise}, {eta}]",
     )
     .unwrap_or_else(|_| ProgressStyle::default_bar())
+}
+
+#[cfg(windows)]
+fn mft_bar_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{spinner:.green} Reading $MFT [{bar:40.cyan/blue}] {pos}/{len} records [{elapsed_precise}, {eta}]",
+    )
+    .unwrap_or_else(|_| ProgressStyle::default_bar())
+}
+
+/// Draws the `$MFT` read as a bar in `multi`. The bar goes away on `Finished`.
+#[cfg(windows)]
+pub fn mft_observer(multi: MultiProgress) -> dedupe_backend_windows::MftObserver {
+    use dedupe_backend_windows::MftEvent;
+    let bar: std::sync::Mutex<Option<ProgressBar>> = std::sync::Mutex::new(None);
+    std::sync::Arc::new(move |ev: MftEvent| {
+        let Ok(mut slot) = bar.lock() else { return };
+        match ev {
+            MftEvent::Started { records } => {
+                let _ = multi.println(format!("reading NTFS $MFT ({records} records)"));
+                *slot = Some(multi.add(ProgressBar::new(records).with_style(mft_bar_style())));
+            }
+            MftEvent::Records { done } => {
+                if let Some(b) = slot.as_ref() {
+                    b.set_position(done);
+                }
+            }
+            MftEvent::CacheLoaded { records } => {
+                let _ = multi.println(format!("MFT cache loaded: {records} records"));
+            }
+            MftEvent::DeltaApplied { entries, reread } => {
+                let _ = multi.println(format!(
+                    "MFT cache: applied {entries} journal entries ({reread} records re-read)"
+                ));
+            }
+            MftEvent::Finished => {
+                if let Some(b) = slot.take() {
+                    b.finish_and_clear();
+                }
+            }
+        }
+    })
 }
 
 impl Sink for BarSink {

@@ -10,22 +10,20 @@ use crate::{DbAction, DbArgs};
 
 pub fn run(args: DbArgs) -> Result<()> {
     match args.action {
-        DbAction::Info => info(&crate::resolve_existing_db(args.db)?),
+        DbAction::Info => info(&crate::resolve_existing_db(args.db, args.dir)?),
         DbAction::Vacuum => {
-            let db = crate::resolve_existing_db(args.db)?;
+            let db = crate::resolve_existing_db(args.db, args.dir)?;
             let dbh = Db::open(&db, &Config::default()).context("open database")?;
             dbh.conn.execute_batch("VACUUM").context("vacuum")?;
             println!("vacuumed {}", db.display());
             Ok(())
         }
         DbAction::Drop => {
-            let db = match args.db {
-                Some(p) => p,
-                None => crate::cwd_default_db()?,
-            };
             if !args.yes {
                 bail!("refusing to drop without --yes (irreversible)");
             }
+            let db = crate::resolve_existing_db(args.db, args.dir)?;
+            println!("dropping {}", db.display());
             for suffix in ["", "-wal", "-shm"] {
                 let p = std::path::PathBuf::from(format!("{}{suffix}", db.display()));
                 if p.exists() {
@@ -52,7 +50,7 @@ fn info(path: &std::path::Path) -> Result<()> {
             v.uuid_kind,
             v.fs_type,
             v.profile,
-            v.mount.to_display()
+            v.mount.to_terminal()
         );
         let states = queries::counts_by_state(&db.conn, v.id)?;
         let counts: Vec<String> = states.iter().map(|(s, n)| format!("{s}:{n}")).collect();
