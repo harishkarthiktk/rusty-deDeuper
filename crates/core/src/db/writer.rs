@@ -1,5 +1,5 @@
 //! Batched writer thread. One thread owns the `rusqlite::Connection`; hash workers
-//! send [`Batch`] messages over a bounded channel. See `.plan.md` 4.5.
+//! send [`Batch`] messages over a bounded channel. See `.overall_plan.md` 4.5.
 
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::thread::JoinHandle;

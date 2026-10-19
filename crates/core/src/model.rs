@@ -58,7 +58,7 @@ impl AsRef<[u8]> for Hash {
     }
 }
 
-/// `files.state`. See `.plan.md` 4.4.
+/// `files.state`. See `.overall_plan.md` 4.4.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(i64)]
 pub enum State {
@@ -130,7 +130,7 @@ pub fn is_legal_transition(from: State, to: State) -> bool {
     }
 }
 
-/// `run_volumes.phase_reached`. See `.plan.md` 4.4b.
+/// `run_volumes.phase_reached`. See `.overall_plan.md` 4.4b.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Phase {
@@ -259,7 +259,7 @@ impl FsType {
     }
 }
 
-/// `volumes.uuid_kind`. See `.plan.md` 4.10.
+/// `volumes.uuid_kind`. See `.overall_plan.md` 4.10.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UuidKind {
     FsUuid,

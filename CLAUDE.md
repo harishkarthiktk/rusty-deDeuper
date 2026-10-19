@@ -102,7 +102,7 @@ Run the two Commands lines marked "Windows cross-check" after any edit that touc
 
 ### Reading results
 
-- `report` and `lookup` read the DB, not in-memory state. Report counts only states 3, 4, and 5 for the latest completed run. Lookup considers every live row not in states -1 or -2.
+- `report` and `lookup` read the DB, not in-memory state. Report counts only states 3, 4, and 5 for rows last seen by any finished run, so roots a later scan skipped are still listed (header file counts still come from the latest finished run). Lookup considers every live row not in states -1 or -2.
 - Default DB location differs by command: `scan` uses `<first root>/.dedupe.db`, while `report`, `lookup`, and `db` use `<cwd>/.dedupe.db`.
 
 ### Progress and cancellation
@@ -112,17 +112,16 @@ Run the two Commands lines marked "Windows cross-check" after any edit that touc
 
 ## Gotchas
 
-- Only one process may write a database: `scan` and `lookup --insert` hold `core/src/db/lock.rs` (a `<db>.lock` sidecar, `File::try_lock`, so `rust-version` is 1.89). Read-only commands take no lock. The scan skips `-wal`, `-shm` and `.lock` siblings of its own DB.
+- Only one process may write a database: `scan` and `lookup --insert` hold `core/src/db/lock.rs` (a `<db>.lock` sidecar, `File::try_lock`, so `rust-version` is 1.89). Read-only commands take no lock. If the filesystem reports file locking as unsupported (likely on WSL `/mnt/c`), `acquire_with` errors unless `--no-lock` is passed. The scan skips `-wal`, `-shm` and `.lock` siblings of its own DB.
 - `cli/src/scan.rs` refuses a default DB on a network filesystem (`backend-generic::fs_locality`) and prints a note for WSL 9p. FUSE counts as remote, so a local ntfs-3g mount needs an explicit `--db`.
-- `FileMeta.dev` (Unix `st_dev`) is runtime only. With `--cross-mounts`, `pass_enumerate::DevScope` namespaces the `file_id` of files on another device as `blake3(foreign uuid)[..8] || id`. The Windows walker leaves `dev` as `None`, so `scan --no-db` over two Windows roots can still merge equal file ids (T4.2 is open).
+- `FileMeta.dev` (Unix `st_dev`, Windows low 32 bits of the volume serial) is runtime only. With `--cross-mounts`, `pass_enumerate::DevScope` namespaces the `file_id` of files on another device as `blake3(foreign uuid)[..8] || id`. The Windows walker and the `$MFT` path (`tree.rs` `file_meta_for`) both set `dev`; `ContentReader::metadata` does not, so `DevScope` stays off on Windows. Volumes whose serials match in the low 32 bits can still merge ids in `scan --no-db` (T4.2 full 64-bit id is open).
 - Enumeration ids are claimed per run in `pass_enumerate` (`Claim::Path` / `Claim::Move`), and folders resolve through an in-run overlay before the read snapshot. Do not look folders or files up on `ctx.read` alone.
 - Hash passes stream results in `RESULT_CHUNK` batches. Unique prefixes are marked by one SQL statement (`Batch::MarkPrefixSingletons`) that commits with the `PrefixDone` marker; stale deletion commits with the `Enumerated` marker. Keep both orderings.
-- The `$MFT` path fails closed: a record that fails twice, a bad root, or an `$ATTRIBUTE_LIST` on record 0 falls back to the walker, and a partial tree is never cached. Only name-surrogate reparse tags count as links (cloud folders are walked). `SectorReader` pins the chunk holding record 0 (`Ntfs::file` re-reads it per record). Throughput is unmeasured.
+- The `$MFT` path fails closed: a record that fails twice, a bad root, or an `$ATTRIBUTE_LIST` on record 0 falls back to the walker, and a partial tree is never cached. Only name-surrogate reparse tags count as links (cloud folders are walked). An unreadable `$REPARSE_POINT` tag fails the record, and a cached record with the reparse bit but no tag is rejected. `SectorReader` pins the chunk holding record 0 (`Ntfs::file` re-reads it per record). Throughput is unmeasured.
 - The walker emits `WalkItem::Error`. Unreadable directories are passed to `Batch::DeleteStale` as protected folders, so their old rows survive.
 - Build matrix: lint and `cargo check` run on the Linux host and for `x86_64-pc-windows-gnu` (mingw). Nothing compiles the macOS code (`volume.rs` macOS `imp`, `probe.rs` macOS items) or MSVC or aarch64 from this host; check those on a Mac or Windows machine.
 
 - Do not add `unsafe` or `cfg(target_os)` to `core`. Put platform code in a backend crate behind a trait.
-- Several source comments point to `.plan.md` (7 references in 5 files). That file was renamed to `.overall_plan.md`, and the section numbers in those comments may not match the current plan.
 - The Windows walker opens each regular file once (`win_sys::file_info` in `backend-generic/src/lib.rs`, used by `file_meta_at` in `meta.rs`) and takes `file_id`, `nlink`, size, times and attributes from that open. `ctime` is the `FILE_BASIC_INFO` ChangeTime, matching the `$MFT` path's `$STANDARD_INFORMATION` change time; creation time is only a fallback. On a failed open, `file_id` stays `None` and `nlink` is 1. NTFS ids are 8 bytes and are meant to equal the `$MFT` file references, but this is unverified on hardware, so until it is checked, assume switching modes re-hashes files. ReFS 128-bit ids are stored as 16 bytes (not truncated) and are never opened by id. The `$MFT` cache is at format version 2, so older caches are rejected and trigger a full scan. Unix reads the inode directly.
 - `scan_runs.enumerator` records `mft`, `walker`, `walker-forced` (`--no-mft`) or `walker-fallback`, written by the CLI after `run_scan` returns. Schema version is 2 and there are no migrations: an older DB fails with a "delete it and scan again" error.
 - `scan --exclude <glob>` (repeatable, `core/src/exclude.rs`) matches the full path with `/` separators, case-sensitive. The walker prunes excluded directories; `pass_enumerate` drops them for the `$MFT` path too. `--no-db` on the `$MFT` path does not filter.

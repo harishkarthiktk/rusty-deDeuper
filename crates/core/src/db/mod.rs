@@ -1,4 +1,4 @@
-//! Connection handling and pragma policy. See `.plan.md` 4.16.
+//! Connection handling and pragma policy. See `.overall_plan.md` 4.16.
 
 use std::path::Path;
 

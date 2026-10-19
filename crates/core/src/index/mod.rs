@@ -1,7 +1,7 @@
 //! Partner lookup for one pass (`prefix_map` / `full_map`).
 //!
 //! The memory impl lives in [`memory`]; the over-budget DB-backed fallback in
-//! [`sqlite`]. See `.plan.md` 4.6.
+//! [`sqlite`]. See `.overall_plan.md` 4.6.
 
 use crate::error::Result;
 use crate::model::Hash;

@@ -46,7 +46,7 @@ Walks each folder you give it, hashes the files, and prints the duplicate groups
 
 By default, the results are saved to a database named `.dedupe.db` inside the first folder you scan. The database is what makes `report`, `lookup`, and `--resume` work.
 
-Only one command can write to a database at a time. A second `scan` or `lookup --insert` on the same database stops with a "database is in use" error. The database must live on a local disk: a default location on a network share (NFS, SMB, FUSE) is refused, so pass `--db <local path>`. On WSL's `/mnt/c`, deDupe prints a note, because SQLite locking can be unreliable there.
+Only one command can write to a database at a time. A second `scan` or `lookup --insert` on the same database stops with a "database is in use" error. The database must live on a local disk: a default location on a network share (NFS, SMB, FUSE) is refused, so pass `--db <local path>`. On WSL's `/mnt/c`, deDupe prints a note, because SQLite locking can be unreliable there. If the filesystem does not support file locking at all, `scan` and `lookup --insert` stop with an error. Pass `--no-lock` to run without the lock in that case, and make sure no other deDupe process uses the same database.
 
 A rescan reuses a file's saved hash only when its size, modification time, change time, and file id are all unchanged. On macOS and Linux, a `chmod`, `chown`, or extended-attribute change on a file therefore makes the next scan hash it again.
 
@@ -56,6 +56,7 @@ A rescan reuses a file's saved hash only when its size, modification time, chang
 | `--no-db` | Do not save anything. Scan in memory and print the report only. |
 | `--resume` | Continue the last interrupted scan from where it stopped. |
 | `--force` | Ignore safety checks when the database does not match the current settings or the disk. Use with care. |
+| `--no-lock` | Run without the database lock when the filesystem does not support file locking. Has no effect where locking works. |
 | `--cross-mounts` | Also descend into other mounted drives. Off by default. |
 | `--include-placeholders` | Include cloud-only files (for example, OneDrive or iCloud placeholders). Off by default, because reading them downloads the file. |
 | `--no-mft` | Windows only: skip the NTFS `$MFT` fast path and use the standard directory walker. Ignored on other systems. See [Windows](#windows). |
@@ -166,6 +167,7 @@ Other options:
 |---|---|
 | `--db <PATH>` | Query this database. Default: `./.dedupe.db`. |
 | `--insert` | Save the file and its hash into the database, so later lookups and reports include it. Creates the database if it does not exist. |
+| `--no-lock` | With `--insert`, run without the database lock when the filesystem does not support file locking. |
 | `--format <human\|json>` | Output format. |
 
 Files that are not checked: empty files, symlinks, special files (pipes, sockets, devices), and cloud placeholders.
@@ -220,7 +222,7 @@ On Windows, `scan` can read the NTFS master file table (`$MFT`) directly instead
 - **Hard links.** On macOS and Linux, files that are hard links to the same data are counted once. On Windows, this works only on the NTFS fast path; see [Windows](#windows).
 - **Symlinks** are not followed.
 - **Space numbers are logical.** "Wasted" means the size of the extra copies. Copy-on-write clones (APFS `clonefile`, btrfs/XFS reflinks, ReFS block clones) share disk blocks, so deleting one of them may free little or no space.
-- **Reports cover the last scan.** `report` shows the groups from the last completed scan of each volume, and only for the folders that scan covered. If a scan is interrupted, `report` warns that files it already touched are missing until `scan --resume` finishes it.
+- **Reports cover every completed scan.** `report` shows the groups from all completed scans of each volume, including folders that a later scan did not cover. Files deleted from a folder you have not rescanned stay listed until you rescan it. If a scan is interrupted, `report` warns that files it already touched are missing until `scan --resume` finishes it.
 - **Unreadable folders.** A folder the scanner cannot read keeps its previously indexed rows instead of being treated as deleted, and the failure is recorded as an error.
 - **Verification.** Byte-by-byte verification of matches (`--verify`) is planned but not available yet.
 - **Platforms.** There is no CI; builds and tests are run by hand on Linux, macOS, and Windows as needed. The NTFS fast path on Windows is described in [Windows](#windows).

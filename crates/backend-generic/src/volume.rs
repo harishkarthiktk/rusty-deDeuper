@@ -1,4 +1,4 @@
-//! Per-OS volume identity. See `.plan.md` 4.10.
+//! Per-OS volume identity. See `.overall_plan.md` 4.10.
 //!
 //! Prefer the filesystem UUID / volume GUID; fall back to an fsid. `UuidKind::None`
 //! synthesizes `"none:<fs_type>:<mount>"` and warns (weak resume guard).

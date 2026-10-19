@@ -1,4 +1,6 @@
 /target
+/target-win/
+/graphify-out/
 /.todo
 /.rtk/*
 **/*.rs.bk
