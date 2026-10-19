@@ -101,6 +101,10 @@ pub struct ScanArgs {
     #[arg(long)]
     pub force: bool,
 
+    /// Run without the database lock when the filesystem does not support locking.
+    #[arg(long)]
+    pub no_lock: bool,
+
     /// Do not descend across mount points (default).
     #[arg(long, conflicts_with = "cross_mounts")]
     pub one_file_system: bool,
@@ -283,6 +287,10 @@ pub struct LookupArgs {
     /// Persist on-demand hashes and, if applicable, the query row.
     #[arg(long)]
     pub insert: bool,
+
+    /// Run without the database lock when the filesystem does not support locking (with --insert).
+    #[arg(long)]
+    pub no_lock: bool,
 }
 
 #[derive(Args, Debug)]

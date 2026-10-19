@@ -288,6 +288,7 @@ fn scan(
             cli_args: "test".to_string(),
             resume,
             stop_after: stop,
+            no_lock: false,
         },
     )
 }

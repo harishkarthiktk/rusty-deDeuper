@@ -28,10 +28,19 @@ pub fn run(args: LookupArgs) -> Result<()> {
     // --insert is a writer: exclude scans and other inserts for its whole run. Read-only
     // lookups take no lock (WAL readers are safe).
     let _lock = if args.insert {
-        Some(
-            dedupe_core::db::lock::acquire(&db)
-                .context("another dedupe process is using this database")?,
-        )
+        let lock = dedupe_core::db::lock::acquire_with(&db, args.no_lock).map_err(|e| {
+            let busy = matches!(e, dedupe_core::CoreError::DbBusy(_));
+            let err = anyhow::Error::from(e);
+            if busy {
+                err.context("another dedupe process is using this database")
+            } else {
+                err
+            }
+        })?;
+        if !lock.is_locked() {
+            eprintln!("note: running without a database lock (--no-lock)");
+        }
+        Some(lock)
     } else {
         None
     };

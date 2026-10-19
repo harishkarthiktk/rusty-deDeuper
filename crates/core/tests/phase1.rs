@@ -334,6 +334,7 @@ fn scan(
             cli_args: "test".to_string(),
             resume,
             stop_after: stop,
+            no_lock: false,
         },
     )
 }
@@ -819,6 +820,7 @@ fn rescan_root_scoping_leaves_other_roots_untouched() {
         cli_args: "t".into(),
         resume: false,
         stop_after: None,
+        no_lock: false,
     };
 
     let reader1 = FsReader::new();

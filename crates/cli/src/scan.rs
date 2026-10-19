@@ -208,10 +208,14 @@ pub fn run(args: ScanArgs, cancel: &Token) -> Result<()> {
         .context("scan failed")
         .map(|(report, _stats)| emit(&report, format)),
         Some(db) => {
+            if args.no_lock {
+                eprintln!("note: running without a database lock (--no-lock)");
+            }
             let opts = ScanOptions {
                 cli_args: recorded_args(),
                 resume: args.resume,
                 stop_after,
+                no_lock: args.no_lock,
             };
             run_scan(db, &args.roots, &cfg, &svc, &opts)
                 .context("scan failed")

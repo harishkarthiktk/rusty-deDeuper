@@ -20,6 +20,8 @@ pub struct ScanOptions {
     pub cli_args: String,
     pub resume: bool,
     pub stop_after: Option<i64>,
+    /// Run without the database lock when the filesystem does not support locking.
+    pub no_lock: bool,
 }
 
 pub fn run_scan(
@@ -30,7 +32,7 @@ pub fn run_scan(
     opts: &ScanOptions,
 ) -> Result<i64> {
     let now = now_unix_ns();
-    let _lock = db::lock::acquire(db_path)?; // held until run_scan returns
+    let _lock = db::lock::acquire_with(db_path, opts.no_lock)?; // held until run_scan returns
     let db = db::Db::open(db_path, cfg)?;
 
     resume::check_config_guard(&db.conn, cfg)?;

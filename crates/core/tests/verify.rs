@@ -287,6 +287,7 @@ fn scan_run(
             cli_args: "test".to_string(),
             resume,
             stop_after,
+            no_lock: false,
         },
     )
 }

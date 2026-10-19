@@ -8,7 +8,7 @@ use rusqlite::{params, Connection, TransactionBehavior};
 
 use crate::config::Config;
 use crate::db::queries;
-use crate::error::Result;
+use crate::error::{CoreError, Result};
 use crate::hash::{hash_full, hash_prefix};
 use crate::model::{attrs, FileEntry, Hash, SkipReason, State};
 use crate::path::{separator_for, strip_mount, RawPath};
@@ -151,16 +151,14 @@ pub fn lookup_report(
     // A fresh stat cannot be negative, so a failure here is a real error for the query.
     let size = meta.size_bytes()?;
 
-    // Where the query lives in the index, so it never matches itself. Best effort for a
-    // read-only lookup (identity can fail on exotic roots); required for --insert.
-    let key = match resolve_query_key(conn, codec, vi, path) {
-        Ok(k) => k,
-        Err(e) if !insert => {
-            tracing::debug!("query key unavailable, self-match filter off: {e}");
-            None
-        }
-        Err(e) => return Err(e),
-    };
+    // Where the query lives in the index, so it never matches itself. `None` only when the
+    // query's volume is not indexed: no candidate can share that volume, so nothing needs
+    // excluding. An identity failure is an error in both modes.
+    let key = resolve_query_key(conn, codec, vi, path).map_err(|e| {
+        CoreError::Other(format!(
+            "cannot identify query file's volume; needed to exclude the file itself: {e}"
+        ))
+    })?;
 
     let probe = probe_index(reader, codec, conn, path, &meta, size, key.as_ref(), cfg)?;
 

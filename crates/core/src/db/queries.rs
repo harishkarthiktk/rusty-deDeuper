@@ -617,7 +617,8 @@ pub fn recompute_groups(conn: &Connection, volume_id: i64, run_id: i64, now: i64
                 COUNT(DISTINCT COALESCE(file_id, id)), \
                 size*(COUNT(DISTINCT COALESCE(file_id, id))-1), NULL, 0, ?2 \
          FROM files \
-         WHERE volume_id=?1 AND last_seen_run_id=?3 \
+         WHERE volume_id=?1 \
+           AND (last_seen_run_id=?3 OR last_seen_run_id IN (SELECT id FROM scan_runs WHERE status='finished')) \
            AND state IN (3,4,5) AND full_hash IS NOT NULL \
          GROUP BY full_hash, size \
          HAVING COUNT(DISTINCT COALESCE(file_id, id)) > 1",
@@ -646,7 +647,9 @@ pub fn recompute_group_for_hash(
                 COUNT(DISTINCT COALESCE(file_id, id)), \
                 size*(COUNT(DISTINCT COALESCE(file_id, id))-1), NULL, 0, ?3 \
          FROM files \
-         WHERE volume_id=?1 AND full_hash=?2 AND last_seen_run_id=?4 AND state IN (3,4,5) \
+         WHERE volume_id=?1 AND full_hash=?2 \
+           AND (last_seen_run_id=?4 OR last_seen_run_id IN (SELECT id FROM scan_runs WHERE status='finished')) \
+           AND state IN (3,4,5) \
          GROUP BY full_hash, size \
          HAVING COUNT(DISTINCT COALESCE(file_id, id)) > 1",
         params![volume_id, full_hash.as_bytes(), now, run_id],
@@ -702,13 +705,12 @@ pub struct GroupMemberRow {
     pub name: RawPath,
 }
 
-/// Member rows of every `dup_groups` group on a volume that are live in `run_id`,
+/// Member rows of every `dup_groups` group on a volume that are live in a finished run,
 /// ordered by `(full_hash, size, file row id)` so equal keys are adjacent.
 /// `min_wasted` prefilters on the stored total; callers re-check it on the listed rows.
 pub fn volume_group_members(
     conn: &Connection,
     volume_id: i64,
-    run_id: i64,
     min_wasted: i64,
 ) -> Result<Vec<GroupMemberRow>> {
     let mut stmt = conn.prepare_cached(
@@ -716,11 +718,12 @@ pub fn volume_group_members(
          FROM dup_groups g \
          JOIN files f ON f.volume_id=g.volume_id AND f.full_hash=g.full_hash AND f.size=g.size \
          WHERE g.volume_id=?1 AND g.wasted_logical>=?2 \
-           AND f.state IN (3,4,5) AND f.last_seen_run_id=?3 \
+           AND f.state IN (3,4,5) \
+           AND f.last_seen_run_id IN (SELECT id FROM scan_runs WHERE status='finished') \
          ORDER BY f.full_hash, f.size, f.id",
     )?;
     let rows = stmt
-        .query_map(params![volume_id, min_wasted, run_id], |r| {
+        .query_map(params![volume_id, min_wasted], |r| {
             let h: Vec<u8> = r.get(0)?;
             let file_id: Option<Vec<u8>> = r.get(2)?;
             let id: i64 = r.get(3)?;

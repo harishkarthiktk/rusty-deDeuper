@@ -270,6 +270,7 @@ fn scan_run(db: &Path, root: &Path, cfg: &Config) -> Result<i64> {
             cli_args: "test".to_string(),
             resume: false,
             stop_after: None,
+            no_lock: false,
         },
     )
 }

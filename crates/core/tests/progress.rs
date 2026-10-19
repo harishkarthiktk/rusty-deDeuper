@@ -285,6 +285,7 @@ fn advance_sums_to_total_per_pass() {
         cli_args: "test".to_string(),
         resume: false,
         stop_after: None,
+        no_lock: false,
     };
     run_scan(&db, &[root], &Config::default(), &svc, &opts).unwrap();
 

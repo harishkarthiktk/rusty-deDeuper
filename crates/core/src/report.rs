@@ -116,7 +116,7 @@ impl Report {
         let mut groups: Vec<Group> = Vec::new();
         let (mut enumerated, mut skipped, mut errored) = (0_i64, 0_i64, 0_i64);
         for (volume_id, run_id) in completed_volumes(conn)? {
-            let pending = load_groups(conn, volume_id, run_id, min_wasted)?;
+            let pending = load_groups(conn, volume_id, min_wasted)?;
             emit_groups(conn, volume_id, pending, cancel, on, |g| {
                 groups.push(g);
                 Ok(())
@@ -162,9 +162,9 @@ impl Report {
         out: &mut W,
     ) -> Result<()> {
         let mut loaded = Vec::new();
-        for (volume_id, run_id) in completed_volumes(conn)? {
+        for (volume_id, _) in completed_volumes(conn)? {
             cancel.check()?;
-            loaded.push((volume_id, load_groups(conn, volume_id, run_id, min_wasted)?));
+            loaded.push((volume_id, load_groups(conn, volume_id, min_wasted)?));
         }
         let count: usize = loaded.iter().map(|(_, g)| g.len()).sum();
         let wasted: i64 = loaded
@@ -257,13 +257,8 @@ fn fold_groups(rows: Vec<queries::GroupMemberRow>, min_wasted: i64) -> Vec<Pendi
 }
 
 /// One volume's groups, read in a single statement (one snapshot).
-fn load_groups(
-    conn: &Connection,
-    volume_id: i64,
-    run_id: i64,
-    min_wasted: i64,
-) -> Result<Vec<PendingGroup>> {
-    let rows = queries::volume_group_members(conn, volume_id, run_id, min_wasted)?;
+fn load_groups(conn: &Connection, volume_id: i64, min_wasted: i64) -> Result<Vec<PendingGroup>> {
+    let rows = queries::volume_group_members(conn, volume_id, min_wasted)?;
     Ok(fold_groups(rows, min_wasted))
 }
 
