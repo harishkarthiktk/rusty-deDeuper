@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 deDupe is a duplicate-file finder in Rust. This directory is the Cargo workspace root; the CLI binary is `dedupe` (package `dedupe`, in `crates/cli`). It groups files by content in progressive passes (size, then BLAKE3 over the first 16 KiB plus last 4 KiB, then full BLAKE3) and persists state in SQLite, so a scan can resume after `kill -9` and new files can be checked against an existing index (`lookup`). v1 is scan/report/lookup only. Nothing deletes files.
 
-The engineering plan is `../.overall_plan.md` (the git repo root is one level up). Its "Status index" and "Task ledger" are the source of truth for what is done and pending. Do not restate status in this file.
+The engineering plan is `.overall_plan.md` (in this directory, which is the repo root). Its "Status index" and "Task ledger" are the source of truth for what is done and pending. Do not restate status in this file.
 
 ## Commands
 
@@ -112,9 +112,20 @@ Run the two Commands lines marked "Windows cross-check" after any edit that touc
 
 ## Gotchas
 
+- Only one process may write a database: `scan` and `lookup --insert` hold `core/src/db/lock.rs` (a `<db>.lock` sidecar, `File::try_lock`, so `rust-version` is 1.89). Read-only commands take no lock. The scan skips `-wal`, `-shm` and `.lock` siblings of its own DB.
+- `cli/src/scan.rs` refuses a default DB on a network filesystem (`backend-generic::fs_locality`) and prints a note for WSL 9p. FUSE counts as remote, so a local ntfs-3g mount needs an explicit `--db`.
+- `FileMeta.dev` (Unix `st_dev`) is runtime only. With `--cross-mounts`, `pass_enumerate::DevScope` namespaces the `file_id` of files on another device as `blake3(foreign uuid)[..8] || id`. The Windows walker leaves `dev` as `None`, so `scan --no-db` over two Windows roots can still merge equal file ids (T4.2 is open).
+- Enumeration ids are claimed per run in `pass_enumerate` (`Claim::Path` / `Claim::Move`), and folders resolve through an in-run overlay before the read snapshot. Do not look folders or files up on `ctx.read` alone.
+- Hash passes stream results in `RESULT_CHUNK` batches. Unique prefixes are marked by one SQL statement (`Batch::MarkPrefixSingletons`) that commits with the `PrefixDone` marker; stale deletion commits with the `Enumerated` marker. Keep both orderings.
+- The `$MFT` path fails closed: a record that fails twice, a bad root, or an `$ATTRIBUTE_LIST` on record 0 falls back to the walker, and a partial tree is never cached. Only name-surrogate reparse tags count as links (cloud folders are walked). `SectorReader` pins the chunk holding record 0 (`Ntfs::file` re-reads it per record). Throughput is unmeasured.
+- The walker emits `WalkItem::Error`. Unreadable directories are passed to `Batch::DeleteStale` as protected folders, so their old rows survive.
+- Build matrix: lint and `cargo check` run on the Linux host and for `x86_64-pc-windows-gnu` (mingw). Nothing compiles the macOS code (`volume.rs` macOS `imp`, `probe.rs` macOS items) or MSVC or aarch64 from this host; check those on a Mac or Windows machine.
+
 - Do not add `unsafe` or `cfg(target_os)` to `core`. Put platform code in a backend crate behind a trait.
-- Several source comments point to `.plan.md` (7 references in 5 files). That file was renamed to `../.overall_plan.md`, and the section numbers in those comments may not match the current plan.
-- `file_id` is `None` in the Windows walker fallback, so there is no hardlink collapse or move detection in that mode. The NTFS `$MFT` path yields the 8-byte file reference and `nlink`, so both work there. Rescans reuse hashes only when file ids match, so switching modes re-hashes files.
+- Several source comments point to `.plan.md` (7 references in 5 files). That file was renamed to `.overall_plan.md`, and the section numbers in those comments may not match the current plan.
+- The Windows walker opens each regular file once (`win_sys::file_info` in `backend-generic/src/lib.rs`, used by `file_meta_at` in `meta.rs`) and takes `file_id`, `nlink`, size, times and attributes from that open. `ctime` is the `FILE_BASIC_INFO` ChangeTime, matching the `$MFT` path's `$STANDARD_INFORMATION` change time; creation time is only a fallback. On a failed open, `file_id` stays `None` and `nlink` is 1. NTFS ids are 8 bytes and are meant to equal the `$MFT` file references, but this is unverified on hardware, so until it is checked, assume switching modes re-hashes files. ReFS 128-bit ids are stored as 16 bytes (not truncated) and are never opened by id. The `$MFT` cache is at format version 2, so older caches are rejected and trigger a full scan. Unix reads the inode directly.
+- `scan_runs.enumerator` records `mft`, `walker`, `walker-forced` (`--no-mft`) or `walker-fallback`, written by the CLI after `run_scan` returns. Schema version is 2 and there are no migrations: an older DB fails with a "delete it and scan again" error.
+- `scan --exclude <glob>` (repeatable, `core/src/exclude.rs`) matches the full path with `/` separators, case-sensitive. The walker prunes excluded directories; `pass_enumerate` drops them for the `$MFT` path too. `--no-db` on the `$MFT` path does not filter.
 - The NTFS fast path runs only when the process is elevated and the scan root is on NTFS (`AutoEnumerator`). Otherwise, or when the fast path fails partway, it falls back to the walker and the CLI prints a `note:` on stderr. `--no-mft` forces the walker and prints no note. Items the fast path already yielded are yielded again by the walker, which is safe because enumeration is an idempotent upsert.
 - Win32 code is compile-checked and linted from macOS only. No test executes it. Before trusting it, run the `mft_vs_walk` self-check on a Windows machine. Still unverified there: the raw `$MFT` read, how the `ntfs` crate handles unused or corrupt records, the reparse tags that mark cloud placeholders, and the admin requirement.
 - `scan --verify <off|byte>` sets `Config.verify` (plan P2.7). `pass_verify` moves state 3 -> 4 and a mismatch to -2. Byte verify has no automated end-to-end test yet.
@@ -127,7 +138,7 @@ ALWAYS use 'rust-best-practises' skill while working on rust code and systems.
 
 - Lint and format checks can run without asking. Builds and tests run only when the user asks for them. When they do run, use a subagent.
 - Benchmarks are deferred to the end of the plan and run by the user on reference hardware. Do not run them as verification.
-- Plan status and task IDs live in `../.overall_plan.md`. Read that file before starting work on any task ID.
+- Plan status and task IDs live in `.overall_plan.md`. Read that file before starting work on any task ID.
 
 <!-- rtk-instructions v2 -->
 # RTK (Rust Token Killer) - Token-Optimized Commands

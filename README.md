@@ -46,6 +46,10 @@ Walks each folder you give it, hashes the files, and prints the duplicate groups
 
 By default, the results are saved to a database named `.dedupe.db` inside the first folder you scan. The database is what makes `report`, `lookup`, and `--resume` work.
 
+Only one command can write to a database at a time. A second `scan` or `lookup --insert` on the same database stops with a "database is in use" error. The database must live on a local disk: a default location on a network share (NFS, SMB, FUSE) is refused, so pass `--db <local path>`. On WSL's `/mnt/c`, deDupe prints a note, because SQLite locking can be unreliable there.
+
+A rescan reuses a file's saved hash only when its size, modification time, change time, and file id are all unchanged. On macOS and Linux, a `chmod`, `chown`, or extended-attribute change on a file therefore makes the next scan hash it again.
+
 | Option | What it does |
 |---|---|
 | `--db <PATH>` | Save the database to this path instead of the default. |
@@ -83,7 +87,7 @@ dedupe scan ~/Documents ~/Desktop --db ~/dedupe-index.db --resume
 dedupe report
 ```
 
-Prints the duplicate groups from the last completed scan. It reads the database only, so it is fast and does not touch your files.
+Prints the duplicate groups from the last completed scan of each volume. If that scan covered only some folders, duplicates under the folders it did not cover are not shown; scan all folders together to see them. It reads the database only, so it is fast and does not touch your files.
 
 | Option | What it does |
 |---|---|
@@ -116,14 +120,19 @@ dedupe report --min-wasted 1048576    # plain bytes still work
 Example output (values are illustrative):
 
 ```
-2 duplicate group(s), 1234 bytes wasted (logical)
+2 duplicate group(s), 1.2 KiB (1234 bytes) wasted (logical)
 
-3f9c...e210  617 bytes  x2 (2 inode(s), wasted 617)
+3f9c...e210  617 bytes  x2 (2 inode(s), wasted 617 bytes)
     /Users/me/Pictures/a.jpg
     /Users/me/Pictures/copy/a.jpg
+
+b81d...47aa  11.7 MiB (12271312 bytes)  x2 (2 inode(s), wasted 11.7 MiB (12271312 bytes))
+    /Users/me/Videos/clip.mp4
+    /Users/me/Videos/backup/clip.mp4
 ```
 
 Each group shows the content hash, the file size, how many copies exist, and the members of the group.
+Sizes in human output use binary units (KiB, MiB, GiB, TiB) with one decimal, followed by the exact byte count once a value reaches 1 KiB. `--format json` always emits raw byte counts.
 
 ### `lookup`: check one file against the index
 
@@ -139,6 +148,8 @@ Example output:
 1 match(es)
     [fresh] /Users/me/Pictures/a.jpg
 ```
+
+A file never matches itself, and neither does another hard link to the same data. With `--insert`, a file that is already indexed and unchanged is left as it is.
 
 Each match has a freshness tag:
 
@@ -179,6 +190,8 @@ dedupe report --format json | jq '.group_count'
 
 Progress bars and log messages go to stderr, so stdout stays clean for piping.
 
+In JSON, each member has a `path` string. When the real path is not valid UTF-8, `path` is lossy and the member also has `path_bytes`, the exact bytes as lowercase hex. Human output escapes control characters (shown as `\u{1b}`) so a file name cannot rewrite your terminal.
+
 Log verbosity is a global option: `dedupe --log-level debug scan ~/Pictures`. Levels: `error`, `warn`, `info` (default), `debug`, `trace`.
 
 ## Typical workflow
@@ -196,6 +209,9 @@ On Windows, `scan` can read the NTFS master file table (`$MFT`) directly instead
 - **The fast path needs an elevated shell and an NTFS volume.** Start the terminal as administrator. When either is missing, deDupe uses the standard walker and prints a `note:` line on stderr saying why. The scan still completes.
 - **`--no-mft` forces the standard walker.** Use it when you do not want deDupe to read the raw volume. The flag is accepted on every platform and ignored outside Windows.
 - **File ids and hard-link detection exist only on the fast path.** The standard walker reports no file id, so it cannot tell hard links apart. Hashes saved by one mode are not reused by a rescan in the other mode, so the rescan hashes those files again.
+- **Network and mapped drives.** Scanning `\\server\share` or a mapped drive uses the walker. Volume identity there is the share path plus the volume serial, so `Z:\` and `\\server\share\` are two different volumes in the database, and a `subst` drive is a separate volume from its target.
+- **OneDrive folders.** The fast path and `--no-mft` both descend into cloud-backed folders. The walker can make the cloud provider populate an empty cloud folder; the fast path sees only the files already local.
+- **The fast path never trades correctness for speed.** If any `$MFT` record cannot be read twice in a row, the scan root is not a directory, or `$MFT` itself is split across extension records, deDupe uses the standard walker and says why on stderr.
 - **Not yet verified on real Windows.** The Windows code is cross-compiled and linted from macOS, and its portable parts are unit-tested there. The raw-volume read has not run on a Windows machine. Check a scan of a folder you know before relying on the results.
 
 ## Notes and limits
@@ -203,7 +219,9 @@ On Windows, `scan` can read the NTFS master file table (`$MFT`) directly instead
 - **Read-only by design.** deDupe does not delete, move, or link files. Acting on the report is up to you.
 - **Hard links.** On macOS and Linux, files that are hard links to the same data are counted once. On Windows, this works only on the NTFS fast path; see [Windows](#windows).
 - **Symlinks** are not followed.
-- **Space numbers are logical.** "Wasted" means the size of the extra copies. Copy-on-write clones (reflinks) that share disk blocks are not yet reported separately.
+- **Space numbers are logical.** "Wasted" means the size of the extra copies. Copy-on-write clones (APFS `clonefile`, btrfs/XFS reflinks, ReFS block clones) share disk blocks, so deleting one of them may free little or no space.
+- **Reports cover the last scan.** `report` shows the groups from the last completed scan of each volume, and only for the folders that scan covered. If a scan is interrupted, `report` warns that files it already touched are missing until `scan --resume` finishes it.
+- **Unreadable folders.** A folder the scanner cannot read keeps its previously indexed rows instead of being treated as deleted, and the failure is recorded as an error.
 - **Verification.** Byte-by-byte verification of matches (`--verify`) is planned but not available yet.
 - **Platforms.** There is no CI; builds and tests are run by hand on Linux, macOS, and Windows as needed. The NTFS fast path on Windows is described in [Windows](#windows).
 
