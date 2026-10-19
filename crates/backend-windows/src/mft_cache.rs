@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 
 use crate::mft_walk::RecordSource;
 use crate::records::RecordError;
-use crate::tree::{BudgetExceeded, NameFact, NameSpace, RecordFacts, VolumeTree};
+use crate::tree::{
+    BudgetExceeded, NameFact, NameSpace, RecordFacts, VolumeTree, FILE_ATTRIBUTE_REPARSE_POINT,
+};
 use crate::usn::UsnEntry;
 
 const MAGIC: &[u8; 8] = b"DDMFTC01";
@@ -305,6 +307,11 @@ fn decode_record(cur: &mut Cursor<'_>) -> Result<RecordFacts, CacheError> {
         1 => Some(cur.u32()?),
         _ => return Err(CacheError::Malformed("reparse flag is not 0 or 1")),
     };
+    if reparse_tag.is_none() && attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(CacheError::Malformed(
+            "reparse attribute is set but the record has no reparse tag",
+        ));
+    }
     let mtime_ft = cur.u64()?;
     let ctime_ft = cur.u64()?;
     let size = cur.u64()?;
@@ -1163,7 +1170,7 @@ mod tests {
 
     /// Items of the tree a full walk would build from `records`.
     fn items_of(records: Vec<RecordFacts>) -> Vec<WalkItem> {
-        tree_of(records).into_items(&RawPath::new(ROOT_PREFIX), &component)
+        tree_of(records).into_items(0, &RawPath::new(ROOT_PREFIX), &component)
     }
 
     /// Root 24 holds "Users" (25) and "b.txt" (28) and "Old" (29). "Users" holds "Docs" (26),
@@ -1211,7 +1218,7 @@ mod tests {
             "stats must count the four entries and the four distinct records re-read"
         );
 
-        let delta_items = tree.into_items(&RawPath::new(ROOT_PREFIX), &component);
+        let delta_items = tree.into_items(0, &RawPath::new(ROOT_PREFIX), &component);
         let full_items = items_of(mutated_records());
         assert_eq!(
             (item_paths(&delta_items), item_files(&delta_items)),
@@ -1238,7 +1245,7 @@ mod tests {
             tree.records_iter().all(|facts| facts.record != 28),
             "a record whose re-read keeps only DOS names must be removed, not left at its old name"
         );
-        let items = tree.into_items(&RawPath::new(ROOT_PREFIX), &component);
+        let items = tree.into_items(0, &RawPath::new(ROOT_PREFIX), &component);
         assert!(
             !item_paths(&items)
                 .iter()

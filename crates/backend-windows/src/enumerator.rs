@@ -217,6 +217,9 @@ fn walk_mft_volume(
             "scan root resolves to a different volume than the one opened".to_owned(),
         ));
     }
+    // Same width as the walker's `FileMeta.dev` (the 32-bit `dwVolumeSerialNumber`), so both
+    // paths report one `dev` for one volume.
+    let dev = u64::from(serial as u32);
     let root_record = record_number_of(resolved.frn);
 
     let codec = GenericPathCodec;
@@ -256,6 +259,7 @@ fn walk_mft_volume(
     emit_tree(
         tree,
         &mut stats,
+        dev,
         &root_prefix,
         &to_component,
         &|| cancel.is_cancelled(),

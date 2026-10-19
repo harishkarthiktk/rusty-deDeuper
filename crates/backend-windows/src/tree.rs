@@ -28,7 +28,7 @@ const MAX_DEPTH: usize = 4096;
 const RECORD_OVERHEAD_BYTES: usize = 128;
 
 const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
-const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+pub(crate) const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
 const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
 const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
@@ -210,8 +210,11 @@ impl VolumeTree {
         }
     }
 
+    /// `dev` is set on every file's `FileMeta`. It is the volume serial, so ids from different
+    /// volumes stay apart. It is passed in, not stored, so a cached tree takes the current volume's value.
     pub fn emit_items<E>(
         self,
+        dev: u64,
         root_prefix: &RawPath,
         to_component: &dyn Fn(&[u16]) -> RawPath,
         visit: &mut dyn FnMut(WalkItem) -> Result<(), E>,
@@ -252,7 +255,7 @@ impl VolumeTree {
                 else {
                     continue;
                 };
-                let Some(meta) = file_meta_for(&facts) else {
+                let Some(meta) = file_meta_for(&facts, dev) else {
                     continue;
                 };
                 let path = parent
@@ -271,12 +274,13 @@ impl VolumeTree {
     /// at once. A parent path is a strict prefix of its children's, so parents still come first.
     pub fn into_items(
         self,
+        dev: u64,
         root_prefix: &RawPath,
         to_component: &dyn Fn(&[u16]) -> RawPath,
     ) -> Vec<WalkItem> {
         let mut items = Vec::new();
         let collected: Result<(), Infallible> =
-            self.emit_items(root_prefix, to_component, &mut |item: WalkItem| {
+            self.emit_items(dev, root_prefix, to_component, &mut |item: WalkItem| {
                 items.push(item);
                 Ok(())
             });
@@ -446,9 +450,13 @@ pub fn file_meta_of(f: &RecordFacts, links: i64) -> Option<FileMeta> {
 }
 
 /// Link count is the number of non-DOS names on the volume, which matches NTFS hard links.
-fn file_meta_for(f: &RecordFacts) -> Option<FileMeta> {
+fn file_meta_for(f: &RecordFacts, dev: u64) -> Option<FileMeta> {
     let links = i64::try_from(f.names.len()).ok()?;
-    file_meta_of(f, links)
+    let meta = file_meta_of(f, links)?;
+    Some(FileMeta {
+        dev: Some(dev),
+        ..meta
+    })
 }
 
 /// NTFS file reference: record number in the low 48 bits, sequence in the high 16.
@@ -534,7 +542,7 @@ mod tests {
     }
 
     fn items_of(root: u64, records: Vec<RecordFacts>) -> Vec<WalkItem> {
-        build(root, records).into_items(&prefix(), &to_component)
+        build(root, records).into_items(0, &prefix(), &to_component)
     }
 
     fn paths(items: &[WalkItem]) -> Vec<String> {
@@ -996,6 +1004,7 @@ mod tests {
     fn emit_items_should_yield_same_items_as_into_items() {
         let mut emitted = Vec::new();
         let collected: Result<(), Infallible> = build(SCAN_ROOT, nested_records()).emit_items(
+            0,
             &prefix(),
             &to_component,
             &mut |item: WalkItem| {
@@ -1005,7 +1014,7 @@ mod tests {
         );
         let Ok(()) = collected;
         emitted.sort_by(|a, b| path_of(a).cmp(path_of(b)));
-        let expected = build(SCAN_ROOT, nested_records()).into_items(&prefix(), &to_component);
+        let expected = build(SCAN_ROOT, nested_records()).into_items(0, &prefix(), &to_component);
         assert_eq!(
             (paths(&emitted), file_entries(&emitted)),
             (paths(&expected), file_entries(&expected)),
@@ -1024,7 +1033,7 @@ mod tests {
             ],
         );
         let mut calls = 0usize;
-        let result = tree.emit_items(&prefix(), &to_component, &mut |_item: WalkItem| {
+        let result = tree.emit_items(0, &prefix(), &to_component, &mut |_item: WalkItem| {
             calls += 1;
             if calls == 2 {
                 Err("stop")
@@ -1056,7 +1065,7 @@ mod tests {
         );
         let mut kinds: Vec<&'static str> = Vec::new();
         let collected: Result<(), Infallible> =
-            tree.emit_items(&prefix(), &to_component, &mut |item: WalkItem| {
+            tree.emit_items(0, &prefix(), &to_component, &mut |item: WalkItem| {
                 kinds.push(match item {
                     WalkItem::Dir { .. } => "dir",
                     WalkItem::File { .. } => "file",

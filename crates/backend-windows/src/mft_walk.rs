@@ -226,6 +226,7 @@ impl Error for MftError {
 pub fn walk_mft<S: RecordSource>(
     source: &mut S,
     root_record: u64,
+    dev: u64,
     root_prefix: &RawPath,
     to_component: &dyn Fn(&[u16]) -> RawPath,
     mem_budget: usize,
@@ -237,6 +238,7 @@ pub fn walk_mft<S: RecordSource>(
     emit_tree(
         tree,
         &mut stats,
+        dev,
         root_prefix,
         to_component,
         cancelled,
@@ -295,12 +297,14 @@ pub fn read_tree<S: RecordSource>(
 pub fn emit_tree(
     tree: VolumeTree,
     stats: &mut MftStats,
+    dev: u64,
     root_prefix: &RawPath,
     to_component: &dyn Fn(&[u16]) -> RawPath,
     cancelled: &dyn Fn() -> bool,
     visit: &mut dyn FnMut(WalkItem) -> CoreResult<()>,
 ) -> Result<(), MftError> {
     tree.emit_items(
+        dev,
         root_prefix,
         to_component,
         &mut |item: WalkItem| -> Result<(), MftError> {
@@ -441,6 +445,7 @@ mod tests {
         let result = walk_mft(
             source,
             root_record,
+            0,
             &prefix(),
             &to_component,
             mem_budget,
@@ -627,6 +632,7 @@ mod tests {
         let result = walk_mft(
             &mut source,
             SCAN_ROOT,
+            0,
             &prefix(),
             &to_component,
             BIG_BUDGET,
@@ -647,6 +653,7 @@ mod tests {
         let _ = walk_mft(
             &mut source,
             SCAN_ROOT,
+            0,
             &prefix(),
             &to_component,
             BIG_BUDGET,
@@ -670,6 +677,7 @@ mod tests {
         let result = walk_mft(
             &mut source,
             SCAN_ROOT,
+            0,
             &prefix(),
             &to_component,
             BIG_BUDGET,
@@ -712,6 +720,7 @@ mod tests {
         let _ = walk_mft(
             &mut source,
             SCAN_ROOT,
+            0,
             &prefix(),
             &to_component,
             BIG_BUDGET,
@@ -772,6 +781,7 @@ mod tests {
         emit_tree(
             tree,
             &mut stats,
+            0,
             &prefix(),
             &to_component,
             &|| false,

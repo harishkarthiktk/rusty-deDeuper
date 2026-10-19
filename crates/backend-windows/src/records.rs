@@ -126,6 +126,9 @@ pub fn extract_record<T: Read + Seek>(
     fs: &mut T,
     record: u64,
 ) -> Result<Option<RecordFacts>, RecordError> {
+    // Known cost: `ntfs.file` re-reads and re-parses $MFT record 0 on every call. ntfs 0.4.0 has
+    // no public constructor that reuses it. Measure on hardware before forking the crate or
+    // writing our own parser.
     let file = match ntfs.file(fs, record) {
         Ok(file) => file,
         // Never written: free space.
@@ -153,7 +156,7 @@ pub fn extract_record<T: Read + Seek>(
     let is_dir = file.is_directory();
     let attrs = standard_information_attributes(&file, fs)?;
     let reparse_tag = if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-        reparse_tag_of(&file, fs)
+        Some(reparse_tag_of(&file, fs)?)
     } else {
         None
     };
@@ -189,9 +192,10 @@ fn namespace_from_byte(byte: u8) -> Option<NameSpace> {
     }
 }
 
-/// The reparse tag is the first little-endian `u32` of the `$REPARSE_POINT` value.
-fn parse_reparse_tag(value: &[u8]) -> Option<u32> {
-    le_u32_at(value, 0)
+/// The reparse tag is the first little-endian `u32` of the `$REPARSE_POINT` value. A value
+/// shorter than that is corrupt, not an unknown tag.
+fn parse_reparse_tag(value: &[u8]) -> Result<u32, RecordError> {
+    le_u32_at(value, 0).ok_or(RecordError::Corrupt("$REPARSE_POINT is too short"))
 }
 
 /// The raw `file_attributes` word of a `$STANDARD_INFORMATION` value.
@@ -251,25 +255,25 @@ fn standard_information_attributes<T: Read + Seek>(
     Err(RecordError::Corrupt("record has no $STANDARD_INFORMATION"))
 }
 
-/// Returns the first `$REPARSE_POINT` tag, or `None` if it cannot be read.
-///
-/// A failed read is not fatal: the caller keeps the reparse bit in `attrs`, so the record is
-/// still treated as a reparse point.
-fn reparse_tag_of<T: Read + Seek>(file: &NtfsFile<'_>, fs: &mut T) -> Option<u32> {
+/// Returns the first `$REPARSE_POINT` tag. The caller calls this only when the reparse bit is
+/// set, so a missing attribute, a read failure, or a short value is an error. It must never
+/// become "no tag", because a directory with the bit and no tag is treated as a symlink.
+fn reparse_tag_of<T: Read + Seek>(file: &NtfsFile<'_>, fs: &mut T) -> Result<u32, RecordError> {
     let mut attributes = file.attributes();
-    while let Some(Ok(item)) = attributes.next(fs) {
-        let Ok(attribute) = item.to_attribute() else {
-            continue;
-        };
-        if attribute.ty().ok() != Some(NtfsAttributeType::ReparsePoint) {
+    while let Some(item) = attributes.next(fs) {
+        let item = item?;
+        let attribute = item.to_attribute()?;
+        if attribute.ty()? != NtfsAttributeType::ReparsePoint {
             continue;
         }
-        let mut value = attribute.value(fs).ok()?;
+        let mut value = attribute.value(fs)?;
         let mut head = [0u8; 4];
-        value.read_exact(fs, &mut head).ok()?;
+        value.read_exact(fs, &mut head)?;
         return parse_reparse_tag(&head);
     }
-    None
+    Err(RecordError::Corrupt(
+        "reparse bit is set but record has no $REPARSE_POINT",
+    ))
 }
 
 /// Size of the unnamed `$DATA` stream. A record without one (a directory, or an empty file
@@ -373,25 +377,27 @@ mod tests {
     fn parse_reparse_tag_should_read_little_endian_when_value_has_four_bytes() {
         // IO_REPARSE_TAG_SYMLINK = 0xA000_000C, stored little-endian.
         assert_eq!(
-            parse_reparse_tag(&[0x0C, 0x00, 0x00, 0xA0]),
+            parse_reparse_tag(&[0x0C, 0x00, 0x00, 0xA0]).ok(),
             Some(0xA000_000C),
             "the tag must be the first four bytes read little-endian"
         );
     }
 
     #[test]
-    fn parse_reparse_tag_should_return_none_when_value_shorter_than_four() {
-        assert_eq!(
-            parse_reparse_tag(&[0x0C, 0x00, 0x00]),
-            None,
-            "a value shorter than the tag cannot yield a tag"
+    fn parse_reparse_tag_should_return_corrupt_error_when_value_shorter_than_four() {
+        assert!(
+            matches!(
+                parse_reparse_tag(&[0x0C, 0x00, 0x00]),
+                Err(RecordError::Corrupt(_))
+            ),
+            "a value shorter than the tag is corrupt and must fail the record"
         );
     }
 
     #[test]
     fn parse_reparse_tag_should_ignore_trailing_bytes_when_value_is_longer() {
         assert_eq!(
-            parse_reparse_tag(&[0x0C, 0x00, 0x00, 0xA0, 0xFF, 0xFF]),
+            parse_reparse_tag(&[0x0C, 0x00, 0x00, 0xA0, 0xFF, 0xFF]).ok(),
             Some(0xA000_000C),
             "bytes after the tag belong to the reparse data and must not change the tag"
         );
