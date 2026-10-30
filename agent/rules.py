@@ -1,4 +1,5 @@
 # Member-level artifact rules. Each returns a reason label or None.
+# Folder names are lowercased first, so matching is case-insensitive (Scripts, scripts, SCRIPTS).
 import ntpath
 
 RUST_PROFILES = {'debug', 'release', 'doc'}
@@ -9,10 +10,10 @@ def is_venv(dirs):
         return True
     named = any(s.startswith('.venv') or s.startswith('venv') for s in dirs)
     env_like = any(s == 'env' or s.endswith('env') for s in dirs)
-    return named or (env_like and bool({'Lib', 'Scripts', 'Include', 'share'} & dirs))
+    return named or (env_like and bool({'lib', 'scripts', 'include', 'share'} & dirs))
 
 def is_venv_launcher(dirs, low):
-    return 'Scripts' in dirs and low.startswith(('python', 'pip', 'activate', 'deactivate'))
+    return 'scripts' in dirs and low.startswith(('python', 'pip', 'activate', 'deactivate'))
 
 def is_cmake_install(dirs, low):
     return any(s.startswith('cmake-') for s in dirs)
@@ -33,7 +34,7 @@ DIR_RULES = [
 
 def reason(path):
     parts = path.replace('/', '\\').split('\\')
-    dirs = set(parts[:-1])
+    dirs = {s.lower() for s in parts[:-1]}
     low = parts[-1].lower()
     for label, rule in DIR_RULES:
         if rule(dirs, low):

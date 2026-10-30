@@ -15,8 +15,17 @@ from jsonio import load_json  # noqa: E402
 from rules import reason  # noqa: E402
 
 
+def check(cond, msg):
+    # not assert: python -O strips asserts, and these guard the lossless split
+    if not cond:
+        sys.exit('split.py: ' + msg)
+
+
 def main(src, out_dir):
+    check(os.path.realpath(os.path.dirname(os.path.abspath(src))) != os.path.realpath(out_dir),
+          'out_dir is the input folder; the input would be overwritten')
     d, text, enc = load_json(src)
+    check(d['group_count'] == len(d['groups']), 'group_count does not match the groups array (truncated input?)')
 
     # Detect the original layout so the output matches it.
     m = re.search(r'\r?\n( *)"', text)
@@ -28,7 +37,7 @@ def main(src, out_dir):
 
     body = text.rstrip('\r\n')
     trailing = text[len(body):]
-    assert dump(d) == body, 'layout not reproducible (indent/newline detection failed)'
+    check(dump(d) == body, 'layout not reproducible (indent/newline detection failed)')
 
     kept, ignored = [], []
     reasons = collections.Counter()
@@ -42,12 +51,12 @@ def main(src, out_dir):
             kept.append(g)
 
     # Lossless check: the two sets together are exactly the original groups.
-    assert len(kept) + len(ignored) == len(d['groups'])
+    check(len(kept) + len(ignored) == len(d['groups']), 'group count changed in the split')
     orig = collections.Counter(json.dumps(g, sort_keys=True) for g in d['groups'])
     new = collections.Counter(
         json.dumps({k: v for k, v in g.items() if k != 'reason'}, sort_keys=True)
         for g in kept + ignored)
-    assert orig == new, 'split is not lossless'
+    check(orig == new, 'split is not lossless')
 
     base = {k: d[k] for k in ('files_enumerated', 'files_errored', 'files_skipped')}
     kept_doc = {**base, 'group_count': len(kept),
@@ -57,8 +66,8 @@ def main(src, out_dir):
                'wasted_logical_total': sum(g['wasted_logical'] for g in ignored),
                'reason_counts': dict(reasons.most_common()),
                'groups': ignored}
-    assert kept_doc['wasted_logical_total'] + ign_doc['wasted_logical_total'] == d['wasted_logical_total'], \
-        'wasted total mismatch'
+    check(kept_doc['wasted_logical_total'] + ign_doc['wasted_logical_total'] == d['wasted_logical_total'],
+          'wasted total mismatch')
 
     def write(path, doc):
         s = dump(doc) + trailing
