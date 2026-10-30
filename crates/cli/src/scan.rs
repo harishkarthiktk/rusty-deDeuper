@@ -28,6 +28,26 @@ use dedupe_core::storage_profile::{self, Profile, StorageKind};
 use dedupe_core::traits::{ContentReader, Enumerator, StorageProbe};
 
 use crate::progress::{should_draw, BarSink};
+
+/// Globs skipped by default (off with `--include-dev-artifacts`): package installs, build output and VCS internals.
+/// Rust `target` is matched with its profile folder, so a folder named `target` holding media is kept.
+const DEV_ARTIFACT_GLOBS: &[&str] = &[
+    "**/site-packages",
+    "**/dist-packages",
+    "**/node_modules",
+    "**/__pycache__",
+    "**/target/debug",
+    "**/target/release",
+    "**/.fingerprint",
+    "**/.git",
+    "**/*.pyc",
+    "**/*.pyo",
+    "**/*.o",
+    "**/*.obj",
+    "**/*.pdb",
+    "**/*.rlib",
+    "**/*.rmeta",
+];
 use crate::{Resolved, ScanArgs};
 
 /// Smallest read chunk for overlapped reads. A small `--buf-size` would otherwise turn each
@@ -160,11 +180,15 @@ pub fn run(args: ScanArgs, cancel: &Token) -> Result<()> {
     #[cfg(not(windows))]
     let backend = make_backend(&args, &profile, cancel);
 
+    let mut patterns = args.exclude.clone();
+    if !args.include_dev_artifacts {
+        patterns.extend(DEV_ARTIFACT_GLOBS.iter().map(|glob| glob.to_string()));
+    }
     let defaults = Config::default();
     let cfg = Config {
         db_path,
         include_placeholders: args.include_placeholders,
-        exclude: ExcludeSet::new(&args.exclude).context("parse --exclude")?,
+        exclude: ExcludeSet::new(&patterns).context("parse --exclude")?,
         force: args.force,
         one_file_system: !args.cross_mounts,
         verify: args.verify.into(),

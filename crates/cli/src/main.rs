@@ -124,6 +124,12 @@ pub struct ScanArgs {
     #[arg(long, value_name = "GLOB")]
     pub exclude: Vec<String>,
 
+    /// Scan build and package artifacts too. By default the scan skips Python and Node
+    /// package folders, Rust build output, `.git` and compiled objects (`.pyc`, `.o`,
+    /// `.pdb`, ...), so `lookup` does not match against them. `--exclude` still applies.
+    #[arg(long)]
+    pub include_dev_artifacts: bool,
+
     /// Windows only: skip the NTFS $MFT fast path and use the standard directory walker. Ignored on other systems.
     #[arg(long)]
     pub no_mft: bool,
