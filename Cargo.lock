@@ -331,6 +331,7 @@ name = "dedupe-backend-generic"
 version = "0.1.0"
 dependencies = [
  "dedupe-core",
+ "dedupe-win-sys",
  "libc",
  "rustix",
  "tracing",
@@ -345,6 +346,7 @@ dependencies = [
  "blake3",
  "dedupe-backend-generic",
  "dedupe-core",
+ "dedupe-win-sys",
  "ntfs",
  "tracing",
  "windows-sys 0.59.0",
@@ -381,6 +383,13 @@ name = "dedupe-tui"
 version = "0.1.0"
 dependencies = [
  "dedupe-core",
+]
+
+[[package]]
+name = "dedupe-win-sys"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

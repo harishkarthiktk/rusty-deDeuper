@@ -145,7 +145,7 @@ mod win32 {
     use std::path::Path;
     use std::ptr::{from_mut, null, null_mut};
 
-    use dedupe_backend_generic::win_sys::{open_handle, to_wide_nul, OwnedHandle};
+    use dedupe_win_sys::{open_handle, to_wide_nul, OwnedHandle};
     use windows_sys::Win32::Foundation::{FILETIME, GENERIC_READ};
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileInformationByHandle, GetFinalPathNameByHandleW, ReadFile, SetFilePointerEx,

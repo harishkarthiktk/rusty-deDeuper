@@ -17,9 +17,9 @@ use std::mem::replace;
 use std::path::Path;
 use std::ptr::{null, null_mut};
 
-use dedupe_backend_generic::win_sys::{open_handle, to_wide_nul, OwnedHandle};
 use dedupe_core::error::Result;
 use dedupe_core::traits::FileHandle;
+use dedupe_win_sys::{open_handle, to_wide_nul, OwnedHandle};
 use windows_sys::Win32::Foundation::{
     ERROR_HANDLE_EOF, ERROR_IO_PENDING, FALSE, GENERIC_READ, HANDLE, TRUE,
 };

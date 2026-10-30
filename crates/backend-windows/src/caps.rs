@@ -90,7 +90,7 @@ mod win32 {
     use std::path::Path;
     use std::ptr::{from_mut, null_mut};
 
-    use dedupe_backend_generic::win_sys::{to_wide_nul, volume_root, OwnedHandle};
+    use dedupe_win_sys::{to_wide_nul, volume_root, OwnedHandle};
     use windows_sys::Win32::Foundation::{HANDLE, MAX_PATH};
     use windows_sys::Win32::Security::{
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,

@@ -68,12 +68,10 @@ mod win32 {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, PoisonError, RwLock};
 
-    use dedupe_backend_generic::win_sys::{
-        open_handle, to_wide_nul, volume_root_cached, OwnedHandle,
-    };
     use dedupe_backend_generic::FsContentReader;
     use dedupe_core::error::Result;
     use dedupe_core::traits::{AccessPattern, ContentReader, FileHandle, FileMeta, ReadTarget};
+    use dedupe_win_sys::{open_handle, to_wide_nul, volume_root_cached, OwnedHandle};
     use windows_sys::Win32::Foundation::{FALSE, GENERIC_READ, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         FileIdType, GetFileInformationByHandle, GetFileSizeEx, GetVolumeInformationByHandleW,

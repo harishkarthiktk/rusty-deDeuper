@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use crate::codec::GenericPathCodec;
-use crate::meta::file_meta_from;
+use crate::sys::{Os, Platform};
 use dedupe_core::config::Config;
 use dedupe_core::error::Result;
 use dedupe_core::model::ErrorKind;
@@ -19,24 +19,8 @@ pub struct WalkdirEnumerator;
 /// Unix: `lstat` (the same cost as before). Windows: one handle open for a regular file, which
 /// yields identity and info together (T8.6). If that open fails, the walker's cached find data
 /// is used with `file_id` `None` and `nlink` 1, and non-regular entries use it directly.
-#[cfg(not(windows))]
 fn file_meta_for(entry: &walkdir::DirEntry, ft: std::fs::FileType) -> std::io::Result<FileMeta> {
-    let md = entry.path().symlink_metadata()?;
-    Ok(file_meta_from(&md, ft))
-}
-
-#[cfg(windows)]
-fn file_meta_for(entry: &walkdir::DirEntry, ft: std::fs::FileType) -> std::io::Result<FileMeta> {
-    if ft.is_file() {
-        if let Some(info) = crate::win_sys::file_info(entry.path()) {
-            return Ok(crate::meta::file_meta_from_info(info));
-        }
-    }
-    let md = entry.metadata().map_err(|e| {
-        e.into_io_error()
-            .unwrap_or_else(|| std::io::Error::other("walk metadata"))
-    })?;
-    Ok(file_meta_from(&md, ft))
+    Os::walk_file_meta(entry, ft)
 }
 
 fn walk_error(

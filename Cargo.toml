@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/backend-generic",
     "crates/backend-windows",
+    "crates/win-sys",
     "crates/cli",
     "crates/tui",
     "bench",
