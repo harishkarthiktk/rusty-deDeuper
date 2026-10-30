@@ -29,7 +29,7 @@ thiserror = "2"
 anyhow = "1"
 smallvec = "1.13"
 unicode-normalization = "0.1"
-tracing = "0.1"
+tracing = { version = "0.1", features = ["release_max_level_warn"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2.5"
 globset = { version = "0.4", default-features = false }
@@ -47,6 +47,18 @@ tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
 
+# Default build: `cargo build --release`. Optimised but quick to compile.
+# shortcut: no LTO and 16 codegen units cost some runtime speed; restore
+# lto = "thin" and codegen-units = 1 before benchmarking or shipping.
 [profile.release]
-lto = "thin"
-codegen-units = 1
+lto = false
+codegen-units = 16
+incremental = true
+strip = "symbols"
+
+# Debug build, only when needed: `cargo build` (dev profile), full debuginfo.
+[profile.dev]
+debug = true
+
+[profile.dev.package."*"]
+opt-level = 2
