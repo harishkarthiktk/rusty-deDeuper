@@ -15,7 +15,7 @@ use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use crate::mft_walk::RecordSource;
+use crate::mft_walk::{RecordSource, CANCEL_CHECK_INTERVAL};
 use crate::records::RecordError;
 use crate::tree::{
     BudgetExceeded, NameFact, NameSpace, RecordFacts, VolumeTree, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -74,6 +74,11 @@ pub enum CacheError {
     Truncated,
     BadChecksum,
     Malformed(&'static str),
+    /// The file is larger than the memory budget allows, so it is not read.
+    TooLarge {
+        len: u64,
+        max_bytes: usize,
+    },
 }
 
 impl fmt::Display for CacheError {
@@ -87,6 +92,10 @@ impl fmt::Display for CacheError {
             Self::Truncated => write!(f, "MFT cache is truncated"),
             Self::BadChecksum => write!(f, "MFT cache checksum does not match its contents"),
             Self::Malformed(why) => write!(f, "MFT cache is malformed: {why}"),
+            Self::TooLarge { len, max_bytes } => write!(
+                f,
+                "MFT cache is {len} bytes, over the {max_bytes} byte memory budget"
+            ),
         }
     }
 }
@@ -425,10 +434,12 @@ where
     Ok(())
 }
 
-/// The sibling `<name>.tmp` file that [`write_atomic_stream`] writes before the rename.
+/// The sibling `<name>.<pid>.tmp` file that [`write_atomic_stream`] writes before the rename.
+///
+/// The process id keeps two scans on one volume from writing the same temp file.
 fn temp_path(path: &Path) -> PathBuf {
     let mut tmp_name = path.as_os_str().to_owned();
-    tmp_name.push(".tmp");
+    tmp_name.push(format!(".{}.tmp", std::process::id()));
     PathBuf::from(tmp_name)
 }
 
@@ -457,8 +468,14 @@ where
     Ok(())
 }
 
-/// Reads and decodes the cache at `path`.
-pub fn read(path: &Path) -> Result<CachedIndex, CacheError> {
+/// Reads and decodes the cache at `path`, unless the file is larger than `max_bytes`.
+///
+/// A stored record never costs less in memory than on disk, so a bigger file cannot fit.
+pub fn read(path: &Path, max_bytes: usize) -> Result<CachedIndex, CacheError> {
+    let len = fs::metadata(path)?.len();
+    if usize::try_from(len).map_or(true, |len| len > max_bytes) {
+        return Err(CacheError::TooLarge { len, max_bytes });
+    }
     let bytes = fs::read(path)?;
     decode(&bytes)
 }
@@ -536,6 +553,8 @@ pub enum DeltaError {
     Record(RecordError),
     /// A refreshed record would exceed the memory budget.
     Budget(BudgetExceeded),
+    /// The caller's cancel check fired while records were being re-read.
+    Cancelled,
 }
 
 impl fmt::Display for DeltaError {
@@ -549,6 +568,7 @@ impl fmt::Display for DeltaError {
             }
             Self::Record(err) => write!(f, "re-reading a changed MFT record failed: {err}"),
             Self::Budget(err) => write!(f, "{err}"),
+            Self::Cancelled => write!(f, "applying the USN delta was cancelled"),
         }
     }
 }
@@ -558,7 +578,7 @@ impl Error for DeltaError {
         match self {
             Self::Record(err) => Some(err),
             Self::Budget(err) => Some(err),
-            Self::TooManyChanges(_) => None,
+            Self::TooManyChanges(_) | Self::Cancelled => None,
         }
     }
 }
@@ -581,6 +601,9 @@ pub fn max_touched(cached_records: usize) -> usize {
 /// The touched set is checked against `max_touched` before any record is read or changed, so
 /// an over-limit delta leaves `tree` as it was.
 ///
+/// `cancelled` is polled every `CANCEL_CHECK_INTERVAL` records and ends the delta with
+/// `DeltaError::Cancelled`.
+///
 /// On `Err` from a re-read or the budget, `tree` is in an unspecified state: some records may
 /// be removed or replaced and others not. The caller must discard the tree and walk the volume.
 pub fn apply_delta<S: RecordSource>(
@@ -588,13 +611,17 @@ pub fn apply_delta<S: RecordSource>(
     source: &mut S,
     entries: &[UsnEntry],
     max_touched: usize,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<DeltaStats, DeltaError> {
     let mut touched: BTreeSet<u64> = entries.iter().map(UsnEntry::record_number).collect();
     touched.retain(|&number| number == ROOT_DIR_RECORD || number >= FIRST_USER_RECORD);
     if touched.len() > max_touched {
         return Err(DeltaError::TooManyChanges(touched.len()));
     }
-    for &number in &touched {
+    for (index, &number) in (0u64..).zip(touched.iter()) {
+        if index.is_multiple_of(CANCEL_CHECK_INTERVAL) && cancelled() {
+            return Err(DeltaError::Cancelled);
+        }
         match source.record(number).map_err(DeltaError::Record)? {
             Some(facts) => {
                 // Remove first: `push` ignores a record that is now filtered out, which would
@@ -902,8 +929,8 @@ mod tests {
             written.is_ok(),
             "write_atomic must create the missing directory and write the file: {written:?}"
         );
-        let tmp_left_behind = path.with_extension("cache.tmp").exists();
-        let read_back = read(&path);
+        let tmp_left_behind = temp_path(&path).exists();
+        let read_back = read(&path, usize::MAX);
         let _ = fs::remove_dir_all(&dir);
 
         assert!(
@@ -1170,7 +1197,9 @@ mod tests {
 
     /// Items of the tree a full walk would build from `records`.
     fn items_of(records: Vec<RecordFacts>) -> Vec<WalkItem> {
-        tree_of(records).into_items(0, &RawPath::new(ROOT_PREFIX), &component)
+        tree_of(records)
+            .into_items(0, &RawPath::new(ROOT_PREFIX), &component)
+            .expect("test budget is large enough")
     }
 
     /// Root 24 holds "Users" (25) and "b.txt" (28) and "Old" (29). "Users" holds "Docs" (26),
@@ -1207,7 +1236,7 @@ mod tests {
         let mut source = FakeSource::new(64, mutated_records(), &[]);
         let entries = [entry(27), entry(28), entry(29), entry(32)];
 
-        let stats = apply_delta(&mut tree, &mut source, &entries, 1000)
+        let stats = apply_delta(&mut tree, &mut source, &entries, 1000, &|| false)
             .expect("a delta over a valid source must apply");
         assert_eq!(
             stats,
@@ -1218,7 +1247,9 @@ mod tests {
             "stats must count the four entries and the four distinct records re-read"
         );
 
-        let delta_items = tree.into_items(0, &RawPath::new(ROOT_PREFIX), &component);
+        let delta_items = tree
+            .into_items(0, &RawPath::new(ROOT_PREFIX), &component)
+            .expect("test budget is large enough");
         let full_items = items_of(mutated_records());
         assert_eq!(
             (item_paths(&delta_items), item_files(&delta_items)),
@@ -1238,14 +1269,16 @@ mod tests {
         records.push(facts_of(28, false, vec![dos_name(SCAN_ROOT, "B~1.TXT")]));
         let mut source = FakeSource::new(64, records, &[]);
 
-        apply_delta(&mut tree, &mut source, &[entry(28)], 1000)
+        apply_delta(&mut tree, &mut source, &[entry(28)], 1000, &|| false)
             .expect("a DOS-only re-read is not an error");
 
         assert!(
             tree.records_iter().all(|facts| facts.record != 28),
             "a record whose re-read keeps only DOS names must be removed, not left at its old name"
         );
-        let items = tree.into_items(0, &RawPath::new(ROOT_PREFIX), &component);
+        let items = tree
+            .into_items(0, &RawPath::new(ROOT_PREFIX), &component)
+            .expect("test budget is large enough");
         assert!(
             !item_paths(&items)
                 .iter()
@@ -1262,7 +1295,7 @@ mod tests {
         let mut source = FakeSource::new(64, mutated_records(), &[]);
         let entries = [entry(25), entry(26), entry(27), entry(28), entry(29)];
 
-        let result = apply_delta(&mut tree, &mut source, &entries, 4);
+        let result = apply_delta(&mut tree, &mut source, &entries, 4, &|| false);
 
         assert!(
             matches!(result, Err(DeltaError::TooManyChanges(5))),
@@ -1286,7 +1319,7 @@ mod tests {
         let mut source = FakeSource::new(64, mutated_records(), &[]);
         let entries = [entry(0), entry(3), entry(5), entry(24)];
 
-        apply_delta(&mut tree, &mut source, &entries, 1000)
+        apply_delta(&mut tree, &mut source, &entries, 1000, &|| false)
             .expect("metafile entries are skipped, not errors");
 
         assert_eq!(
@@ -1302,11 +1335,41 @@ mod tests {
         let mut tree = tree_of(original_records());
         let mut source = FakeSource::new(64, mutated_records(), &[28]);
 
-        let result = apply_delta(&mut tree, &mut source, &[entry(28)], 1000);
+        let result = apply_delta(&mut tree, &mut source, &[entry(28)], 1000, &|| false);
 
         assert!(
             matches!(result, Err(DeltaError::Record(RecordError::Corrupt(_)))),
             "a failed re-read must surface as DeltaError::Record, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn read_should_return_too_large_when_file_exceeds_max_bytes() {
+        let dir = std::env::temp_dir().join(format!("dedupe-cache-large-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let index = sample_index();
+        let path = cache_path(&dir, index.volume.volume_serial);
+        write_atomic(&path, &index).expect("write the fixture");
+
+        let result = read(&path, 8);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(
+            matches!(result, Err(CacheError::TooLarge { max_bytes: 8, .. })),
+            "a file over max_bytes must fail with TooLarge, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn apply_delta_should_return_cancelled_when_cancel_check_fires() {
+        let mut tree = tree_of(original_records());
+        let mut source = FakeSource::new(64, mutated_records(), &[]);
+
+        let result = apply_delta(&mut tree, &mut source, &[entry(25)], 1000, &|| true);
+
+        assert!(
+            matches!(result, Err(DeltaError::Cancelled)),
+            "a cancel must end the delta with Cancelled, got {result:?}"
         );
     }
 

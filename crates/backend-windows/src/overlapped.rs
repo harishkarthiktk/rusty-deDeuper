@@ -184,7 +184,7 @@ impl AsyncBackend for OverlappedBackend {
             .ok_or_else(|| invalid_input("slot index is out of range"))?;
         let result = match replace(&mut s.state, SlotState::Idle) {
             SlotState::Waited(result) => result,
-            SlotState::InFlight => wait_for(handle, &s.overlapped),
+            SlotState::InFlight => wait_for(handle, std::ptr::from_mut(&mut *s.overlapped)),
             SlotState::Idle => Err(invalid_input("complete called on a slot with no read")),
         };
         s.valid = result.as_ref().map_or(0, |bytes| *bytes);
@@ -215,7 +215,8 @@ impl AsyncBackend for OverlappedBackend {
         for s in &mut self.slots {
             if matches!(s.state, SlotState::InFlight) {
                 // The result is kept, not dropped, so the matching `complete` still returns it.
-                s.state = SlotState::Waited(wait_for(handle, &s.overlapped));
+                s.state =
+                    SlotState::Waited(wait_for(handle, std::ptr::from_mut(&mut *s.overlapped)));
             }
         }
     }
@@ -279,11 +280,15 @@ impl FileHandle for OverlappedFile {
 
 /// Waits until the read on `overlapped` finishes and returns the bytes it moved. End of file
 /// counts as zero bytes.
-fn wait_for(handle: HANDLE, overlapped: &OVERLAPPED) -> io::Result<usize> {
+///
+/// `overlapped` is a raw pointer because the kernel writes through it during the wait, so no
+/// Rust reference to it may be live.
+fn wait_for(handle: HANDLE, overlapped: *mut OVERLAPPED) -> io::Result<usize> {
     let mut transferred: u32 = 0;
-    // SAFETY: `handle` is live, since its owner outlives every call here. `overlapped` points to
-    // the slot's boxed OVERLAPPED, which is not moved or freed while its read is pending. The
-    // caller only calls this for an InFlight slot. `transferred` is a live u32 out-parameter.
+    // SAFETY: `handle` is live, since its owner outlives every call here. `overlapped` comes from
+    // the slot's boxed OVERLAPPED, which is not moved or freed while its read is pending, and
+    // no Rust reference to it is live during the wait. The caller only calls this for an
+    // InFlight slot. `transferred` is a live u32 out-parameter.
     // bWait is TRUE, so the call returns only after the kernel has finished writing the buffer.
     let ok = unsafe { GetOverlappedResult(handle, overlapped, &mut transferred, TRUE) };
     if ok != FALSE {

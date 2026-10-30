@@ -298,30 +298,44 @@ mod win32 {
         }
 
         /// Opens the target with `flags`: by id first when it carries a valid id, then by path.
+        ///
+        /// On NTFS the path-opened file must still have the stored id, else it fails with
+        /// `InvalidData`.
         fn open_handle_for(
             &self,
             t: ReadTarget<'_>,
             flags: FILE_FLAGS_AND_ATTRIBUTES,
         ) -> io::Result<OwnedHandle> {
-            if let Some(frn) = t.file_id.and_then(file_id_to_frn) {
-                if let Some(hint) = self.hint_for(t.path) {
-                    match open_by_id(&hint, frn, flags) {
-                        Ok(handle) if handle_is(&handle, frn) => return Ok(handle),
-                        Ok(_) => {
-                            tracing::debug!("open by id returned another file; opening by path");
-                        }
-                        Err(err) => {
-                            tracing::debug!(error = %err, "open by file id failed; opening by path");
-                        }
+            let frn = t.file_id.and_then(file_id_to_frn);
+            // `Some` only on NTFS, the one filesystem whose ids are trusted here.
+            let hint = frn.and_then(|_| self.hint_for(t.path));
+            if let (Some(frn), Some(hint)) = (frn, &hint) {
+                match open_by_id(hint, frn, flags) {
+                    Ok(handle) if handle_is(&handle, frn) => return Ok(handle),
+                    Ok(_) => {
+                        tracing::debug!("open by id returned another file; opening by path");
+                    }
+                    Err(err) => {
+                        tracing::debug!(error = %err, "open by file id failed; opening by path");
                     }
                 }
             }
-            open_handle(
+            let handle = open_handle(
                 &to_wide_nul(t.path.as_os_str()),
                 GENERIC_READ,
                 SHARE_ALL,
                 flags,
-            )
+            )?;
+            // A link or a new file put at this path after enumeration has another id.
+            if let (Some(frn), Some(_)) = (frn, &hint) {
+                if !handle_is(&handle, frn) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "file changed since enumeration",
+                    ));
+                }
+            }
+            Ok(handle)
         }
     }
 

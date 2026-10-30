@@ -16,15 +16,15 @@ use dedupe_core::traits::{Enumerator, PathCodec, WalkItem};
 
 use crate::caps::{choose_mode, probe_capabilities, FallbackReason, Mode};
 use crate::mft_cache::{
-    self, apply_delta, cache_path, max_touched, validate, CacheError, CachedIndex, DeltaStats,
-    JournalStamp, VolumeStamp,
+    self, apply_delta, cache_path, max_touched, validate, CacheError, CachedIndex, DeltaError,
+    DeltaStats, JournalStamp, VolumeStamp,
 };
 use crate::mft_walk::{
     emit_tree, read_tree, MftError, MftEvent, MftObserver, MftStats, NtfsRecordSource,
     RecordSource, VolumeGeometry,
 };
 use crate::tree::VolumeTree;
-use crate::usn::{query_journal, read_journal, JournalInfo, UsnEntry};
+use crate::usn::{query_journal, read_journal, JournalInfo, UsnEntry, UsnError};
 use crate::volume_io::{
     ntfs_volume_data, ntfs_volume_serial, open_raw_volume, record_number_of, resolve_root,
     RawVolume,
@@ -229,7 +229,9 @@ fn walk_mft_volume(
     // Read before any record, so a change made during the read is replayed by the next scan.
     let site = cache_site(&volume, &geometry, cache, notices);
     let plan = match &site {
-        Some(site) if !cache.rebuild => load_cache_plan(site, &volume, notices),
+        Some(site) if !cache.rebuild => {
+            load_cache_plan(site, &volume, cancel, notices, cfg.mem_budget)?
+        }
         _ => Plan::Full,
     };
 
@@ -319,13 +321,21 @@ fn cache_site(
 
 /// Decides whether the cache file can seed this scan. Every reason to refuse it becomes a notice,
 /// except a missing file, which is the normal first scan.
-fn load_cache_plan(site: &CacheSite, volume: &RawVolume, notices: &EnumNotices) -> Plan {
-    let cached = match mft_cache::read(&site.path) {
+///
+/// A cancel during the journal read stops the scan; it is not a cache problem.
+fn load_cache_plan(
+    site: &CacheSite,
+    volume: &RawVolume,
+    cancel: &Token,
+    notices: &EnumNotices,
+    mem_budget: usize,
+) -> std::result::Result<Plan, MftFailure> {
+    let cached = match mft_cache::read(&site.path, mem_budget) {
         Ok(cached) => cached,
-        Err(CacheError::Io(err)) if err.kind() == io::ErrorKind::NotFound => return Plan::Full,
+        Err(CacheError::Io(err)) if err.kind() == io::ErrorKind::NotFound => return Ok(Plan::Full),
         Err(err) => {
             notices.push(format!("MFT cache discarded: {err}"));
-            return Plan::Full;
+            return Ok(Plan::Full);
         }
     };
     let journal = &site.journal;
@@ -337,20 +347,22 @@ fn load_cache_plan(site: &CacheSite, volume: &RawVolume, notices: &EnumNotices) 
         journal.next_usn,
     ) {
         notices.push(format!("MFT cache discarded: {reason}"));
-        return Plan::Full;
+        return Ok(Plan::Full);
     }
     match read_journal(
         volume,
         journal.journal_id,
         cached.journal.next_usn,
         journal.next_usn,
+        &|| cancel.is_cancelled(),
     ) {
-        Ok(entries) => Plan::Delta { cached, entries },
+        Ok(entries) => Ok(Plan::Delta { cached, entries }),
+        Err(UsnError::Cancelled) => Err(classify(MftError::Cancelled)),
         Err(err) => {
             notices.push(format!(
                 "MFT cache discarded: USN journal read failed: {err}"
             ));
-            Plan::Full
+            Ok(Plan::Full)
         }
     }
 }
@@ -369,7 +381,15 @@ fn obtain_tree<S: RecordSource>(
     notices: &EnumNotices,
 ) -> std::result::Result<(VolumeTree, MftStats, Option<DeltaStats>), MftFailure> {
     if let Plan::Delta { cached, entries } = plan {
-        match refresh_cached(cached, &entries, source, root_record, mem_budget, on_event) {
+        match refresh_cached(
+            cached,
+            &entries,
+            source,
+            root_record,
+            mem_budget,
+            cancel,
+            on_event,
+        ) {
             Ok((tree, delta)) => {
                 let stats = MftStats {
                     records_seen: tree.records_iter().len() as u64,
@@ -377,7 +397,10 @@ fn obtain_tree<S: RecordSource>(
                 };
                 return Ok((tree, stats, Some(delta)));
             }
-            Err(reason) => notices.push(format!("MFT cache discarded: {reason}")),
+            Err(Refresh::Cancelled) => return Err(classify(MftError::Cancelled)),
+            Err(Refresh::Discard(reason)) => {
+                notices.push(format!("MFT cache discarded: {reason}"));
+            }
         }
     }
     let (tree, stats) = read_tree(
@@ -391,24 +414,38 @@ fn obtain_tree<S: RecordSource>(
     Ok((tree, stats, None))
 }
 
-/// Rebuilds the tree from the cached records, then applies the journal entries to it. The error
-/// text is the reason for the notice. A failed refresh drops its partly updated tree.
+/// Why [`refresh_cached`] gave up.
+enum Refresh {
+    /// The scan was cancelled; it must stop, not fall back to a full read.
+    Cancelled,
+    /// The cache cannot be used. The text is the reason for the notice.
+    Discard(String),
+}
+
+/// Rebuilds the tree from the cached records, then applies the journal entries to it. A failed
+/// refresh drops its partly updated tree.
 fn refresh_cached<S: RecordSource>(
     cached: CachedIndex,
     entries: &[UsnEntry],
     source: &mut S,
     root_record: u64,
     mem_budget: usize,
+    cancel: &Token,
     on_event: &dyn Fn(MftEvent),
-) -> std::result::Result<(VolumeTree, DeltaStats), String> {
+) -> std::result::Result<(VolumeTree, DeltaStats), Refresh> {
     let mut tree = VolumeTree::from_facts(root_record, mem_budget, cached.records)
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| Refresh::Discard(err.to_string()))?;
     let records = tree.records_iter().len();
     on_event(MftEvent::CacheLoaded {
         records: records as u64,
     });
-    let delta = apply_delta(&mut tree, source, entries, max_touched(records))
-        .map_err(|err| err.to_string())?;
+    let delta = apply_delta(&mut tree, source, entries, max_touched(records), &|| {
+        cancel.is_cancelled()
+    })
+    .map_err(|err| match err {
+        DeltaError::Cancelled => Refresh::Cancelled,
+        other => Refresh::Discard(other.to_string()),
+    })?;
     on_event(MftEvent::DeltaApplied {
         entries: delta.entries as u64,
         reread: delta.reread as u64,

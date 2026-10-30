@@ -68,6 +68,8 @@ pub enum UsnError {
     JournalDeleteInProgress,
     /// The requested USN is no longer in the journal; the caller must rescan.
     EntryDeleted,
+    /// The caller's cancel check fired between journal reads.
+    Cancelled,
     Io(io::Error),
 }
 
@@ -92,6 +94,7 @@ impl fmt::Display for UsnError {
             Self::JournalNotActive => f.write_str("USN journal is not active on this volume"),
             Self::JournalDeleteInProgress => f.write_str("USN journal is being deleted"),
             Self::EntryDeleted => f.write_str("USN journal entry was deleted"),
+            Self::Cancelled => f.write_str("USN journal read was cancelled"),
             Self::Io(err) => write!(f, "USN journal I/O error: {err}"),
         }
     }
@@ -249,18 +252,23 @@ pub fn query_journal(vol: &RawVolume) -> Result<JournalInfo, UsnError> {
 /// Reads every journal record with a USN below `end_usn`, starting at `start_usn`.
 ///
 /// Stops when the cursor reaches `end_usn`, when a read returns no records, or when a read does
-/// not move the cursor. Returns `Malformed` after `MAX_READ_ROUNDS` reads.
+/// not move the cursor. Returns `Malformed` after `MAX_READ_ROUNDS` reads. `cancelled` is polled at
+/// the start of every round and ends the read with `Cancelled`.
 #[cfg(windows)]
 pub fn read_journal(
     vol: &RawVolume,
     journal_id: u64,
     start_usn: i64,
     end_usn: i64,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<UsnEntry>, UsnError> {
     let mut entries = Vec::new();
     let mut cursor = start_usn;
     let mut buf = vec![0u8; READ_BUFFER_LEN];
     for _ in 0..MAX_READ_ROUNDS {
+        if cancelled() {
+            return Err(UsnError::Cancelled);
+        }
         if cursor >= end_usn {
             return Ok(entries);
         }

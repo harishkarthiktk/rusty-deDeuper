@@ -26,6 +26,8 @@ const RECORD_NUMBER_MASK: u64 = (1 << 48) - 1;
 const MAX_DEPTH: usize = 4096;
 /// Fixed estimate of the per-record bookkeeping cost used for the memory budget.
 const RECORD_OVERHEAD_BYTES: usize = 128;
+/// Bytes charged per directory node beyond its path: map slot, `DirNode`, queue entry.
+const DIR_NODE_OVERHEAD_BYTES: usize = 64;
 
 const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
 pub(crate) const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
@@ -99,6 +101,15 @@ impl fmt::Display for BudgetExceeded {
 }
 
 impl Error for BudgetExceeded {}
+
+/// Why [`VolumeTree::emit_items`] stopped.
+#[derive(Debug)]
+pub enum EmitError<E> {
+    /// Directory paths pushed memory past the budget. Nothing was emitted yet.
+    Budget(BudgetExceeded),
+    /// The visitor failed; its error is returned unchanged.
+    Visit(E),
+}
 
 /// Records under one root, indexed for a single walk.
 pub struct VolumeTree {
@@ -179,6 +190,16 @@ impl VolumeTree {
         }
     }
 
+    /// Checks the scan root before anything is visited. An empty success would let the
+    /// rescan delete every row under the root.
+    pub fn check_root(&self) -> Result<(), &'static str> {
+        match self.records.get(&self.root) {
+            None => Err("root record is not in the index (metafile range or unreadable)"),
+            Some(f) if kind_of(f) != EntryKind::Directory => Err("root record is not a directory"),
+            Some(_) => Ok(()),
+        }
+    }
+
     /// Visits every walk item under the root without collecting them.
     ///
     /// Order: the root directory first, then every other directory in path byte order (a
@@ -191,7 +212,9 @@ impl VolumeTree {
     /// takes ownership. Each file's facts are dropped once its names are visited.
     ///
     /// The directory pass needs the facts of every record, so the records still count against
-    /// `mem_budget` until emission starts. The cached directory paths are not counted.
+    /// `mem_budget` until emission starts. The cached directory paths and a fixed per-directory
+    /// overhead are charged against what the records leave of the budget. If they do not fit,
+    /// [`EmitError::Budget`] is returned before the first item is visited.
     ///
     /// Paths are `root_prefix` joined with the on-disk names, so they match the paths the
     /// generic walker yields for the same root. Each hard-link name yields its own file item.
@@ -199,17 +222,8 @@ impl VolumeTree {
     ///
     /// `to_component` converts one UTF-16 name to a path component (the caller uses the
     /// path codec on the wide name). A visitor error stops emission at that item and is
-    /// returned unchanged.
-    /// Checks the scan root before anything is visited. An empty success would let the
-    /// rescan delete every row under the root.
-    pub fn check_root(&self) -> Result<(), &'static str> {
-        match self.records.get(&self.root) {
-            None => Err("root record is not in the index (metafile range or unreadable)"),
-            Some(f) if kind_of(f) != EntryKind::Directory => Err("root record is not a directory"),
-            Some(_) => Ok(()),
-        }
-    }
-
+    /// returned as [`EmitError::Visit`].
+    ///
     /// `dev` is set on every file's `FileMeta`. It is the volume serial, so ids from different
     /// volumes stay apart. It is passed in, not stored, so a cached tree takes the current volume's value.
     pub fn emit_items<E>(
@@ -218,8 +232,13 @@ impl VolumeTree {
         root_prefix: &RawPath,
         to_component: &dyn Fn(&[u16]) -> RawPath,
         visit: &mut dyn FnMut(WalkItem) -> Result<(), E>,
-    ) -> Result<(), E> {
-        let Self { root, records, .. } = self;
+    ) -> Result<(), EmitError<E>> {
+        let Self {
+            root,
+            records,
+            budget_bytes,
+            used_bytes,
+        } = self;
         // `check_root` makes these early returns unreachable in practice.
         let Some(root_facts) = records.get(&root) else {
             return Ok(());
@@ -228,11 +247,20 @@ impl VolumeTree {
             return Ok(());
         }
 
-        let dirs = reach_directories(&records, root, root_prefix, to_component);
+        let dirs = reach_directories(
+            &records,
+            root,
+            root_prefix,
+            to_component,
+            budget_bytes,
+            budget_bytes.saturating_sub(used_bytes),
+        )
+        .map_err(EmitError::Budget)?;
 
         visit(WalkItem::Dir {
             path: root_prefix.clone(),
-        })?;
+        })
+        .map_err(EmitError::Visit)?;
         let mut others: Vec<&RawPath> = dirs
             .iter()
             .filter(|&(&record, _)| record != root)
@@ -240,7 +268,7 @@ impl VolumeTree {
             .collect();
         others.sort_unstable();
         for path in others {
-            visit(WalkItem::Dir { path: path.clone() })?;
+            visit(WalkItem::Dir { path: path.clone() }).map_err(EmitError::Visit)?;
         }
 
         // Consuming the map drops each record's facts as soon as its names are visited.
@@ -261,7 +289,7 @@ impl VolumeTree {
                 let path = parent
                     .path
                     .join_component(to_component(&name.name).as_bytes());
-                visit(WalkItem::File { path, meta })?;
+                visit(WalkItem::File { path, meta }).map_err(EmitError::Visit)?;
             }
         }
         Ok(())
@@ -277,16 +305,20 @@ impl VolumeTree {
         dev: u64,
         root_prefix: &RawPath,
         to_component: &dyn Fn(&[u16]) -> RawPath,
-    ) -> Vec<WalkItem> {
+    ) -> Result<Vec<WalkItem>, BudgetExceeded> {
         let mut items = Vec::new();
-        let collected: Result<(), Infallible> =
+        let collected: Result<(), EmitError<Infallible>> =
             self.emit_items(dev, root_prefix, to_component, &mut |item: WalkItem| {
                 items.push(item);
                 Ok(())
             });
-        let Ok(()) = collected;
+        match collected {
+            Ok(()) => {}
+            Err(EmitError::Budget(err)) => return Err(err),
+            Err(EmitError::Visit(never)) => match never {},
+        }
         items.sort_by(|a, b| path_of(a).cmp(path_of(b)));
-        items
+        Ok(items)
     }
 }
 
@@ -334,12 +366,25 @@ fn index_dir_children(records: &BTreeMap<u64, RecordFacts>) -> HashMap<u64, Vec<
 /// The first name that reaches a directory fixes its path. The map doubles as the visited
 /// set: it stops cycles and a directory reached through a second, corrupt name. The root is in
 /// the map from the start, so NTFS's self-named "." edge is skipped without a separate check.
+///
+/// Each directory, the root included, is charged its path length plus [`DIR_NODE_OVERHEAD_BYTES`]
+/// against `remaining`. Past it the walk fails with `limit_bytes` as the error's limit.
 fn reach_directories(
     records: &BTreeMap<u64, RecordFacts>,
     root: u64,
     root_prefix: &RawPath,
     to_component: &dyn Fn(&[u16]) -> RawPath,
-) -> HashMap<u64, DirNode> {
+    limit_bytes: usize,
+    remaining: usize,
+) -> Result<HashMap<u64, DirNode>, BudgetExceeded> {
+    let over = BudgetExceeded { limit_bytes };
+    let mut charged = root_prefix
+        .as_bytes()
+        .len()
+        .saturating_add(DIR_NODE_OVERHEAD_BYTES);
+    if charged > remaining {
+        return Err(over);
+    }
     let children = index_dir_children(records);
     let mut dirs = HashMap::from([(
         root,
@@ -366,6 +411,12 @@ fn reach_directories(
                 continue;
             };
             let path = parent.path.join_component(to_component(name).as_bytes());
+            charged = charged
+                .saturating_add(path.as_bytes().len())
+                .saturating_add(DIR_NODE_OVERHEAD_BYTES);
+            if charged > remaining {
+                return Err(over);
+            }
             dirs.insert(
                 child,
                 DirNode {
@@ -376,7 +427,7 @@ fn reach_directories(
             queue.push_back((child, child_depth));
         }
     }
-    dirs
+    Ok(dirs)
 }
 
 fn path_of(item: &WalkItem) -> &RawPath {
@@ -542,7 +593,9 @@ mod tests {
     }
 
     fn items_of(root: u64, records: Vec<RecordFacts>) -> Vec<WalkItem> {
-        build(root, records).into_items(0, &prefix(), &to_component)
+        build(root, records)
+            .into_items(0, &prefix(), &to_component)
+            .expect("test budget is large enough")
     }
 
     fn paths(items: &[WalkItem]) -> Vec<String> {
@@ -1003,18 +1056,16 @@ mod tests {
     #[test]
     fn emit_items_should_yield_same_items_as_into_items() {
         let mut emitted = Vec::new();
-        let collected: Result<(), Infallible> = build(SCAN_ROOT, nested_records()).emit_items(
-            0,
-            &prefix(),
-            &to_component,
-            &mut |item: WalkItem| {
+        let collected: Result<(), EmitError<Infallible>> = build(SCAN_ROOT, nested_records())
+            .emit_items(0, &prefix(), &to_component, &mut |item: WalkItem| {
                 emitted.push(item);
                 Ok(())
-            },
-        );
-        let Ok(()) = collected;
+            });
+        assert!(collected.is_ok(), "an Infallible visitor cannot fail");
         emitted.sort_by(|a, b| path_of(a).cmp(path_of(b)));
-        let expected = build(SCAN_ROOT, nested_records()).into_items(0, &prefix(), &to_component);
+        let expected = build(SCAN_ROOT, nested_records())
+            .into_items(0, &prefix(), &to_component)
+            .expect("test budget is large enough");
         assert_eq!(
             (paths(&emitted), file_entries(&emitted)),
             (paths(&expected), file_entries(&expected)),
@@ -1041,15 +1092,41 @@ mod tests {
                 Ok(())
             }
         });
-        assert_eq!(
-            result,
-            Err("stop"),
+        assert!(
+            matches!(result, Err(EmitError::Visit("stop"))),
             "the visitor's error must be returned unchanged"
         );
         assert_eq!(
             calls, 2,
             "emission must stop at the failing item, got {calls} visits"
         );
+    }
+
+    #[test]
+    fn emit_items_should_return_budget_error_when_directory_paths_exceed_budget() {
+        let records = vec![
+            root_at(SCAN_ROOT),
+            dir(25, vec![win32(SCAN_ROOT, "Users")]),
+            dir(26, vec![win32(25, "Bob")]),
+            file(27, vec![win32(26, "a.txt")]),
+        ];
+        // Fits the records and the root path, so the first child directory is what trips it.
+        let budget = records.iter().map(record_cost).sum::<usize>()
+            + ROOT_PREFIX.len()
+            + DIR_NODE_OVERHEAD_BYTES
+            + 8;
+        let tree = VolumeTree::from_facts(SCAN_ROOT, budget, records)
+            .expect("the budget fits the records");
+        let mut calls = 0usize;
+        let result = tree.emit_items(0, &prefix(), &to_component, &mut |_item: WalkItem| {
+            calls += 1;
+            Ok::<(), Infallible>(())
+        });
+        assert!(
+            matches!(result, Err(EmitError::Budget(_))),
+            "directory paths over the budget must fail, got {result:?}"
+        );
+        assert_eq!(calls, 0, "nothing may be visited before the budget check");
     }
 
     #[test]
@@ -1064,7 +1141,7 @@ mod tests {
             ],
         );
         let mut kinds: Vec<&'static str> = Vec::new();
-        let collected: Result<(), Infallible> =
+        let collected: Result<(), EmitError<Infallible>> =
             tree.emit_items(0, &prefix(), &to_component, &mut |item: WalkItem| {
                 kinds.push(match item {
                     WalkItem::Dir { .. } => "dir",
@@ -1073,7 +1150,7 @@ mod tests {
                 });
                 Ok(())
             });
-        let Ok(()) = collected;
+        assert!(collected.is_ok(), "an Infallible visitor cannot fail");
         assert_eq!(
             kinds,
             ["dir", "dir", "file"],

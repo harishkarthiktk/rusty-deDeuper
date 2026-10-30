@@ -16,13 +16,13 @@ use dedupe_core::traits::WalkItem;
 
 use crate::records::{ensure_mft_runlist_in_base, extract_record, RecordError};
 use crate::sector::SectorReader;
-use crate::tree::{BudgetExceeded, RecordFacts, VolumeTree};
+use crate::tree::{BudgetExceeded, EmitError, RecordFacts, VolumeTree};
 
 /// Cache chunk for the sector reader. A multiple of 4 KiB, so each volume read covers many
 /// records, and a multiple of every common sector size.
 const READ_CHUNK_BYTES: u64 = 4 << 20;
 /// How often the walk polls the cancel flag, counted in records and in visited items.
-const CANCEL_CHECK_INTERVAL: u64 = 4096;
+pub(crate) const CANCEL_CHECK_INTERVAL: u64 = 4096;
 
 /// What the record-read loop reports. Progress only; the walk never depends on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -303,7 +303,7 @@ pub fn emit_tree(
     cancelled: &dyn Fn() -> bool,
     visit: &mut dyn FnMut(WalkItem) -> CoreResult<()>,
 ) -> Result<(), MftError> {
-    tree.emit_items(
+    let emitted = tree.emit_items(
         dev,
         root_prefix,
         to_component,
@@ -315,7 +315,12 @@ pub fn emit_tree(
             stats.items_emitted += 1;
             Ok(())
         },
-    )
+    );
+    match emitted {
+        Ok(()) => Ok(()),
+        Err(EmitError::Budget(err)) => Err(MftError::BudgetExceeded(err)),
+        Err(EmitError::Visit(err)) => Err(err),
+    }
 }
 
 #[cfg(test)]
