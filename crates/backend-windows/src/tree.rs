@@ -858,7 +858,12 @@ mod tests {
         records.extend(
             ((SCAN_ROOT + 1)..=chain_end).map(|record| dir(record, vec![win32(record - 1, "d")])),
         );
-        let items = items_of(SCAN_ROOT, records);
+        // Each nested path repeats its parents, so path bytes grow with depth squared
+        // (about 17 MB here): more than the shared helper's 16 MiB budget.
+        let items = VolumeTree::from_facts(SCAN_ROOT, 1 << 26, records)
+            .expect("the budget fits the records")
+            .into_items(0, &prefix(), &to_component)
+            .expect("the budget fits the directory paths");
         assert_eq!(
             items.len(),
             MAX_DEPTH + 1,
