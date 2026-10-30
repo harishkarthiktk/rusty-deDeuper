@@ -1,20 +1,11 @@
 //! `dedupe scan`. Persists by default (`.dedupe.db` under the first root); `--no-db`
 //! runs the naive Phase 0 pipeline with no persistence; `--db` selects an explicit path.
-//!
-//! `make_backend` is the one place that chooses backend types. Windows builds get the
-//! NTFS-aware enumerator and the open-by-id reader; every other build gets the generic pieces.
 
 use std::io::IsTerminal;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-#[cfg(not(windows))]
-use dedupe_backend_generic::GenericBackend;
-use dedupe_backend_generic::{GenericPathCodec, GenericStorageProbe, GenericVolumeIdentity};
-#[cfg(windows)]
-use dedupe_backend_windows::{
-    mft_cache, AutoEnumerator, CacheConfig, EnumNotices, HandleReader, MftObserver,
-};
+use dedupe_backend_generic::GenericStorageProbe;
 use dedupe_core::cancel::Token;
 use dedupe_core::config::Config;
 use dedupe_core::db::queries;
@@ -25,8 +16,9 @@ use dedupe_core::pipeline::{scan_naive, Services};
 use dedupe_core::progress::SharedSink;
 use dedupe_core::report::Report;
 use dedupe_core::storage_profile::{self, Profile, StorageKind};
-use dedupe_core::traits::{ContentReader, Enumerator, StorageProbe};
+use dedupe_core::traits::StorageProbe;
 
+use crate::platform::{self, ScanExtras};
 use crate::progress::{should_draw, BarSink};
 
 /// Globs skipped by default (off with `--include-dev-artifacts`): package installs, build output and VCS internals.
@@ -49,23 +41,6 @@ const DEV_ARTIFACT_GLOBS: &[&str] = &[
     "**/*.rmeta",
 ];
 use crate::{Resolved, ScanArgs};
-
-/// Smallest read chunk for overlapped reads. A small `--buf-size` would otherwise turn each
-/// overlapped read into a tiny request, which costs more than the overlap saves.
-#[cfg(windows)]
-const MIN_OVERLAPPED_CHUNK: usize = 256 * 1024;
-
-/// The backend pieces one scan uses. `Services` borrows them for the length of the scan.
-struct Backend {
-    enumerator: Box<dyn Enumerator>,
-    reader: Box<dyn ContentReader>,
-    codec: GenericPathCodec,
-    volume: GenericVolumeIdentity,
-    /// Messages the enumerator queued during the scan, such as why the walker was used.
-    /// Drained after the scan, on success and on failure alike.
-    #[cfg(windows)]
-    notices: Arc<EnumNotices>,
-}
 
 /// Command line as recorded in `scan_runs.cli_args`. Informational only, so it is lossy
 /// per argument (never panics on non-Unicode) and quotes what would otherwise be ambiguous.
@@ -168,17 +143,12 @@ pub fn run(args: ScanArgs, cancel: &Token) -> Result<()> {
         std::io::stderr().is_terminal(),
     );
     let bar_sink = if draw { Some(BarSink::new()) } else { None };
-    #[cfg(windows)]
-    let backend = make_backend(
+    let backend = platform::make_backend(
         &args,
         &profile,
         cancel,
-        bar_sink
-            .as_ref()
-            .map(|bar| crate::progress::mft_observer(bar.multi())),
+        bar_sink.as_ref().map(BarSink::multi),
     );
-    #[cfg(not(windows))]
-    let backend = make_backend(&args, &profile, cancel);
 
     let mut patterns = args.exclude.clone();
     if !args.include_dev_artifacts {
@@ -246,7 +216,7 @@ pub fn run(args: ScanArgs, cancel: &Token) -> Result<()> {
                 .and_then(|run_id| {
                     // The enumerator is only known once the walk is over, so it is recorded
                     // here and not when the run row is created.
-                    let enumerator = enumerator_label(&backend, args.no_mft);
+                    let enumerator = backend.extras.enumerator_label(args.no_mft);
                     let writer = dedupe_core::db::Db::open(db, &cfg)
                         .context("open db to record the enumerator")?;
                     queries::set_run_enumerator(&writer.conn, run_id, enumerator)
@@ -264,96 +234,10 @@ pub fn run(args: ScanArgs, cancel: &Token) -> Result<()> {
 
     // Drained after the scan returns, so a failed scan still shows why the fast path was
     // not used. Each message is printed once, because draining empties the queue.
-    for note in drain_notices(&backend) {
+    for note in backend.extras.drain_notices() {
         eprintln!("note: {note}");
     }
     outcome
-}
-
-/// Builds the backend for one scan. Windows picks the NTFS fast path with the open-by-id
-/// reader; the reader's overlapped read-ahead depends on the storage profile. The token goes to
-/// the enumerator so Ctrl-C can stop the `$MFT` read, which the trait has no way to receive.
-/// `observer`, when set, draws the `$MFT` read progress.
-#[cfg(windows)]
-fn make_backend(
-    args: &ScanArgs,
-    profile: &Profile,
-    cancel: &Token,
-    observer: Option<MftObserver>,
-) -> Backend {
-    let notices = Arc::new(EnumNotices::default());
-    let chunk = profile.buf_size.max(MIN_OVERLAPPED_CHUNK);
-    // `--no-mft-cache` turns the cache off. Otherwise the directory comes from DEDUPE_CACHE_DIR or
-    // %LOCALAPPDATA%; with neither set, `dir` is `None` and no cache is used.
-    let cache = if args.no_mft_cache {
-        CacheConfig::default()
-    } else {
-        CacheConfig {
-            dir: mft_cache::cache_dir(&|key| std::env::var_os(key)),
-            rebuild: args.rebuild_mft_cache,
-        }
-    };
-    let mut enumerator =
-        AutoEnumerator::new(args.no_mft, Arc::clone(&notices), cancel.clone()).with_cache(cache);
-    if let Some(observer) = observer {
-        enumerator = enumerator.with_observer(observer);
-    }
-    Backend {
-        enumerator: Box::new(enumerator),
-        reader: Box::new(HandleReader::new(read_ahead_for(profile), chunk)),
-        codec: GenericPathCodec,
-        volume: GenericVolumeIdentity,
-        notices,
-    }
-}
-
-// Non-Windows takes no observer: the `$MFT` path does not exist here, so there is nothing to draw.
-#[cfg(not(windows))]
-fn make_backend(_args: &ScanArgs, _profile: &Profile, _cancel: &Token) -> Backend {
-    let generic = GenericBackend::new();
-    Backend {
-        enumerator: Box::new(generic.enumerator),
-        reader: Box::new(generic.reader),
-        codec: generic.codec,
-        volume: generic.volume,
-    }
-}
-
-/// Which enumerator produced the file list, as stored in `scan_runs.enumerator`.
-#[cfg(windows)]
-fn enumerator_label(backend: &Backend, no_mft: bool) -> &'static str {
-    match (backend.notices.walker_used(), no_mft) {
-        (false, _) => "mft",
-        (true, true) => "walker-forced",
-        (true, false) => "walker-fallback",
-    }
-}
-
-#[cfg(not(windows))]
-fn enumerator_label(_backend: &Backend, _no_mft: bool) -> &'static str {
-    "walker"
-}
-
-/// Notices queued by the enumerator during the scan. Always empty outside Windows.
-#[cfg(windows)]
-fn drain_notices(backend: &Backend) -> Vec<String> {
-    backend.notices.drain()
-}
-
-#[cfg(not(windows))]
-fn drain_notices(_backend: &Backend) -> Vec<String> {
-    Vec::new()
-}
-
-/// Overlapped read slots for a profile. SSD gets 4, so several reads are in flight per file.
-/// HDD and unknown storage get 1: parallel reads make a seek-bound disk jump between files,
-/// which is the cost the HDD policy exists to avoid.
-#[cfg(any(windows, test))]
-fn read_ahead_for(profile: &Profile) -> usize {
-    match profile.kind {
-        StorageKind::Ssd => 4,
-        StorageKind::Hdd | StorageKind::Unknown => 1,
-    }
 }
 
 fn emit(report: &Report, format: Resolved) {
@@ -430,36 +314,6 @@ mod tests {
         assert!(
             unknown_storage_notice(&profile, true).is_none(),
             "an explicit --queue-depth should suppress the unknown-storage notice"
-        );
-    }
-
-    #[test]
-    fn read_ahead_for_should_return_four_when_profile_is_ssd() {
-        let profile = resolved(ProfileChoice::Ssd, None);
-        assert_eq!(
-            read_ahead_for(&profile),
-            4,
-            "an SSD profile should keep four overlapped reads in flight, got {profile:?}"
-        );
-    }
-
-    #[test]
-    fn read_ahead_for_should_return_one_when_profile_is_hdd() {
-        let profile = resolved(ProfileChoice::Hdd, None);
-        assert_eq!(
-            read_ahead_for(&profile),
-            1,
-            "an HDD profile should read one slot at a time, got {profile:?}"
-        );
-    }
-
-    #[test]
-    fn read_ahead_for_should_return_one_when_profile_is_unknown() {
-        let profile = resolved(ProfileChoice::Auto, None);
-        assert_eq!(
-            read_ahead_for(&profile),
-            1,
-            "an unknown profile should stay conservative with one slot, got {profile:?}"
         );
     }
 }

@@ -1,9 +1,12 @@
 //! `dedupe` command-line entry point. All logic lives in `core`; this is a thin
 //! consumer that parses flags, builds a `Config`, and prints results.
 
+#![forbid(unsafe_code)]
+
 mod db;
 mod discover;
 mod lookup;
+mod platform;
 mod progress;
 mod report;
 mod scan;
