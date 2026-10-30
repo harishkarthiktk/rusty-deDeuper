@@ -46,7 +46,7 @@ Facts to rely on:
 
 - Equal `full_hash` and equal `size` means equal content. Trust the hash over file names.
 - `wasted_logical = (distinct_inodes - 1) * size`. If two members are already hardlinks they share an inode and add no waste.
-- Encoding: **UTF-16 LE with BOM, CRLF newlines**, pretty-printed (2-space indent in run 1). Plain `open().read()` as UTF-8 fails. The scripts detect the BOM; for ad hoc reads use `open(p,'rb').read().decode('utf-16')`.
+- Encoding: **UTF-16 LE with BOM, CRLF newlines**, pretty-printed (usually 2-space indent). Plain `open().read()` as UTF-8 fails. The scripts detect the BOM; for ad hoc reads use `open(p,'rb').read().decode('utf-16')`.
 - Paths are Windows paths (`X:\A\B\file.ext`).
 
 ## 3. Phase 0: inspect input
@@ -125,7 +125,7 @@ Outputs:
 
 Built-in assertions (the script aborts if any fails): the layout is reproducible byte for byte before writing; kept plus ignored equals the original groups (lossless, ignoring the added `reason` field); kept wasted plus ignored wasted equals the original `wasted_logical_total`.
 
-Record the printed counts in the run record (section 11).
+Record the printed counts in `OUT/run_record.md`.
 
 ## 5. Phase 2: rank and tabulate
 
@@ -133,7 +133,7 @@ Record the printed counts in the run record (section 11).
 python agent/top_locations.py OUT_DIR/dedupe.json 10 OUT_DIR
 ```
 
-Choose N with the user (10 in run 1). Output:
+Choose N with the user. Output:
 
 - `OUT_DIR/top_10_locations.md`: table with rank, location number (`1.1`, `1.2`, ... = group rank . member index), folder (without drive letter), file, size in decimal MB.
 - `OUT_DIR/top_10_locations.json`: one row per location with `group`, `loc`, `path`, `folder`, `name`, `size`, `full_hash`.
@@ -146,15 +146,11 @@ Goal: for each location in the top N, learn what the folder looks like, so Phase
 
 ### Permission first
 
-Reading outside the project directory needs user confirmation (global rules require a question before such shell reads). The **parent agent asks once**, naming the drives and what will be read (directory listings and small text files). Subagents do the listing and cannot ask the user, so they start only after the user said yes.
+Ask the user once before reading outside the working directory. The **parent agent asks once**, naming the drives and what will be read (directory listings and small text files). Subagents do the listing and cannot ask the user, so they start only after the user said yes.
 
 ### Path translation
 
-| Windows | WSL |
-|---|---|
-| `X:\A\B` | `/mnt/x/A/B` (drive letter lowercase, backslash to slash) |
-
-Fallback when the mount is missing or slow:
+Inputs are Windows paths. On native Windows use them as is. On WSL, `X:\a` maps to `$DEDUPE_MOUNT_ROOT/x/a` (default `/mnt`; drive letter lowercase, backslash to slash). The PowerShell fallback below is WSL-only, for a missing or slow mount:
 
 ```
 powershell.exe -NoProfile -Command "Get-ChildItem -LiteralPath 'X:\A\B' | Select-Object Name,Length,LastWriteTime"
@@ -178,7 +174,7 @@ Use `-LiteralPath` so brackets and special characters in names are not treated a
 - Sidecar text that names a source or an owner.
 - The names of the parent and grandparent folders (they often say whether the place is organized or scratch).
 
-Subagent reports contain metadata only (names, sizes, mtimes), never content. Say so in the final report. Inspect parent folders too; in run 1 they were not always inspected, which weakened some decisions.
+Subagent reports contain metadata only (names, sizes, mtimes), never content. Say so in the final report. Inspect parent folders too; skipping them weakens decisions.
 
 ## 7. Phase 4: sibling cross-check
 
@@ -198,7 +194,7 @@ Rules:
 - A file counted in a group is only safe if at least one other member of that group survives.
 - Folder comparison is case-insensitive (the script does this).
 - The script checks direct children only. Subfolders must be listed separately.
-- A folder with 5 of 6 files in groups is a trap: the 6th is unique. Run 1 example: one file in a scratch folder was in no group, so that folder had to be kept (or the file preserved) even though its other files were duplicates.
+- A folder with 5 of 6 files in groups is a trap: the 6th is unique. If one file in a scratch folder is in no group, that folder must be kept (or the file preserved) even though its other files were duplicates.
 
 ## 8. Phase 5: decide keeps
 
@@ -308,41 +304,10 @@ Gotchas for this phase:
 - Sizes only prove difference, never sameness.
 - Folder names can differ only in case (`folder` vs `Folder`); compare case-insensitively.
 - Mtime lineage is inference only.
-- A file can be duplicated outside the cluster, so the cluster plan does not cover it (run 1: one common-folder file has a copy elsewhere; the common-folder copy is kept and the outside copy is out of scope).
+- A file can be duplicated outside the cluster, so the cluster plan does not cover it (for example a common-folder file with a copy elsewhere: the common-folder copy is kept and the outside copy is out of scope).
 - `desktop.ini` and `thumbs.db` can be Windows folder settings even when they are hash-matched duplicates. The planner never plans them as deletes; their folder gets status `needs_user_ok` and is kept.
 - Inspect parent folders before deleting a folder; a parent can hold other content.
 - The script lists nested cluster folders deepest first and counts only files a folder owns; re-run after the first removals if folders are nested.
-
-### Run 1 reconciliation example
-
-Inputs: `folder_inventory.json` (14 folders, 354 files), `dedupe.json`, `dedupe_ignore.json`. The numbers come from the hand-made run 1 plan; verify any new plan with `--dry-run`. Folder names are placeholders (`X:\ROOT\...`).
-
-| Cluster | Groups | Common folder | Moves | Deletes | Freed |
-|---|---|---|---|---|---|
-| A | 2, 3, 8, 9 | `X:\ROOT\FOLDER_A1` (the complete numbered set) | 1 | 26 | 429.7 MB |
-| B | 5, 6 | `X:\ROOT\FOLDER_B1\SUB` | 2 | 33 | 166.5 MB |
-| C | 7 | `X:\ROOT\FOLDER_C1\SUB` | 0 | 116 | 191.3 MB |
-| D | 10 | `X:\ROOT\FOLDER_D1\SUB` | 0 | 11 | 77.4 MB |
-| Total | | | 3 | 186 | 0.865 GB |
-
-**Cluster A.** The common folder of cluster A already holds the full numbered set (items 1 to 5).
-- Move: one unique file (36,017,187 bytes, in no group) from a scratch folder of cluster A goes to the common folder, renamed `item5__SCRATCH-SUB.ext`, because the common folder's `item5.ext` is 36,243,307 bytes (different size proves different content).
-- Deletes: 26 duplicate copies in six scratch folders nested under two parents.
-- Removable after that: the six scratch folders (and the intermediate wrapper folder if empty). Their parents were not inspected.
-
-**Cluster B.** The common folder holds the newest batch, a derivative and a picture subfolder.
-- Moves: two unique files (1,934,330 and 359,782 bytes) from a scratch folder. Both conflict by name with files in the common folder, so they become `02__FOLDER-SUB.ext` and `03__FOLDER-SUB.ext`.
-- Deletes: 33. All 17 files in one scratch folder are duplicates. In the other scratch folder, 16 are duplicates, including a file named like a derivative that is byte-identical to a common-folder file.
-- Both scratch folders become empty and can be removed.
-- One file in the common folder has a copy outside this cluster; the common-folder copy is kept and the outside copy is out of scope for this plan.
-
-**Cluster C.** The common folder holds 8 unique videos that stay.
-- Deletes: 116 entries in the copy folder in the hand analysis: 10 videos, 105 images and a `desktop.ini` (134 bytes), all hash-matched duplicates of common-folder files. The script never plans `desktop.ini` or `thumbs.db` as deletes (115 deletes here): the folder gets status `needs_user_ok` and is kept until the user decides.
-- Parent of the copy folder not inspected.
-
-**Cluster D.** The common folder holds 4 unique files (two videos, two images), which stay.
-- Deletes: 11, all in the copy folder. Two of the deleted images have different names there, but their hashes match common-folder copies.
-- Folder removal: the copy folder. Its parent was not inspected.
 
 ## 9. Phase 6: executor (agent/execute_plan.py)
 
@@ -360,7 +325,7 @@ python agent/execute_plan.py OUT/reconcile_plan.json --execute --quarantine X:\Q
 | `--quarantine DIR` | Instead of deleting, move each duplicate under `DIR`, keeping the folder tree below the drive letter (`X:\ROOT\A\f.ext` goes to `DIR\ROOT\A\f.ext`). Nothing is lost. `DIR` must be on the same volume (it uses a rename) |
 | `--log FILE` | JSON lines log. Default `<plan>.exec.jsonl`. Written only with `--execute`, appended if it exists |
 
-Windows drive paths are mapped on WSL (`X:\a\b` to `/mnt/x/a/b`).
+Paths follow the rule in section 6 (Path translation).
 
 ### Order per cluster
 
@@ -407,7 +372,7 @@ One JSON object per line: `time`, `cluster`, `action` (`rename`, `delete`, `quar
 - Every deleted or quarantined path is gone from its old location (and present under `DIR` if quarantined).
 - Every move and rename target exists.
 - Every `removable` folder is gone; every `keep-folder` folder is still there.
-- Rescan (section 12) and compare group counts.
+- Rescan (section 11) and compare group counts.
 
 ### Approval
 
@@ -415,10 +380,9 @@ The agent never runs `--execute`. Any run that touches the drive, the dry run in
 
 ## 10. Gotchas
 
-- The first run used the WSL mapping (`/mnt/x` works).
 - Mixed-case folder names exist (`folder` vs `Folder`). Windows is case-insensitive: compare folder paths case-insensitively when grouping or checking.
 - Subagent reports were size and mtime only, not content. Do not claim a content comparison beyond the hash.
-- Parent folders of a folder were not always inspected in run 1; do it, it changes confidence.
+- Parent folders of a folder are easy to skip; inspect them, it changes confidence.
 - Parents of cluster folders are not inventoried and are never removed by the scripts.
 - `split.py` writes new files only; the original is never modified. Keep the original JSON.
 - If `split.py` fails with "layout not reproducible", the input was not written by the usual serializer (different indent or newlines, or a trailing field). Inspect with Phase 0 before forcing anything.
@@ -428,60 +392,9 @@ The agent never runs `--execute`. Any run that touches the drive, the dry run in
 - Renamed files follow `stem__source-folder.ext`.
 - Hash equality is for the full file. File names such as `upscaled` are not evidence of content.
 
-## 11. Run record
+## 11. How to repeat with a new JSON
 
-### Run 1 (2026-10-30)
-
-Input: `dedupe.json`, 31,356 groups, 326,818 files enumerated.
-
-| Result | Value |
-|---|---|
-| Groups moved to ignore file | 27,453 |
-| python-venv | 21,500 |
-| node-modules | 5,438 |
-| rust-target | 392 |
-| build-toolchain | 57 |
-| git-internals | 51 |
-| combined (more than one label) | 15 |
-| Groups kept | 3,903 |
-| Reclaimable bytes among kept | 9,346,353,731 |
-| Top 10 reclaim | about 2.5 GB, 28 redundant copies (38 locations in 10 groups) |
-
-Per-group decisions (top-10 groups; clusters as in section 8b):
-
-| Group | Decision | Confidence |
-|---|---|---|
-| 1 | Keep the copy in the organized home folder; hardlink or delete the copy in the secondary folder | medium |
-| 2, 3, 8, 9 (cluster A) | Keep the copies in the folder holding the complete numbered set; remove the copies in the scratch folders | medium-low |
-| 4 | Keep the copy in the better organized of two folders; delete the other | medium-low |
-| 5 (cluster B) | Keep the copy in the common folder; delete the copies in two scratch folders | medium-low |
-| 6 (cluster B) | Keep the common-folder copy; delete the scratch copy and a copy named like a derivative that has the same hash (not a real derivative) | medium |
-| 7 (cluster C) | Keep the home folder copy; delete the copy in the shrunk extraction folder | high |
-| 10 (cluster D) | Keep the copy in one folder; delete the copy in a second folder | medium |
-
-Special case: one file in a scratch folder of cluster A is unique (in no group) and must not be deleted together with its folder.
-
-The reconciliation numbers are in section 8b. No executor existed in run 1, so nothing was deleted then.
-
-### Run 2 (planner and executor available)
-
-Anonymised; clusters are identified by id only.
-
-| Result | Value |
-|---|---|
-| Clusters planned | 4 |
-| Clusters skipped (no inventoried folder) | 148 |
-| Deletes | 1160 |
-| Moves or renames | 18 |
-| Held (duplicates inside the common folder) | 138 |
-| Freed | 2.355 GB |
-| `--dry-run` | 0 problems |
-
-Parent scope checks (step 3b): one container included (a collection folder with two subfolders, one of them a media folder with two subfolders); four non-containers excluded (each held 40 or more unrelated folders).
-
-## 12. How to repeat with a new JSON
-
-Set `IN` to the new dedupe.json and `OUT` to a fresh folder (not the input's folder). Run from the project root. Order:
+Set `IN` to the new dedupe.json and `OUT` to a fresh folder (not the input's folder). The scripts resolve their imports from their own folder, so run them from any directory; every path is passed as an argument (the `agent/` prefix below assumes the repo root). Order:
 
 | Step | Command | Output |
 |---|---|---|
@@ -496,7 +409,7 @@ Set `IN` to the new dedupe.json and `OUT` to a fresh folder (not the input's fol
 | 8 | User approves the exact `--execute` command (section 9) | approval |
 | 9 | `python agent/execute_plan.py OUT/reconcile_plan.json --execute --quarantine DIR --log OUT/exec.jsonl` (user-approved) | `OUT/exec.jsonl` |
 | 10 | Read-only verification (section 9) | checks |
-| 11 | Rescan with the CLI, then add a run record to section 11 | new `dedupe.json` |
+| 11 | Rescan with the CLI, then write a run summary to `OUT/run_record.md` | new `dedupe.json` |
 
 Apply Phase 5 (section 8) while preparing step 3 to 5: the principles decide the common folder, and `overrides.json` enforces a manual choice.
 
