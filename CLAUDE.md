@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+This is the general guide: what the project is, workspace commands, how the crates fit together, and rules that cross crates. Each crate has its own `CLAUDE.md` with its module map, runtime flow, invariants, gotchas, crate-specific commands and tests. Read the crate file before editing that crate.
+
 ## What this is
 
 deDupe is a duplicate-file finder in Rust. This directory is the Cargo workspace root; the CLI binary is `dedupe` (package `dedupe`, in `crates/cli`). It groups files by content in progressive passes (size, then BLAKE3 over the first 16 KiB plus last 4 KiB, then full BLAKE3) and persists state in SQLite, so a scan can resume after `kill -9` and new files can be checked against an existing index (`lookup`). v1 is scan/report/lookup only. Nothing deletes files.
@@ -10,17 +12,20 @@ The engineering plan is `.overall_plan.md` (in this directory, which is the repo
 
 ## Commands
 
-Run from this directory. The toolchain is pinned to Rust 1.92.0 in `rust-toolchain.toml`.
+Run from this directory. The toolchain is pinned to Rust 1.92.0 in `rust-toolchain.toml`. Crate-specific commands (single test files, ignored tests, self-checks, benchmarks) are in each crate's `CLAUDE.md`.
 
 ```bash
-# Build
+# Build (only the binary and its target's dependencies; --workspace also builds every member)
+cargo build -p dedupe
+cargo build -p dedupe --target x86_64-pc-windows-gnu
 cargo build --workspace --all-targets
 
 # Lint and format (there is no CI; run these by hand before a commit)
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-cargo run -p dedupe-xtask -- boundaries   # fails on OS cfg outside core-free zones (needs approval like other project scripts)
+# OS boundary check (project script; needs approval like other project scripts)
+cargo run -p dedupe-xtask -- boundaries
 
 # Windows cross-check from macOS/Linux (compile and lint only; see "Windows cross-check")
 CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar cargo check --workspace --all-targets --locked --target x86_64-pc-windows-gnu
@@ -32,24 +37,13 @@ cargo deny check
 # Run the CLI
 cargo run -p dedupe -- scan <root>            # persists to <root>/.dedupe.db
 cargo run -p dedupe -- scan --no-db <root>    # naive pipeline, no DB
-cargo run -p dedupe -- report                 # reads <cwd>/.dedupe.db
+cargo run -p dedupe -- report                 # finds the DB in --dir (default cwd)
 cargo run -p dedupe -- lookup <file>
 cargo run -p dedupe -- db info
 
 # Tests (run only when the user asks; see Working conventions)
 cargo test --workspace --all-targets
-cargo test -p dedupe-core --test phase1                 # one integration-test file
-cargo test -p dedupe-core --test phase1 <name_filter>   # one test within it
-cargo test -p dedupe --test kill_fuzz -- --ignored      # kill -9 fuzz (manual, Linux/macOS)
-# Windows self-check: elevated PowerShell on an NTFS volume only (cannot run on macOS/Linux)
-cargo test -p dedupe-backend-windows --test mft_vs_walk -- --ignored
-DEDUPE_SCALE_N=1000000 cargo test -p dedupe-core --test scale -- --ignored   # 1M-file scale tests
-
-# Benchmarks (user-run on reference hardware; deferred to the end of the plan)
-cargo run -p dedupe-bench --release -- [rows]
 ```
-
-`--stop-after-pass` exists only when built with `--features test-hooks` on the `dedupe` package.
 
 ### Windows cross-check
 
@@ -66,73 +60,42 @@ Run the two Commands lines marked "Windows cross-check" after any edit that touc
 
 ## Architecture
 
-### Crate layering
+### Crate map
 
-- `crates/core` (`dedupe-core`) holds all logic. It has `#![forbid(unsafe_code)]` and no `cfg(target_os)`. It reaches the OS only through the traits in `core/src/traits.rs` (`Enumerator`, `ContentReader`, `PathCodec`, `VolumeIdentity`, `Hasher`), which are bundled per call in `pipeline::Services`.
-- `crates/backend-generic` is the portable backend: walkdir enumeration, positional reads, volume identity, and the path codec. Per-OS code lives in `src/sys/{linux,macos,windows}/`, plus `sys/unix.rs` (shared) and `sys/other.rs` (fallback), behind the `pub(crate) trait Platform` with one cfg-selected `type Os` (static dispatch). Pure parsers live in `src/parse/`. Facade files (`lib.rs`, `meta.rs`, `probe.rs`, `volume.rs`, `reader.rs`, `walk.rs`, `extents.rs`, `codec.rs`) hold no target cfg. The crate has `#![deny(unsafe_code)]` with local opt-in.
-- `crates/backend-windows` holds the NTFS `$MFT` enumerator (`AutoEnumerator`), open-by-id reads (`HandleReader`), and overlapped read-ahead. Its parsing, path, and scheduling modules are portable and unit-tested on every OS. Win32 calls are confined to `cfg(windows)` items in `caps`, `volume_io`, `handle`, `overlapped`, and `enumerator`. Shared Win32 handle and path helpers come from `dedupe-win-sys`.
-- `crates/win-sys` (`dedupe-win-sys`) is the sole owner of shared Win32 handle and path FFI. `ffi.rs` sits behind `cfg(windows)`; the pure `file_id_bytes` is tested on all OSes. `backend-generic` and `backend-windows` both import their Win32 helpers from it.
-- `crates/cli` is a thin consumer: argument parsing, progress bar, output formatting, and the storage probe that resolves `Config.profile`. Scan logic does not belong here. `make_backend` lives in `cli/src/platform/` (`mod.rs` is the only CLI file with OS cfg; `windows.rs` and `generic.rs` each build the backend and return `ScanExtras`) and is the only place that picks backend types. The crate has `#![forbid(unsafe_code)]`.
-- `crates/tui` is a stub. `bench/` is a standalone benchmark binary. `xtask/` is a stub.
-- Linux and macOS use `backend-generic` directly. A new platform gets its own `backend-*` crate implementing the same traits.
+| Crate | Package | Role | Guide |
+|---|---|---|---|
+| `crates/core` | `dedupe-core` | All scan logic: pipelines, passes, DB, resume, report, lookup index. No OS code. | `crates/core/CLAUDE.md` |
+| `crates/backend-generic` | `dedupe-backend-generic` | Portable backend: walker, positional reads, volume identity, path codec, storage probe. Per-OS code under `src/sys/`. | `crates/backend-generic/CLAUDE.md` |
+| `crates/backend-windows` | `dedupe-backend-windows` | NTFS `$MFT` fast path, open-by-id reads, overlapped read-ahead. Linked only into Windows builds. | `crates/backend-windows/CLAUDE.md` |
+| `crates/win-sys` | `dedupe-win-sys` | Shared Win32 handle and path FFI used by both backends. | `crates/win-sys/CLAUDE.md` |
+| `crates/cli` | `dedupe` | Thin consumer: args, progress, output, storage-profile resolution, backend wiring. | `crates/cli/CLAUDE.md` |
+| `xtask` | `dedupe-xtask` | Dev tasks: `boundaries` check, `schema` stub. | `xtask/CLAUDE.md` |
+| `bench` | `dedupe-bench` | Standalone benchmark binary, user-run only. | `bench/CLAUDE.md` |
+| `crates/tui` | `dedupe-tui` | Stub. | - |
 
-### Two scan pipelines
+### How the crates connect
 
-- `pipeline::naive::scan_naive` runs in memory with no DB. It backs `scan --no-db` and serves as the correctness reference.
-- `pipeline::scan::run_scan` is the default persistent path. It:
-  1. Opens the DB read-write (pragmas, then migrations) and checks the hash-config guard (`resume::check_config_guard`).
-  2. Either inserts a new `scan_runs` row (abandoning overlapping running runs) or, with `--resume`, builds a plan with `resume::plan_resume`.
-  3. Spawns the single writer thread and opens a separate read-only connection for the passes.
-  4. For each volume, runs `pass_enumerate`, `pass_size`, `pass_prefix`, `pass_full`, then `pass_verify` (only with `VerifyMode::Byte`, set by `scan --verify byte`). Each pass advances `run_volumes.phase_reached`.
-  5. After the writer shuts down, recomputes `dup_groups` per volume and marks the run finished.
+- `core` reaches the OS only through the traits in `crates/core/src/traits.rs` (`Enumerator`, `ContentReader`, `PathCodec`, `VolumeIdentity`, `Hasher`, `StorageProbe`), bundled per call in `pipeline::Services`. Backends implement them; the CLI picks the implementations and passes them in.
+- `crates/cli/src/platform/` builds the scan backend (`make_backend`): `windows.rs` on Windows (`AutoEnumerator`, `HandleReader`), `generic.rs` elsewhere. Two other CLI paths use `backend-generic` types directly: `scan.rs` probes storage with `GenericStorageProbe` before the backend exists, and `lookup.rs` uses `GenericBackend::new()` on every OS.
+- Per target, only that target's code is compiled. A Linux or macOS build of `dedupe` pulls in `core` and `backend-generic` only; a Windows build adds `backend-windows`, `win-sys` and `windows-sys`. Inside `backend-generic`, only one `sys/<os>/` module compiles.
+- A new platform is a new `crates/backend-generic/src/sys/<os>/` implementing the `Platform` trait plus a cfg arm in `sys/mod.rs`, or a new `backend-*` crate implementing the core traits.
 
-### Write path
+### OS code boundaries
 
-- One thread owns the only read-write `rusqlite::Connection` (`db/writer.rs`). Passes and hash workers send `Batch` messages over a bounded channel. The writer commits every 50k rows or 5 seconds.
-- `db/ids.rs` (`IdAllocator`) pre-assigns file and folder ids, so passes can reference rows before the writer commits them.
-- Stale-row deletion also goes through the writer (`Batch::DeleteStale`).
+- `core`: `#![forbid(unsafe_code)]`, no OS `cfg`.
+- `cli`: `#![forbid(unsafe_code)]`; OS `cfg` only in `src/platform/mod.rs`.
+- `backend-generic`: `#![deny(unsafe_code)]` with local opt-in; OS `cfg` only under `src/sys/` and `src/parse/`.
+- `backend-windows` and `win-sys`: `#![deny(unsafe_code)]` with local opt-in in their Win32 modules.
+- `cargo run -p dedupe-xtask -- boundaries` enforces the `cfg` rules (substring match; comment lines are skipped).
 
-### File state machine
+## Cross-crate gotchas
 
-`files.state` is an integer. Each pass consumes one state and writes the next: 0 enumerated, 1 size candidate, 2 prefix hashed, 3 full hashed, 4 verified, 5 done. Negative values are terminal: -1 skipped, -2 error, -3 unique by size, -4 unique by prefix. Transition rules are in plan P1.4. Two rules matter most: transitions only move forward within a run, and a rescan resets rows to 0 but reuses stored hashes when size, mtime, ctime, and file id are unchanged.
-
-### Resume and rescan
-
-- Resume is driven by `run_volumes.phase_reached` (the `Phase` enum in `core/src/model.rs`), not by a full re-scan. Enumeration is an idempotent upsert, so a crash loses at most one batch.
-- A rescan (a new run over an already-indexed volume) keeps hashes for unchanged files and detects moves by `(volume_id, file_id)` plus size and mtime. It deletes stale rows only under this run's roots. Rows under roots not scanned this time are left alone.
-- `meta.hash_algo` and the prefix sizes must match the DB. A mismatch aborts resume unless `--force` is passed.
-
-### Reading results
-
-- `report` and `lookup` read the DB, not in-memory state. Report counts only states 3, 4, and 5 for rows last seen by any finished run, so roots a later scan skipped are still listed (header file counts still come from the latest finished run). Lookup considers every live row not in states -1 or -2.
-- Default DB location differs by command: `scan` uses `<first root>/.dedupe.db`, while `report`, `lookup`, and `db` use `<cwd>/.dedupe.db`.
-
-### Progress and cancellation
-
-- `core/src/progress.rs` defines the `Sink` trait and `SharedSink`. The CLI supplies a bar sink (`cli/src/progress.rs`) or `null_sink()` for JSON output and non-TTY stderr. Core never prints.
-- `core/src/cancel.rs` holds the cancel token. The CLI cancels it from a Ctrl-C handler. On Windows the same token is handed to `AutoEnumerator`, so Ctrl-C also stops the `$MFT` read phase (a cancel returns `Cancelled` and never triggers the fallback walker). A second Ctrl-C exits immediately with code 130 (safe: the DB survives `kill -9` and the `$MFT` cache is written atomically).
-
-## Gotchas
-
-- Only one process may write a database: `scan` and `lookup --insert` hold `core/src/db/lock.rs` (a `<db>.lock` sidecar, `File::try_lock`, so `rust-version` is 1.89). Read-only commands take no lock. If the filesystem reports file locking as unsupported (likely on WSL `/mnt/c`), `acquire_with` errors unless `--no-lock` is passed. The scan skips `-wal`, `-shm` and `.lock` siblings of its own DB.
-- `cli/src/scan.rs` refuses a default DB on a network filesystem (`backend-generic::fs_locality`) and prints a note for WSL 9p. FUSE counts as remote, so a local ntfs-3g mount needs an explicit `--db`.
-- `FileMeta.dev` (Unix `st_dev`, Windows low 32 bits of the volume serial) is runtime only. With `--cross-mounts`, `pass_enumerate::DevScope` namespaces the `file_id` of files on another device as `blake3(foreign uuid)[..8] || id`. The Windows walker and the `$MFT` path (`tree.rs` `file_meta_for`) both set `dev`; `ContentReader::metadata` does not, so `DevScope` stays off on Windows. Volumes whose serials match in the low 32 bits can still merge ids in `scan --no-db` (T4.2 full 64-bit id is open).
-- Enumeration ids are claimed per run in `pass_enumerate` (`Claim::Path` / `Claim::Move`), and folders resolve through an in-run overlay before the read snapshot. Do not look folders or files up on `ctx.read` alone.
-- Hash passes stream results in `RESULT_CHUNK` batches. Unique prefixes are marked by one SQL statement (`Batch::MarkPrefixSingletons`) that commits with the `PrefixDone` marker; stale deletion commits with the `Enumerated` marker. Keep both orderings.
-- The `$MFT` path fails closed: a record that fails twice, a bad root, or an `$ATTRIBUTE_LIST` on record 0 falls back to the walker, and a partial tree is never cached. Only name-surrogate reparse tags count as links (cloud folders are walked). An unreadable `$REPARSE_POINT` tag fails the record, and a cached record with the reparse bit but no tag is rejected. `SectorReader` pins the chunk holding record 0 (`Ntfs::file` re-reads it per record). Throughput is unmeasured.
-- The walker emits `WalkItem::Error`. Unreadable directories are passed to `Batch::DeleteStale` as protected folders, so their old rows survive.
-- Build matrix: lint and `cargo check` run on the Linux host and for `x86_64-pc-windows-gnu` (mingw). Nothing compiles the macOS code (`backend-generic/src/sys/macos/`, `sys/other.rs`) or MSVC or aarch64 from this host; check those on a Mac or Windows machine.
-
-- OS code boundaries: `core` takes no `unsafe` and no OS `cfg`; `cli` takes OS `cfg` only in `platform/mod.rs`; `backend-generic` takes it only under `sys/` and `parse/`. `cargo run -p dedupe-xtask -- boundaries` enforces this (substring match; comment lines are skipped). A new OS is a new `sys/<os>/` implementing `Platform` plus a cfg arm in `sys/mod.rs`. macOS and `sys/other.rs` are not compiled from this host.
-- The Windows walker opens each regular file once (`dedupe_win_sys::file_info` in `crates/win-sys/src/ffi.rs`, used by `file_meta_at` in `backend-generic/src/sys/windows/meta.rs`) and takes `file_id`, `nlink`, size, times and attributes from that open. `ctime` is the `FILE_BASIC_INFO` ChangeTime, matching the `$MFT` path's `$STANDARD_INFORMATION` change time; creation time is only a fallback. On a failed open, `file_id` stays `None` and `nlink` is 1. NTFS ids are 8 bytes and are meant to equal the `$MFT` file references, but this is unverified on hardware, so until it is checked, assume switching modes re-hashes files. ReFS 128-bit ids are stored as 16 bytes (not truncated) and are never opened by id. The `$MFT` cache is at format version 2, so older caches are rejected and trigger a full scan. Unix reads the inode directly.
-- `scan_runs.enumerator` records `mft`, `walker`, `walker-forced` (`--no-mft`) or `walker-fallback`, written by the CLI after `run_scan` returns. Schema version is 2 and there are no migrations: an older DB fails with a "delete it and scan again" error.
-- `scan --exclude <glob>` (repeatable, `core/src/exclude.rs`) matches the full path with `/` separators, case-sensitive. The walker prunes excluded directories; `pass_enumerate` drops them for the `$MFT` path too. `--no-db` on the `$MFT` path does not filter. The CLI appends the fixed `DEV_ARTIFACT_GLOBS` list in `cli/src/scan.rs` by default (`--include-dev-artifacts` turns it off; core `Config` has no default excludes); it keys only on artifact folder names and extensions, never on folder names like `TurboC++` that may hold media.
-- The NTFS fast path runs only when the process is elevated and the scan root is on NTFS (`AutoEnumerator`). Otherwise, or when the fast path fails partway, it falls back to the walker and the CLI prints a `note:` on stderr. `--no-mft` forces the walker and prints no note. Items the fast path already yielded are yielded again by the walker, which is safe because enumeration is an idempotent upsert.
-- Win32 code is compile-checked and linted from macOS only. No test executes it. Before trusting it, run the `mft_vs_walk` self-check on a Windows machine. Still unverified there: the raw `$MFT` read, how the `ntfs` crate handles unused or corrupt records, the reparse tags that mark cloud placeholders, and the admin requirement.
-- `scan --verify <off|byte>` sets `Config.verify` (plan P2.7). `pass_verify` moves state 3 -> 4 and a mismatch to -2. Byte verify has no automated end-to-end test yet.
-- `Config.profile` is resolved in the CLI (`cli/src/scan.rs`), not in core: the CLI probes the first root with `GenericStorageProbe` (Linux sysfs, macOS `diskutil`, Windows seek-penalty ioctl, not yet verified on hardware; network volumes report unknown), then calls `core::storage_profile::resolve`. `StorageKind::Unknown` keeps the SSD buffer and ordering but caps the full-hash queue depth at `UNKNOWN_QUEUE_DEPTH` (2, a judgment value, not measured). The CLI prints a stderr note for Unknown unless `--queue-depth` is set, and only on the DB path. `--no-db` (naive) does not read the profile.
-- `scale.rs` and `kill_fuzz.rs` tests are `#[ignore]`. Plain `cargo test` skips them.
-- The hash is BLAKE3 truncated to 128 bits (`blake3-128`).
+- `FileMeta.dev` (Unix `st_dev`, Windows low 32 bits of the volume serial) is runtime only. With `--cross-mounts`, `pass_enumerate::DevScope` namespaces the `file_id` of files on another device as `blake3(foreign uuid)[..8] || id`. The Windows walker, `ContentReader::metadata` (through `meta::file_meta_at`) and the `$MFT` path (`tree.rs` `file_meta_for`) all set `dev` on Windows when the handle open succeeds. Volumes whose serials match in the low 32 bits can still merge ids in `scan --no-db` (T4.2 full 64-bit id is open).
+- File identity on Windows: the walker opens each regular file once (`dedupe_win_sys::file_info`) and takes `file_id`, `nlink`, size, times and attributes from that open. NTFS ids are 8 bytes and are meant to equal the `$MFT` file references, but this is unverified on hardware, so assume switching between walker and `$MFT` re-hashes files. ReFS 128-bit ids are stored as 16 bytes (not truncated) and are never opened by id. Unix reads the inode directly.
+- Schema version is 2 and there are no migrations: an older DB fails with a "delete it and scan again" error.
+- The hash is BLAKE3 truncated to 128 bits (`blake3-128`). `meta.hash_algo` and the prefix sizes must match the DB.
+- Build matrix: lint and `cargo check` run on the Linux host and for `x86_64-pc-windows-gnu` (mingw). Nothing compiles the macOS code (`crates/backend-generic/src/sys/macos/`, `crates/backend-generic/src/sys/other.rs`) or MSVC or aarch64 from this host; check those on a Mac or Windows machine. Win32 code is compile-checked only; no test on this host executes it.
+- `scale.rs` (core) and `kill_fuzz.rs` (cli) tests are `#[ignore]`. Plain `cargo test` skips them.
 
 ## Working conventions
 ALWAYS use 'rust-best-practises' skill while working on rust code and systems.
@@ -140,6 +103,7 @@ ALWAYS use 'rust-best-practises' skill while working on rust code and systems.
 - Lint and format checks can run without asking. Builds and tests run only when the user asks for them. When they do run, use a subagent.
 - Benchmarks are deferred to the end of the plan and run by the user on reference hardware. Do not run them as verification.
 - Plan status and task IDs live in `.overall_plan.md`. Read that file before starting work on any task ID.
+- When a change moves or renames code, update the affected crate's `CLAUDE.md` in the same change, and this file only if a cross-crate fact changed.
 
 <!-- rtk-instructions v2 -->
 # RTK (Rust Token Killer) - Token-Optimized Commands
