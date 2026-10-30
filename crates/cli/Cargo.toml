@@ -28,7 +28,8 @@ dedupe-backend-windows = { path = "../backend-windows" }
 
 [features]
 default = []
-test-hooks = ["dedupe-core/test-hooks"]
+# Exposes `--stop-after-pass N`; never enabled in release builds.
+test-hooks = []
 
 [dev-dependencies]
 tempfile.workspace = true

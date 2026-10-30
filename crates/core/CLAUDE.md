@@ -193,8 +193,8 @@ Transitions are forward only within a run. Two things to know:
   tests use it. `Config::mem_budget` is not read by any pass.
 - `Config` documents `VerifyMode::Byte` as "lands in Phase 2". That comment is stale. `pass_verify` is
   implemented.
-- The `test-hooks` feature in `Cargo.toml` gates no code in core. `cli` forwards it to
-  `dedupe-core/test-hooks`, and the CLI gates `--stop-after-pass`. `ScanOptions::stop_after` always compiles.
+- Core has no `test-hooks` feature. The `dedupe` (cli) feature `test-hooks` gates `--stop-after-pass`;
+  `ScanOptions::stop_after` always compiles.
 - Two types named `PathCache` exist. `pipeline::PathCache` is per pass and cached. `db::queries::PathCache`
   is used by `report.rs`. Do not mix them up.
 

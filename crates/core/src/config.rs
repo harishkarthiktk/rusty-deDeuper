@@ -6,7 +6,7 @@ use crate::exclude::ExcludeSet;
 use crate::hash::HASH_ALGO;
 use crate::storage_profile::Profile;
 
-/// Whether `pass_verify` runs. `Byte` lands in Phase 2; Phase 1 only knows `Off`.
+/// Whether `pass_verify` runs. `Byte` byte-compares hash-equal files (state 3) and moves survivors to state 4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum VerifyMode {
     #[default]

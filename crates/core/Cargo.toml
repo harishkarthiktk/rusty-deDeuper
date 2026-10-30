@@ -24,10 +24,5 @@ globset.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 
-[features]
-default = []
-# Exposes `--stop-after-pass N`; never enabled in release builds.
-test-hooks = []
-
 [lints]
 workspace = true
