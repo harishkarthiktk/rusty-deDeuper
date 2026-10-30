@@ -3,6 +3,7 @@
 use dedupe_backend_generic::GenericBackend;
 use dedupe_core::cancel::Token;
 use dedupe_core::storage_profile::Profile;
+use dedupe_core::traits::ContentReader;
 
 use super::{Backend, ScanExtras};
 use crate::ScanArgs;
@@ -35,4 +36,9 @@ pub fn make_backend(
         volume: generic.volume,
         extras: Extras,
     }
+}
+
+/// The content reader alone, for commands that need no enumerator (`lookup`).
+pub fn make_reader(_profile: &Profile) -> Box<dyn ContentReader> {
+    Box::new(GenericBackend::new().reader)
 }

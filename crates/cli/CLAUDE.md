@@ -49,8 +49,9 @@ logic does not belong here. See the root CLAUDE.md for layering and cross-crate 
 - `main.rs` has `#![forbid(unsafe_code)]`, which covers the whole crate.
 - OS `cfg` appears only in `src/platform/mod.rs`. `cargo run -p dedupe-xtask -- boundaries` enforces it
   (see `xtask/CLAUDE.md`). `#[cfg(feature = "test-hooks")]` is not an OS cfg and is allowed.
-- Scan code takes its backend from `platform::make_backend`. The exceptions are `scan.rs`
-  (`GenericStorageProbe`, `fs_locality`) and `lookup.rs` (`GenericBackend::new()`, used on every OS).
+- Scan code takes its backend from `platform::make_backend`; `lookup.rs` takes its reader from
+  `platform::make_reader` (profile resolved with `Auto`) and its codec and volume from
+  `GenericBackend::new()`. The other exception is `scan.rs` (`GenericStorageProbe`, `fs_locality`).
 - Clap enums (`VerifyArg`, `ProfileArg`) convert to core enums with `From`. Core must not depend on clap.
 - With `--format json`, stdout is JSON only. `--progress always` still draws nothing in JSON mode.
 - Clap `conflicts_with` attributes encode the flag rules (`--json` vs `--format`, `--db` vs `--no-db`,

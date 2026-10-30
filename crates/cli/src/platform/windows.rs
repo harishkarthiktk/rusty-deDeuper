@@ -8,6 +8,7 @@ use dedupe_backend_windows::{
 };
 use dedupe_core::cancel::Token;
 use dedupe_core::storage_profile::Profile;
+use dedupe_core::traits::ContentReader;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use super::{read_ahead_for, Backend, ScanExtras};
@@ -90,7 +91,6 @@ pub fn make_backend(
 ) -> Backend {
     let observer = multi.map(mft_observer);
     let notices = Arc::new(EnumNotices::default());
-    let chunk = profile.buf_size.max(MIN_OVERLAPPED_CHUNK);
     // `--no-mft-cache` turns the cache off. Otherwise the directory comes from DEDUPE_CACHE_DIR or
     // %LOCALAPPDATA%; with neither set, `dir` is `None` and no cache is used.
     let cache = if args.no_mft_cache {
@@ -108,9 +108,17 @@ pub fn make_backend(
     }
     Backend {
         enumerator: Box::new(enumerator),
-        reader: Box::new(HandleReader::new(read_ahead_for(profile), chunk)),
+        reader: make_reader(profile),
         codec: GenericPathCodec,
         volume: GenericVolumeIdentity,
         extras: Extras { notices },
     }
+}
+
+/// The open-by-id reader alone, for commands that need no enumerator (`lookup`).
+pub fn make_reader(profile: &Profile) -> Box<dyn ContentReader> {
+    Box::new(HandleReader::new(
+        read_ahead_for(profile),
+        profile.buf_size.max(MIN_OVERLAPPED_CHUNK),
+    ))
 }

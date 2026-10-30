@@ -1,5 +1,5 @@
 //! Kill -9 fuzz (Unix): spawn the CLI as a subprocess, SIGKILL it mid-scan, then
-//! `--resume` and assert the normalized report converges to a full scan.
+//! `--resume` and assert the raw JSON report converges to a full scan.
 //!
 //! Unix-only; on other platforms the process is terminated via `Child::kill`.
 
@@ -34,18 +34,29 @@ fn scan(db: &Path, root: &Path, extra: &[&str]) -> std::process::Output {
         .arg(db)
         .args(extra)
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     cmd.output().expect("run scan")
 }
 
-fn report(db: &Path) -> String {
+fn report(db: &Path) -> serde_json::Value {
     let out = Command::new(BIN)
         .args(["report", "--db"])
         .arg(db)
         .args(["--format", "json"])
         .output()
         .expect("run report");
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    assert!(
+        out.status.success(),
+        "report failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("report stdout should be JSON");
+    assert!(
+        value.get("groups").is_some(),
+        "report JSON should be an object with \"groups\": {value}"
+    );
+    value
 }
 
 /// Deterministic small random delay per iteration (no external rng).
@@ -66,8 +77,19 @@ fn kill9_then_resume_converges() {
     // Reference: one uninterrupted scan.
     let ref_db = dir.path().join("ref.db");
     let out = scan(&ref_db, &root, &[]);
-    assert!(out.status.success(), "reference scan failed");
+    assert!(
+        out.status.success(),
+        "reference scan failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let reference = report(&ref_db);
+    assert!(
+        reference["groups"]
+            .as_array()
+            .is_some_and(|g| !g.is_empty()),
+        "reference report should contain duplicate groups: {reference}"
+    );
+    let (mut interrupted, mut finished_early) = (0u32, 0u32);
 
     for iter in 0..20u64 {
         let db = dir.path().join(format!("fuzz{iter}.db"));
@@ -84,13 +106,28 @@ fn kill9_then_resume_converges() {
             .spawn()
             .expect("spawn scan");
         sleep(Duration::from_millis(delay_ms(iter)));
-        let _ = child.kill();
-        let _ = child.wait();
+        if child.try_wait().expect("poll scan").is_some() {
+            finished_early += 1;
+        } else {
+            let _ = child.kill();
+            let _ = child.wait();
+            interrupted += 1;
+        }
 
-        // Resume; if the scan had already finished, `--resume` reports nothing to
-        // resume, which is fine: the DB is complete either way.
-        let _ = scan(&db, &root, &["--resume"]);
+        // A scan that finished before the kill leaves no running run, so `--resume` fails with
+        // "nothing to resume"; the DB is complete and the report check below still applies.
+        let out = scan(&db, &root, &["--resume"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() || stderr.contains("nothing to resume"),
+            "iteration {iter}: resume failed: {stderr}"
+        );
         let got = report(&db);
         assert_eq!(got, reference, "iteration {iter}: resume diverged");
     }
+
+    assert!(
+        interrupted > 0,
+        "no iteration interrupted the scan ({finished_early} finished early); enlarge the tree or shorten delays"
+    );
 }

@@ -13,9 +13,9 @@ mod generic;
 mod windows;
 
 #[cfg(not(windows))]
-pub use generic::{make_backend, Extras};
+pub use generic::{make_backend, make_reader, Extras};
 #[cfg(windows)]
-pub use windows::{make_backend, Extras};
+pub use windows::{make_backend, make_reader, Extras};
 
 /// What each platform's `Extras` must provide after a scan. Static dispatch via the alias above.
 pub trait ScanExtras {

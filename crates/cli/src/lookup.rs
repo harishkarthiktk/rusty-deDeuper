@@ -3,13 +3,15 @@
 use std::io::IsTerminal;
 
 use anyhow::{Context, Result};
-use dedupe_backend_generic::GenericBackend;
+use dedupe_backend_generic::{GenericBackend, GenericStorageProbe};
 use dedupe_core::config::Config;
 use dedupe_core::db::Db;
 use dedupe_core::lookup::{lookup_report, Freshness, InsertStatus, LookupOutcome, LookupReport};
+use dedupe_core::storage_profile::{self, ProfileChoice};
+use dedupe_core::traits::StorageProbe;
 use serde_json::json;
 
-use crate::{LookupArgs, Resolved};
+use crate::{platform, LookupArgs, Resolved};
 
 pub fn run(args: LookupArgs) -> Result<()> {
     let format = args
@@ -17,6 +19,10 @@ pub fn run(args: LookupArgs) -> Result<()> {
         .resolve(args.json, std::io::stdout().is_terminal());
     let cfg = Config::default();
     let backend = GenericBackend::new();
+    let rotational = GenericStorageProbe.is_rotational(&args.file).ok().flatten();
+    let profile = storage_profile::resolve(ProfileChoice::Auto, rotational, None, None)
+        .context("resolve lookup profile")?;
+    let reader = platform::make_reader(&profile);
 
     // Read-only lookups require an existing DB; --insert may target a fresh one.
     let db = if args.insert {
@@ -57,7 +63,7 @@ pub fn run(args: LookupArgs) -> Result<()> {
 
     let report = lookup_report(
         &conn,
-        &backend.reader,
+        reader.as_ref(),
         &backend.codec,
         &backend.volume,
         &args.file,
