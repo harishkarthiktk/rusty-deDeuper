@@ -20,6 +20,8 @@ cargo build --workspace --all-targets
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+cargo run -p dedupe-xtask -- boundaries   # fails on OS cfg outside core-free zones (needs approval like other project scripts)
+
 # Windows cross-check from macOS/Linux (compile and lint only; see "Windows cross-check")
 CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar cargo check --workspace --all-targets --locked --target x86_64-pc-windows-gnu
 CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar cargo clippy --workspace --all-targets --all-features --locked --target x86_64-pc-windows-gnu -- -D warnings
@@ -60,17 +62,17 @@ rustup target add x86_64-pc-windows-gnu --toolchain 1.92.0
 brew install mingw-w64   # provides x86_64-w64-mingw32-gcc and x86_64-w64-mingw32-ar
 ```
 
-Run the two Commands lines marked "Windows cross-check" after any edit that touches Windows-reachable code: `backend-generic`, `backend-windows`, or `cli`.
+Run the two Commands lines marked "Windows cross-check" after any edit that touches Windows-reachable code: `backend-generic`, `backend-windows`, `win-sys`, or `cli`.
 
 ## Architecture
 
 ### Crate layering
 
 - `crates/core` (`dedupe-core`) holds all logic. It has `#![forbid(unsafe_code)]` and no `cfg(target_os)`. It reaches the OS only through the traits in `core/src/traits.rs` (`Enumerator`, `ContentReader`, `PathCodec`, `VolumeIdentity`, `Hasher`), which are bundled per call in `pipeline::Services`.
-- `crates/backend-generic` is the portable backend: walkdir enumeration, positional reads, volume identity, and the path codec. Its Windows storage probe and extent lookup sit behind `cfg(windows)`.
-- `crates/backend-windows` holds the NTFS `$MFT` enumerator (`AutoEnumerator`), open-by-id reads (`HandleReader`), and overlapped read-ahead. Its parsing, path, and scheduling modules are portable and unit-tested on every OS. Win32 calls are confined to `cfg(windows)` items in `caps`, `volume_io`, `handle`, `overlapped`, and `enumerator`.
-- Any `unsafe` or platform `cfg` belongs in one of the two backend crates.
-- `crates/cli` is a thin consumer: argument parsing, progress bar, output formatting, and the storage probe that resolves `Config.profile`. Scan logic does not belong here. `make_backend` in `cli/src/scan.rs` is the only place that picks backend types.
+- `crates/backend-generic` is the portable backend: walkdir enumeration, positional reads, volume identity, and the path codec. Per-OS code lives in `src/sys/{linux,macos,windows}/`, plus `sys/unix.rs` (shared) and `sys/other.rs` (fallback), behind the `pub(crate) trait Platform` with one cfg-selected `type Os` (static dispatch). Pure parsers live in `src/parse/`. Facade files (`lib.rs`, `meta.rs`, `probe.rs`, `volume.rs`, `reader.rs`, `walk.rs`, `extents.rs`, `codec.rs`) hold no target cfg. The crate has `#![deny(unsafe_code)]` with local opt-in.
+- `crates/backend-windows` holds the NTFS `$MFT` enumerator (`AutoEnumerator`), open-by-id reads (`HandleReader`), and overlapped read-ahead. Its parsing, path, and scheduling modules are portable and unit-tested on every OS. Win32 calls are confined to `cfg(windows)` items in `caps`, `volume_io`, `handle`, `overlapped`, and `enumerator`. Shared Win32 handle and path helpers come from `dedupe-win-sys`.
+- `crates/win-sys` (`dedupe-win-sys`) is the sole owner of shared Win32 handle and path FFI. `ffi.rs` sits behind `cfg(windows)`; the pure `file_id_bytes` is tested on all OSes. `backend-generic` and `backend-windows` both import their Win32 helpers from it.
+- `crates/cli` is a thin consumer: argument parsing, progress bar, output formatting, and the storage probe that resolves `Config.profile`. Scan logic does not belong here. `make_backend` lives in `cli/src/platform/` (`mod.rs` is the only CLI file with OS cfg; `windows.rs` and `generic.rs` each build the backend and return `ScanExtras`) and is the only place that picks backend types. The crate has `#![forbid(unsafe_code)]`.
 - `crates/tui` is a stub. `bench/` is a standalone benchmark binary. `xtask/` is a stub.
 - Linux and macOS use `backend-generic` directly. A new platform gets its own `backend-*` crate implementing the same traits.
 
@@ -119,10 +121,10 @@ Run the two Commands lines marked "Windows cross-check" after any edit that touc
 - Hash passes stream results in `RESULT_CHUNK` batches. Unique prefixes are marked by one SQL statement (`Batch::MarkPrefixSingletons`) that commits with the `PrefixDone` marker; stale deletion commits with the `Enumerated` marker. Keep both orderings.
 - The `$MFT` path fails closed: a record that fails twice, a bad root, or an `$ATTRIBUTE_LIST` on record 0 falls back to the walker, and a partial tree is never cached. Only name-surrogate reparse tags count as links (cloud folders are walked). An unreadable `$REPARSE_POINT` tag fails the record, and a cached record with the reparse bit but no tag is rejected. `SectorReader` pins the chunk holding record 0 (`Ntfs::file` re-reads it per record). Throughput is unmeasured.
 - The walker emits `WalkItem::Error`. Unreadable directories are passed to `Batch::DeleteStale` as protected folders, so their old rows survive.
-- Build matrix: lint and `cargo check` run on the Linux host and for `x86_64-pc-windows-gnu` (mingw). Nothing compiles the macOS code (`volume.rs` macOS `imp`, `probe.rs` macOS items) or MSVC or aarch64 from this host; check those on a Mac or Windows machine.
+- Build matrix: lint and `cargo check` run on the Linux host and for `x86_64-pc-windows-gnu` (mingw). Nothing compiles the macOS code (`backend-generic/src/sys/macos/`, `sys/other.rs`) or MSVC or aarch64 from this host; check those on a Mac or Windows machine.
 
-- Do not add `unsafe` or `cfg(target_os)` to `core`. Put platform code in a backend crate behind a trait.
-- The Windows walker opens each regular file once (`win_sys::file_info` in `backend-generic/src/lib.rs`, used by `file_meta_at` in `meta.rs`) and takes `file_id`, `nlink`, size, times and attributes from that open. `ctime` is the `FILE_BASIC_INFO` ChangeTime, matching the `$MFT` path's `$STANDARD_INFORMATION` change time; creation time is only a fallback. On a failed open, `file_id` stays `None` and `nlink` is 1. NTFS ids are 8 bytes and are meant to equal the `$MFT` file references, but this is unverified on hardware, so until it is checked, assume switching modes re-hashes files. ReFS 128-bit ids are stored as 16 bytes (not truncated) and are never opened by id. The `$MFT` cache is at format version 2, so older caches are rejected and trigger a full scan. Unix reads the inode directly.
+- OS code boundaries: `core` takes no `unsafe` and no OS `cfg`; `cli` takes OS `cfg` only in `platform/mod.rs`; `backend-generic` takes it only under `sys/` and `parse/`. `cargo run -p dedupe-xtask -- boundaries` enforces this (substring match; comment lines are skipped). A new OS is a new `sys/<os>/` implementing `Platform` plus a cfg arm in `sys/mod.rs`. macOS and `sys/other.rs` are not compiled from this host.
+- The Windows walker opens each regular file once (`dedupe_win_sys::file_info` in `crates/win-sys/src/ffi.rs`, used by `file_meta_at` in `backend-generic/src/sys/windows/meta.rs`) and takes `file_id`, `nlink`, size, times and attributes from that open. `ctime` is the `FILE_BASIC_INFO` ChangeTime, matching the `$MFT` path's `$STANDARD_INFORMATION` change time; creation time is only a fallback. On a failed open, `file_id` stays `None` and `nlink` is 1. NTFS ids are 8 bytes and are meant to equal the `$MFT` file references, but this is unverified on hardware, so until it is checked, assume switching modes re-hashes files. ReFS 128-bit ids are stored as 16 bytes (not truncated) and are never opened by id. The `$MFT` cache is at format version 2, so older caches are rejected and trigger a full scan. Unix reads the inode directly.
 - `scan_runs.enumerator` records `mft`, `walker`, `walker-forced` (`--no-mft`) or `walker-fallback`, written by the CLI after `run_scan` returns. Schema version is 2 and there are no migrations: an older DB fails with a "delete it and scan again" error.
 - `scan --exclude <glob>` (repeatable, `core/src/exclude.rs`) matches the full path with `/` separators, case-sensitive. The walker prunes excluded directories; `pass_enumerate` drops them for the `$MFT` path too. `--no-db` on the `$MFT` path does not filter. The CLI appends the fixed `DEV_ARTIFACT_GLOBS` list in `cli/src/scan.rs` by default (`--include-dev-artifacts` turns it off; core `Config` has no default excludes); it keys only on artifact folder names and extensions, never on folder names like `TurboC++` that may hold media.
 - The NTFS fast path runs only when the process is elevated and the scan root is on NTFS (`AutoEnumerator`). Otherwise, or when the fast path fails partway, it falls back to the walker and the CLI prints a `note:` on stderr. `--no-mft` forces the walker and prints no note. Items the fast path already yielded are yielded again by the walker, which is safe because enumeration is an idempotent upsert.
