@@ -108,7 +108,7 @@ Run the two Commands lines marked "Windows cross-check" after any edit that touc
 ### Progress and cancellation
 
 - `core/src/progress.rs` defines the `Sink` trait and `SharedSink`. The CLI supplies a bar sink (`cli/src/progress.rs`) or `null_sink()` for JSON output and non-TTY stderr. Core never prints.
-- `core/src/cancel.rs` holds the cancel token. The CLI cancels it from a Ctrl-C handler. On Windows the same token is handed to `AutoEnumerator`, so Ctrl-C also stops the `$MFT` read phase (a cancel returns `Cancelled` and never triggers the fallback walker).
+- `core/src/cancel.rs` holds the cancel token. The CLI cancels it from a Ctrl-C handler. On Windows the same token is handed to `AutoEnumerator`, so Ctrl-C also stops the `$MFT` read phase (a cancel returns `Cancelled` and never triggers the fallback walker). A second Ctrl-C exits immediately with code 130 (safe: the DB survives `kill -9` and the `$MFT` cache is written atomically).
 
 ## Gotchas
 

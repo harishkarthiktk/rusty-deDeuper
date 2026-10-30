@@ -410,11 +410,18 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.log_level);
 
-    // Ctrl-C sets the shared cancel token; long scans return `Cancelled`.
+    // First Ctrl-C cancels cooperatively; a second exits at once (safe: the DB survives kill -9,
+    // the lock is released by the OS, and the $MFT cache is written via tmp + rename).
     let token = Token::new();
     {
         let token = token.clone();
-        let _ = ctrlc::set_handler(move || token.cancel());
+        let _ = ctrlc::set_handler(move || {
+            if token.is_cancelled() {
+                std::process::exit(130);
+            }
+            token.cancel();
+            eprintln!("\ncancelling; press Ctrl-C again to quit immediately");
+        });
     }
 
     match cli.cmd {

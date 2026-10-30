@@ -76,7 +76,7 @@ Example:
 dedupe scan ~/Documents ~/Desktop --db ~/dedupe-index.db
 ```
 
-If a scan is interrupted (for example, Ctrl-C or a power loss), run it again with `--resume`:
+If a scan is interrupted (for example, Ctrl-C or a power loss), run it again with `--resume`. The first Ctrl-C stops the scan cleanly, and a second Ctrl-C quits immediately; `--resume` works after either:
 
 ```bash
 dedupe scan ~/Documents ~/Desktop --db ~/dedupe-index.db --resume
