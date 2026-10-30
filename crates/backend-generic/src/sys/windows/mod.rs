@@ -7,7 +7,6 @@ use std::path::Path;
 
 use dedupe_core::error::Result;
 use dedupe_core::path::RawPath;
-use dedupe_core::time::system_time_to_unix_ns;
 use dedupe_core::traits::{FileMeta, VolumeInfo};
 
 use super::Platform;
@@ -43,10 +42,11 @@ impl Platform for Windows {
         meta::platform_attr_bits(md)
     }
 
-    /// Windows `file_meta_from` has no change time in `Metadata`, so it uses creation time.
-    /// The handle path (`file_meta_from_info`) reports the real ChangeTime.
-    fn ctime_ns(md: &Metadata) -> Option<i64> {
-        md.created().ok().and_then(system_time_to_unix_ns)
+    /// `std::fs::Metadata` has no change time on Windows. `None` means unknown, which
+    /// `ctime_matches` in core treats as a match, so a fallback read never flips a file to
+    /// changed. The handle path (`file_meta_from_info`) reports the real ChangeTime.
+    fn ctime_ns(_md: &Metadata) -> Option<i64> {
+        None
     }
 
     fn file_meta_at(path: &Path, md: &Metadata, ft: FileType) -> FileMeta {
@@ -66,7 +66,9 @@ impl Platform for Windows {
         Ok(crate::meta::file_meta_from(&md, ft))
     }
 
-    /// Windows keeps the plain read-only open. The walker never yields reparse points as files.
+    /// Windows keeps the plain read-only open. Scan and lookup reads on Windows go through
+    /// backend-windows `HandleReader`, which checks the NTFS file id of a path open against the
+    /// enumerated id; this reader keeps the plain open.
     fn configure_open(_opts: &mut OpenOptions) {}
 
     fn after_open(_file: &File) -> io::Result<()> {

@@ -36,12 +36,9 @@ pub fn file_meta_from_info(info: dedupe_win_sys::WinFileInfo) -> FileMeta {
         nlink: i64::from(info.nlink),
         size: i64::try_from(info.size).unwrap_or(i64::MAX),
         mtime_ns: filetime_to_unix_ns(info.written).unwrap_or(0),
-        // ChangeTime is the metadata-change time (matches Unix ctime). Creation time is only a
-        // fallback when the query failed.
-        ctime_ns: info
-            .change_time
-            .and_then(filetime_to_unix_ns)
-            .or_else(|| filetime_to_unix_ns(info.created)),
+        // ChangeTime is the metadata-change time (matches Unix ctime). `None` (query failed)
+        // means unknown, which core treats as a match.
+        ctime_ns: info.change_time.and_then(filetime_to_unix_ns),
         attrs: attr_bits,
         kind: EntryKind::RegularFile,
     }

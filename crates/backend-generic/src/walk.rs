@@ -1,7 +1,7 @@
 //! Directory traversal via `walkdir`. Regular files only at the pipeline level;
 //! the walker reports every entry and lets the pipeline apply 4.4a rules.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::codec::GenericPathCodec;
 use crate::sys::{Os, Platform};
@@ -21,6 +21,27 @@ pub struct WalkdirEnumerator;
 /// is used with `file_id` `None` and `nlink` 1, and non-regular entries use it directly.
 fn file_meta_for(entry: &walkdir::DirEntry, ft: std::fs::FileType) -> std::io::Result<FileMeta> {
     Os::walk_file_meta(entry, ft)
+}
+
+/// Last directory yielded at each depth. walkdir reports a failed entry inside an open
+/// directory without a path, only with its depth; this maps it back to that directory.
+#[derive(Default)]
+struct DirTrail(Vec<PathBuf>);
+
+impl DirTrail {
+    /// Record a yielded directory at `depth` and forget deeper ones.
+    fn enter(&mut self, depth: usize, path: &Path) {
+        self.0.truncate(depth);
+        self.0.push(path.to_path_buf());
+    }
+
+    /// Directory whose listing produced an error at `err_depth`, if known.
+    fn parent_of(&self, err_depth: usize) -> Option<&Path> {
+        err_depth
+            .checked_sub(1)
+            .and_then(|d| self.0.get(d))
+            .map(PathBuf::as_path)
+    }
 }
 
 fn walk_error(
@@ -60,20 +81,29 @@ impl Enumerator for WalkdirEnumerator {
         let walker = builder
             .into_iter()
             .filter_entry(|e| e.depth() == 0 || !cfg.exclude.is_excluded(e.path()));
+        let mut trail = DirTrail::default();
         for entry in walker {
             let entry = match entry {
                 Ok(e) => e,
                 Err(err) => {
-                    // walkdir errors carry the path being read (a directory for read_dir
-                    // failures). No path (rare) means nothing to attribute: skip.
-                    let Some(path) = err.path() else { continue };
-                    // Unknown type => treat as a directory so its old rows are kept.
-                    let is_dir = path.symlink_metadata().map(|m| m.is_dir()).unwrap_or(true);
                     let io = err
                         .io_error()
                         .map(|e| std::io::Error::new(e.kind(), e.to_string()))
                         .unwrap_or_else(|| std::io::Error::other(err.to_string()));
-                    visit(walk_error(&codec, path, &io, is_dir))?;
+                    if let Some(path) = err.path() {
+                        // Unknown type => treat as a directory so its old rows are kept.
+                        let is_dir = path.symlink_metadata().map(|m| m.is_dir()).unwrap_or(true);
+                        visit(walk_error(&codec, path, &io, is_dir))?;
+                    } else if let Some(dir) = trail.parent_of(err.depth()) {
+                        // A failed entry inside an open listing: attribute it to that directory
+                        // so core protects the subtree's old rows.
+                        visit(walk_error(&codec, dir, &io, true))?;
+                    } else {
+                        tracing::warn!(
+                            depth = err.depth(),
+                            "walk error with no path and no known parent"
+                        );
+                    }
                     continue;
                 }
             };
@@ -81,6 +111,7 @@ impl Enumerator for WalkdirEnumerator {
             let ft = entry.file_type();
             let raw = codec.path_to_raw(path);
             if ft.is_dir() {
+                trail.enter(entry.depth(), path);
                 visit(WalkItem::Dir { path: raw })?;
                 continue;
             }
@@ -91,5 +122,31 @@ impl Enumerator for WalkdirEnumerator {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parent_of_should_return_dir_one_level_up_when_error_depth_given() {
+        let mut t = DirTrail::default();
+        t.enter(0, Path::new("/r"));
+        t.enter(1, Path::new("/r/a"));
+        assert_eq!(t.parent_of(2), Some(Path::new("/r/a")));
+        assert_eq!(t.parent_of(1), Some(Path::new("/r")));
+    }
+
+    #[test]
+    fn enter_should_forget_deeper_dirs_when_sibling_entered() {
+        let mut t = DirTrail::default();
+        t.enter(0, Path::new("/r"));
+        t.enter(1, Path::new("/r/a"));
+        t.enter(2, Path::new("/r/a/b"));
+        t.enter(1, Path::new("/r/c"));
+        assert_eq!(t.parent_of(3), None);
+        assert_eq!(t.parent_of(2), Some(Path::new("/r/c")));
+        assert_eq!(t.parent_of(0), None);
     }
 }
