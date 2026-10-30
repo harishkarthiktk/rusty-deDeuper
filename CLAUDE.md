@@ -8,7 +8,7 @@ This is the general guide: what the project is, workspace commands, how the crat
 
 deDupe is a duplicate-file finder in Rust. This directory is the Cargo workspace root; the CLI binary is `dedupe` (package `dedupe`, in `crates/cli`). It groups files by content in progressive passes (size, then BLAKE3 over the first 16 KiB plus last 4 KiB, then full BLAKE3) and persists state in SQLite, so a scan can resume after `kill -9` and new files can be checked against an existing index (`lookup`). v1 is scan/report/lookup only. Nothing deletes files.
 
-The engineering plan is `.overall_plan.md` (in this directory, which is the repo root). Its "Status index" and "Task ledger" are the source of truth for what is done and pending. Do not restate status in this file.
+The engineering plan is `.overall_plan.md` (in this directory, which is the repo root). Its "Next steps" and "Open task ledger" (top) are the source of truth for what is pending; finished work is in its footer. Do not restate status in this file.
 
 ## Commands
 
