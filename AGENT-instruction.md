@@ -16,9 +16,27 @@ The workflow does analysis and intelligent detection only:
 
 **Nothing is deleted, moved or copied by the analysis scripts. Nothing changes on disk unless the user runs `execute_plan.py` with `--execute`.**
 
+### Hard rules
+
+Every rule below is a must. If one cannot be met, stop and ask the user. Details are in the section named.
+
+1. Never delete, move, rename, copy or write any file outside `OUT` and the project. Never run `execute_plan.py --execute` (sections 1, 9).
+2. Get the user's approval for the exact command line before any run that touches the scanned drives, the executor dry run included (section 9).
+3. Ask the user once before reading outside the project, naming the drives or mount points. Subagents start listings only after that yes (section 6).
+4. Read only directory listings and text sidecars under 64 KB. Never open, preview, hash or copy media or other files. Hashing an "unknown" file needs separate approval (sections 6, 8).
+5. Subagent reports hold metadata only (names, sizes, mtimes), never content. Say so in the final report (section 6).
+6. Never change an artifact rule in `rules.py` without telling the user first (section 4).
+7. Trust `full_hash` over names. Treat mtime order as inference only. Give every common-folder choice a reason and a confidence (section 7).
+8. Never plan a delete of a unique file, never overwrite, and leave held (`unresolved`) items to the user (section 8).
+9. Do the parent scope check for every cluster folder with a generic name, and record it (section 8, step 3b).
+10. Trust a plan only after `reconcile_plan.py --dry-run` reports 0 problems (section 8).
+11. Recommend `--quarantine` over `--delete` when you show the execute command (section 9).
+12. Use one report per path style, keep the original `dedupe.json`, and rescan after any change on disk before planning again (sections 2, 10).
+13. Finish with the handover checklist (section 11).
+
 ## 2. Input format
 
-`dedupe.json` is the CLI's `--json` report.
+`dedupe.json` is the CLI's `--json` report. Reference files with made-up data: `agent/examples/dedupe.example.windows.json` (Windows build: a plain duplicate, a group with two hardlinked members, a venv artifact group) and `agent/examples/dedupe.example.posix.json` (Linux build, including a member with `path_bytes`). Both use the CLI's layout: keys sorted, 2-space indent, LF.
 
 Top-level keys:
 

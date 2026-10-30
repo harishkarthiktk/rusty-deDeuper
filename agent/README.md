@@ -4,7 +4,7 @@ Analysis scripts for a `dedupe.json` produced by the dedupe CLI. All are read-on
 
 By default, `dedupe scan` skips most of what `rules.py` classifies (venv `site-packages`, `node_modules`, Rust `target`, `.git`, compiled objects) at scan time (`--include-dev-artifacts` turns this off). `split.py` still catches the rest, such as `cmake-*` installs and venv `Scripts` launchers. Rules match folder names case-insensitively.
 
-Files: `rules.py` (artifact classifier, imported by the others), `jsonio.py` (BOM-aware loading and path styles, imported by the others).
+Files: `rules.py` (artifact classifier, imported by the others), `jsonio.py` (BOM-aware loading and path styles, imported by the others), `examples/` (reference `dedupe.json` files, Windows and POSIX, made-up data).
 
 Scripts resolve their imports from their own folder, so run them from any directory; every path is passed as an argument. Use `python` (3.8+), standard library only. Replace `RUN` with your working folder for outputs.
 
