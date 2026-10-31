@@ -118,7 +118,12 @@ impl Row {
                 kind: meta.kind,
                 size: meta.size,
                 mtime_ns: meta.mtime_ns,
-                ctime_ns: meta.ctime_ns,
+                // Core reads ctime only for regular files; a link's ctime is unknown on the walker.
+                ctime_ns: if meta.kind == EntryKind::RegularFile {
+                    meta.ctime_ns
+                } else {
+                    None
+                },
                 attrs: meta.attrs & !attrs::HARDLINK,
             },
             WalkItem::Error { path, message, .. } => {

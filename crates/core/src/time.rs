@@ -35,27 +35,31 @@ mod tests {
         assert_eq!(system_time_to_unix_ns(UNIX_EPOCH), Some(0));
     }
 
+    // Steps are 100 ns: Windows `SystemTime` has 100 ns resolution, so 1 ns steps round away.
     #[test]
-    fn system_time_one_ns_before_epoch_is_minus_one() {
-        let t = UNIX_EPOCH.checked_sub(Duration::from_nanos(1)).unwrap();
-        assert_eq!(system_time_to_unix_ns(t), Some(-1));
+    fn system_time_one_tick_before_epoch_is_minus_100() {
+        let t = UNIX_EPOCH.checked_sub(Duration::from_nanos(100)).unwrap();
+        assert_eq!(system_time_to_unix_ns(t), Some(-100));
     }
 
     #[test]
     fn system_time_year_2262_boundary() {
+        // Largest 100 ns multiple that fits in i64.
+        let max_ticks = i64::MAX - i64::MAX % 100;
         let max = UNIX_EPOCH
-            .checked_add(Duration::from_nanos(i64::MAX as u64))
+            .checked_add(Duration::from_nanos(max_ticks as u64))
             .unwrap();
-        assert_eq!(system_time_to_unix_ns(max), Some(i64::MAX));
-        let over = max.checked_add(Duration::from_nanos(1)).unwrap();
+        assert_eq!(system_time_to_unix_ns(max), Some(max_ticks));
+        let over = max.checked_add(Duration::from_nanos(100)).unwrap();
         assert_eq!(system_time_to_unix_ns(over), None);
     }
 
     #[test]
     fn system_time_pre_1970_below_i64_min_is_none() {
+        let max_ticks = i64::MAX - i64::MAX % 100;
         let t = UNIX_EPOCH
-            .checked_sub(Duration::from_nanos(i64::MAX as u64))
-            .and_then(|t| t.checked_sub(Duration::from_nanos(2)))
+            .checked_sub(Duration::from_nanos(max_ticks as u64))
+            .and_then(|t| t.checked_sub(Duration::from_nanos(100)))
             .unwrap();
         assert_eq!(system_time_to_unix_ns(t), None);
     }

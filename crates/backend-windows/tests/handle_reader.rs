@@ -179,28 +179,37 @@ fn handle_reader_open_should_match_path_bytes_when_opened_by_file_id() {
     );
 }
 
+// A path open whose file id differs from the enumerated one is a file that changed since
+// enumeration (or a link swapped in), so it fails instead of reading another file.
+fn assert_changed_since_enumeration(result: dedupe_core::error::Result<Box<dyn FileHandle + '_>>) {
+    match result {
+        Err(dedupe_core::error::CoreError::Io(err)) => {
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidData,
+                "unexpected io error: {err}"
+            );
+        }
+        Err(other) => panic!("expected InvalidData io error, got {other:?}"),
+        Ok(_) => panic!("a path open with a mismatched file id must fail"),
+    }
+}
+
 #[test]
-fn handle_reader_open_target_should_return_path_bytes_when_file_id_is_garbage() {
+fn handle_reader_open_target_should_fail_when_file_id_is_garbage() {
     let content = pattern_bytes(2048);
     let file = TempFile::with_bytes("garbage_id", &content);
     let garbage = [0xFFu8; 8];
     let reader = HandleReader::new(DEPTH, CHUNK);
-    let mut handle = reader
-        .open_target(ReadTarget {
-            path: file.path(),
-            file_id: Some(&garbage),
-            access: AccessPattern::Random,
-        })
-        .expect("a garbage file id should fall back to the path");
-    let got = read_sequentially(&mut *handle, 512);
-    assert_eq!(
-        got, content,
-        "fallback to the path should return the file's bytes"
-    );
+    assert_changed_since_enumeration(reader.open_target(ReadTarget {
+        path: file.path(),
+        file_id: Some(&garbage),
+        access: AccessPattern::Random,
+    }));
 }
 
 #[test]
-fn handle_reader_open_target_should_return_path_bytes_when_file_id_is_stale() {
+fn handle_reader_open_target_should_fail_when_file_id_is_stale() {
     let old_content = pattern_bytes(2048);
     let new_content: Vec<u8> = pattern_bytes(2048).into_iter().rev().collect();
     let file = TempFile::with_bytes("stale_id", &old_content);
@@ -212,18 +221,11 @@ fn handle_reader_open_target_should_return_path_bytes_when_file_id_is_stale() {
     fs::write(file.path(), &new_content).expect("replacement temp file should be writable");
 
     let reader = HandleReader::new(DEPTH, CHUNK);
-    let mut handle = reader
-        .open_target(ReadTarget {
-            path: file.path(),
-            file_id: Some(&stale_id),
-            access: AccessPattern::Random,
-        })
-        .expect("a stale file id should fall back to the path");
-    let got = read_sequentially(&mut *handle, 512);
-    assert_eq!(
-        got, new_content,
-        "a stale file id should read the file now at the path"
-    );
+    assert_changed_since_enumeration(reader.open_target(ReadTarget {
+        path: file.path(),
+        file_id: Some(&stale_id),
+        access: AccessPattern::Random,
+    }));
 }
 
 #[test]
