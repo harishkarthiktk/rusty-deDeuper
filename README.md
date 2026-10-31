@@ -59,7 +59,8 @@ A rescan reuses a file's saved hash only when its size, modification time, chang
 | `--no-lock` | Run without the database lock when the filesystem does not support file locking. Has no effect where locking works. |
 | `--cross-mounts` | Also descend into other mounted drives. Off by default. |
 | `--include-placeholders` | Include cloud-only files (for example, OneDrive or iCloud placeholders). Off by default, because reading them downloads the file. |
-| `--exclude <GLOB>` | Skip paths matching this glob, and everything under a matching folder. Repeatable. Matched on the full path with `/` separators, case-sensitive, for example `--exclude '**/Temp'`. |
+| `--exclude <GLOB>` | Skip paths matching this glob, and everything under a matching folder. Repeatable. Matched on the full path with `/` separators, ignoring case, for example `--exclude '**/Temp'`. |
+| `-E, --exclude-dir <PATH>` | Skip this folder and everything under it. Repeatable. Relative paths are taken from the current folder. Matching ignores case. Fails when the path does not exist or contains a scan root, for example `-E ./build`. |
 | `--include-dev-artifacts` | Also scan build and package artifacts. By default the scan skips `site-packages`, `dist-packages`, `node_modules`, `__pycache__`, Rust `target/debug` and `target/release`, `.fingerprint`, `.git`, and `.pyc`, `.pyo`, `.o`, `.obj`, `.pdb`, `.rlib`, `.rmeta` files, so `lookup` does not match files under these paths. A default scan of a database built before this default removes rows under these paths. `--exclude` still applies. |
 | `--no-mft` | Windows only: skip the NTFS `$MFT` fast path and use the standard directory walker. Ignored on other systems. See [Windows](#windows). |
 | `--mem-budget <SIZE>` | Memory budget for the in-memory working set. Accepts bytes or a unit, such as `512MiB` or `1GiB`. |

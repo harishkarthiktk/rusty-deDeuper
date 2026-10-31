@@ -80,7 +80,7 @@ fn walk_all(root: &Path, cfg: &Config) -> Vec<WalkItem> {
 fn cfg_with_exclude(patterns: &[&str]) -> Config {
     let owned: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
     Config {
-        exclude: ExcludeSet::new(&owned).expect("valid exclude glob"),
+        exclude: ExcludeSet::new(&owned, &[]).expect("valid exclude glob"),
         ..Config::default()
     }
 }
@@ -137,6 +137,35 @@ fn walker_should_prune_excluded_dir_below_root_when_pattern_matches() {
             .iter()
             .all(|i| !String::from_utf8_lossy(item_bytes(i)).contains("node_modules")),
         "nothing under an excluded directory should be yielded"
+    );
+}
+
+#[test]
+fn walker_should_prune_subtree_when_exclude_dir_rule_given() {
+    let tree = TempTree::new("prune-dir");
+    let root = fs::canonicalize(tree.path()).unwrap();
+    fs::create_dir_all(root.join("keep")).unwrap();
+    fs::create_dir_all(root.join("skip/deep")).unwrap();
+    fs::write(root.join("keep/a.txt"), b"a").unwrap();
+    fs::write(root.join("skip/deep/b.txt"), b"b").unwrap();
+
+    let cfg = Config {
+        exclude: ExcludeSet::new(&[], &[root.join("skip")]).expect("dir rule"),
+        ..Config::default()
+    };
+    let items = walk_all(&root, &cfg);
+
+    assert!(
+        position_of(&items, &root.join("keep/a.txt")).is_some(),
+        "file outside the excluded directory should be yielded"
+    );
+    assert!(
+        position_of(&items, &root.join("skip")).is_none(),
+        "excluded directory should not be yielded"
+    );
+    assert!(
+        position_of(&items, &root.join("skip/deep/b.txt")).is_none(),
+        "file under an excluded directory should not be yielded"
     );
 }
 

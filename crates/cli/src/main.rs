@@ -122,11 +122,16 @@ pub struct ScanArgs {
     pub include_placeholders: bool,
 
     /// Skip paths matching this glob, and everything under a matching directory. Repeatable.
-    /// Matched against the full path with `/` separators, case-sensitive, for example
+    /// Matched against the full path with `/` separators; matching ignores case, for example
     /// `--exclude '**/target' --exclude '**/node_modules'`. Rows indexed earlier under an
     /// excluded path are removed by the next scan of that root.
     #[arg(long, value_name = "GLOB")]
     pub exclude: Vec<String>,
+
+    /// Skip this directory and everything under it. Repeatable. Relative paths are taken from the
+    /// current directory; matching ignores case. `--exclude` takes glob patterns instead.
+    #[arg(short = 'E', long, value_name = "PATH")]
+    pub exclude_dir: Vec<PathBuf>,
 
     /// Scan build and package artifacts too. By default the scan skips Python and Node
     /// package folders, Rust build output, `.git` and compiled objects (`.pyc`, `.o`,

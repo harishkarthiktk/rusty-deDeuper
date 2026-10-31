@@ -38,7 +38,8 @@ logic does not belong here. See the root CLAUDE.md for layering and cross-crate 
       `<first root, canonicalized>/.dedupe.db`.
    3. `check_db_locality` (see Gotchas).
    4. Storage probe on the first root, then `storage_profile::resolve`.
-   5. Exclude list: `--exclude` globs plus `DEV_ARTIFACT_GLOBS` unless `--include-dev-artifacts`.
+   5. Exclude list: `--exclude` globs plus `DEV_ARTIFACT_GLOBS` unless `--include-dev-artifacts`, and
+      the `-E/--exclude-dir` paths resolved by `resolve_exclude_dirs`.
    6. `platform::make_backend`, then `Config`. With no DB, `scan_naive` runs. With a DB, `run_scan` runs,
       the CLI reopens the DB read-write to write the enumerator label, then reopens it read-only and
       builds `Report::from_db(conn, 0)`.
@@ -75,10 +76,13 @@ logic does not belong here. See the root CLAUDE.md for layering and cross-crate 
 - `scan_runs.enumerator` is written by the CLI after `run_scan` returns, because the enumerator is only
   known once the walk ends. Labels: `mft`, `walker`, `walker-forced` (`--no-mft`) or `walker-fallback`.
   The schema version is core's concern.
-- `scan --exclude <glob>` (repeatable, `crates/core/src/exclude.rs`) matches the full path with `/` separators,
-  case-sensitive. The walker prunes excluded directories; `pass_enumerate` drops them for the `$MFT` path
-  too. `--no-db` on the `$MFT` path does not filter. The CLI appends the fixed `DEV_ARTIFACT_GLOBS` list
-  by default (`--include-dev-artifacts` turns it off; core `Config` has no default excludes).
+- `scan --exclude <glob>` (repeatable, `crates/core/src/exclude.rs`) matches the full path with `/` separators
+  and ignores case. The walker prunes excluded directories; `pass_enumerate` drops them for the `$MFT` path
+  too, and `scan_naive` (`--no-db`) drops them on every path. The CLI appends the fixed `DEV_ARTIFACT_GLOBS`
+  list by default (`--include-dev-artifacts` turns it off; core `Config` has no default excludes).
+- `scan -E/--exclude-dir <PATH>` (repeatable) skips one directory and everything under it. Matching ignores
+  case. `resolve_exclude_dirs` (`scan.rs`) canonicalizes each path (relative paths resolve from the cwd) and
+  fails when the path is missing or contains a scan root. Core receives absolute paths only.
 - The NTFS fast path runs only when the process is elevated and the scan root is on NTFS (`AutoEnumerator`).
   Otherwise, or when the fast path fails partway, it falls back to the walker and the CLI prints a
   `note:` on stderr. `--no-mft` forces the walker and prints no note. Items the fast path already

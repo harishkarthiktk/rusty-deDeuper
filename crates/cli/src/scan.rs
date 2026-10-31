@@ -2,6 +2,7 @@
 //! runs the naive Phase 0 pipeline with no persistence; `--db` selects an explicit path.
 
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -154,11 +155,12 @@ pub fn run(args: ScanArgs, cancel: &Token) -> Result<()> {
     if !args.include_dev_artifacts {
         patterns.extend(DEV_ARTIFACT_GLOBS.iter().map(|glob| glob.to_string()));
     }
+    let exclude_dirs = resolve_exclude_dirs(&args.exclude_dir, &args.roots)?;
     let defaults = Config::default();
     let cfg = Config {
         db_path,
         include_placeholders: args.include_placeholders,
-        exclude: ExcludeSet::new(&patterns).context("parse --exclude")?,
+        exclude: ExcludeSet::new(&patterns, &exclude_dirs).context("parse --exclude")?,
         force: args.force,
         one_file_system: !args.cross_mounts,
         verify: args.verify.into(),
@@ -245,6 +247,34 @@ fn emit(report: &Report, format: Resolved) {
         Resolved::Json => println!("{}", report.to_json()),
         Resolved::Human => print!("{}", report.to_human()),
     }
+}
+
+/// Canonical form of each `--exclude-dir`. Fails when a path is missing or covers a scan root.
+fn resolve_exclude_dirs(dirs: &[PathBuf], roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    // No -E: roots are left to the scan's own error handling, as before.
+    if dirs.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Lowercased like the matcher, so a case-only match on a case-sensitive volume is refused too.
+    let lower = |p: &std::path::Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+    let roots = roots
+        .iter()
+        .map(|r| std::fs::canonicalize(r).with_context(|| format!("scan root {}", r.display())))
+        .collect::<Result<Vec<_>>>()?;
+    dirs.iter()
+        .map(|d| {
+            let canon = std::fs::canonicalize(d)
+                .with_context(|| format!("--exclude-dir {}", d.display()))?;
+            if let Some(root) = roots.iter().find(|r| lower(r).starts_with(lower(&canon))) {
+                anyhow::bail!(
+                    "--exclude-dir {} contains scan root {}",
+                    d.display(),
+                    root.display()
+                );
+            }
+            Ok(canon)
+        })
+        .collect()
 }
 
 /// One-line stderr note for a device the probe could not classify, or `None` when

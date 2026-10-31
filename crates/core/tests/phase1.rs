@@ -12,13 +12,14 @@ use dedupe_core::cancel::Token;
 use dedupe_core::config::Config;
 use dedupe_core::db::{queries, Db};
 use dedupe_core::error::{CoreError, Result};
+use dedupe_core::exclude::ExcludeSet;
 use dedupe_core::hash::Blake3Hasher;
 #[cfg(unix)]
 use dedupe_core::model::attrs;
 use dedupe_core::model::{FsType, State, UuidKind};
 use dedupe_core::path::RawPath;
 use dedupe_core::pipeline::scan::{run_scan, ScanOptions};
-use dedupe_core::pipeline::Services;
+use dedupe_core::pipeline::{scan_naive, Services};
 use dedupe_core::report::Report;
 use dedupe_core::traits::*;
 
@@ -866,4 +867,51 @@ fn rescan_root_scoping_leaves_other_roots_untouched() {
         .unwrap()
         .expect("root B rows must survive a root-A-only rescan");
     assert_eq!(b_row.id, fid_b);
+}
+
+#[test]
+fn scan_naive_should_drop_subtree_when_exclude_dir_given() {
+    let e = env();
+    write(&e.root, "keep/a.txt", b"same bytes\n");
+    write(&e.root, "keep/b.txt", b"same bytes\n");
+    write(&e.root, "skip/deep/c.txt", b"same bytes\n");
+    write(&e.root, "skip/d.txt", b"same bytes\n");
+    // The walker below does not prune, so the excluded subtree must be dropped by scan_naive.
+    let root = fs::canonicalize(&e.root).unwrap();
+    let cfg = Config {
+        exclude: ExcludeSet::new(&[], &[root.join("skip")]).expect("dir rule"),
+        ..Config::default()
+    };
+    let reader = FsReader::new();
+    let hasher = Blake3Hasher;
+    let cancel = Token::new();
+    let (report, _) = scan_naive(
+        std::slice::from_ref(&e.root),
+        &Walker,
+        &reader,
+        &hasher,
+        &Codec,
+        &cfg,
+        &cancel,
+    )
+    .unwrap();
+
+    let names: Vec<String> = report
+        .groups
+        .iter()
+        .flat_map(|g| g.members.iter())
+        .map(|m| String::from_utf8_lossy(&m.path.0).into_owned())
+        .collect();
+    assert_eq!(
+        names.len(),
+        2,
+        "only keep/a.txt and keep/b.txt should remain: {names:?}"
+    );
+    assert!(
+        names.iter().all(|p| {
+            let parts: Vec<_> = Path::new(p).components().map(|c| c.as_os_str()).collect();
+            parts.iter().any(|c| *c == "keep") && !parts.iter().any(|c| *c == "skip")
+        }),
+        "nothing under skip/ should be reported: {names:?}"
+    );
 }

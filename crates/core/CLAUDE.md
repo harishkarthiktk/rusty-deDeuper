@@ -19,7 +19,7 @@ workspace layering and cross-crate rules are in the root CLAUDE.md.
 - `src/time.rs`: FILETIME and `SystemTime` to signed nanoseconds since the Unix epoch.
 - `src/hash.rs`: `HASH_ALGO` (`blake3-128`), `hash_prefix_target`, `hash_full_target`, `read_full`.
 - `src/identity.rs`: `run_key` (naive hardlink key), `volume_tag`, `namespaced_file_id` (`--cross-mounts`).
-- `src/exclude.rs`: `ExcludeSet`, the compiled `--exclude` globs.
+- `src/exclude.rs`: `ExcludeSet`, the compiled `--exclude` globs and `--exclude-dir` directories.
 - `src/cancel.rs`: `Token`, the cooperative cancel flag.
 - `src/progress.rs`: `Sink` trait, `SharedSink`, `PhaseProgress`, `emit_*` helpers.
 - `src/storage_profile.rs`: `Profile`, `StorageKind`, `ProfileChoice`, `resolve()`.
@@ -60,7 +60,8 @@ Persistent scan (`pipeline::scan::run_scan`):
 
 Naive scan (`scan_naive`): walks roots into memory, groups by size, then prefix, then full hash, then
 `Report::normalize`. No DB, no resume, `volume_id` is 0. It is the correctness reference. The `hasher`
-argument is ignored.
+argument is ignored. It canonicalizes each root, and it drops excluded directories and their subtrees
+by tracking parents, so it does not depend on the enumerator pruning.
 
 Lookup (`lookup_report`): stat the query file (symlink, non-regular, zero-length and placeholder files
 are `Skipped`). Resolve its volume and row key so the file never matches itself. Probe candidates by
@@ -181,9 +182,12 @@ Transitions are forward only within a run. Two things to know:
   `file_id` of a file on another device to `namespaced_file_id(volume_tag(uuid), id)`, so ids from two
   volumes cannot collide. The tag comes from the foreign volume's uuid, so rescans keep their hashes.
   `DevScope` stays off when `metadata` reports no `dev`.
-- `--exclude` matching lives in `exclude.rs`. Matching is on the full path with `/` separators and is
-  case-sensitive. An excluded directory is never registered, so `pass_enumerate` drops every file under
-  it, including on the `$MFT` path, which cannot prune.
+- `--exclude` and `--exclude-dir` matching lives in `exclude.rs`. Matching is on the full path with `/`
+  separators and ignores case, for globs and directories alike. `--exclude-dir` rules are absolute
+  normalized prefixes that match whole components (`/a/build` covers `/a/build/x`, not `/a/buildx`).
+  `ExcludeSet::new` expects canonical absolute dirs; the CLI resolves them. An excluded directory is
+  never registered, so `pass_enumerate` drops every file under it, including on the `$MFT` path, which
+  cannot prune.
 - Schema version 2 has no migrations. An older DB fails with "delete it and scan again".
 - `Services::hasher` is set by callers but never read in core. Hashing calls `hash::hash_bytes` and BLAKE3
   directly. `naive.rs` ignores its `hasher` argument as well.

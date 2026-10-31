@@ -56,6 +56,25 @@ fn distinct_count(recs: &[Rec], idxs: &[usize]) -> usize {
     set.len()
 }
 
+/// True when `path` is excluded or lies under an excluded directory. Excluded directories are
+/// recorded so their children are dropped too: the `$MFT` path does not prune, and a glob such as
+/// `**/node_modules` does not match the files below it.
+fn skip_under_excluded(
+    excluded: &mut HashSet<RawPath>,
+    codec: &dyn PathCodec,
+    cfg: &Config,
+    path: &RawPath,
+    is_dir: bool,
+) -> bool {
+    let native = codec.raw_to_path(path);
+    let parent = codec.split_component(&native).0;
+    let hit = excluded.contains(&parent) || cfg.exclude.is_excluded(&native);
+    if hit && is_dir {
+        excluded.insert(path.clone());
+    }
+    hit
+}
+
 /// Run the Phase 0 algorithm. `volume_id` is 0 (no volume identity in Phase 0).
 pub fn scan_naive(
     roots: &[PathBuf],
@@ -66,20 +85,34 @@ pub fn scan_naive(
     cfg: &Config,
     cancel: &Token,
 ) -> Result<(Report, ScanStats)> {
-    let _ = codec; // kept for signature symmetry with the DB pipeline
     let mut stats = ScanStats::default();
     let mut recs: Vec<Rec> = Vec::new();
+    let mut excluded: HashSet<RawPath> = HashSet::new();
 
     for root in roots {
         cancel.check()?;
-        enumr.walk(root, cfg, &mut |item| {
-            if matches!(item, WalkItem::Error { .. }) {
-                stats.files_errored += 1;
+        // Canonical roots make the exclude prefixes match, as the DB pipeline's roots do.
+        let canon = std::fs::canonicalize(root)?;
+        let root_raw = codec.path_to_raw(&canon);
+        enumr.walk(&canon, cfg, &mut |item| {
+            let (path, meta) = match item {
+                WalkItem::Error { .. } => {
+                    stats.files_errored += 1;
+                    return Ok(());
+                }
+                // The scan root itself is never excluded, as in the walker and `pass_enumerate`.
+                WalkItem::Dir { path } => {
+                    if path != root_raw {
+                        skip_under_excluded(&mut excluded, codec, cfg, &path, true);
+                    }
+                    return Ok(());
+                }
+                WalkItem::File { path, meta } => (path, meta),
+            };
+            let is_dir = matches!(meta.kind, crate::traits::EntryKind::Directory);
+            if skip_under_excluded(&mut excluded, codec, cfg, &path, is_dir) {
                 return Ok(());
             }
-            let WalkItem::File { path, meta } = item else {
-                return Ok(());
-            };
             match meta.kind {
                 crate::traits::EntryKind::Directory => return Ok(()),
                 crate::traits::EntryKind::Symlink => {
