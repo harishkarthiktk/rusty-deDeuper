@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-Runs the Windows verification runbook (W1-W7 in .overall_plan.md section 6.3) and writes a results table.
+Runs the Windows verification runbook (W1-W8 in .overall_plan.md section 6.3) and writes a results table.
 
 .DESCRIPTION
 Builds into <repo>\target-win so a WSL or Linux build in <repo>\target is never touched.
-W4, W5 and W7 need an elevated shell. W6 needs a non-elevated scan: from an elevated shell it is
+W4, W5, W7 and W8 need an elevated shell. W6 needs a non-elevated scan: from an elevated shell it is
 started with `runas /trustlevel:0x20000`. Logs, databases and results.md go to -OutDir.
 Exit code 0 when no step failed (skipped steps are allowed), 1 otherwise.
 
@@ -13,16 +13,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\verify.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\verify.ps1 -Step W5,W6,W7
 #>
 param(
-    [string[]]$Step = @('W1', 'W2', 'W3', 'W4', 'W5', 'W6', 'W7'),
-    # Scratch tree for W5-W7. Recreated on every run; must be empty or made by this script.
+    [string[]]$Step = @('W1', 'W2', 'W3', 'W4', 'W5', 'W6', 'W7', 'W8'),
+    # Scratch tree for W5-W8. Recreated on every run; must be empty or made by this script.
     [string]$TestRoot = 'C:\dd_test',
     [string]$OutDir = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# `powershell -File ... -Step W5,W8` binds one string "W5,W8", so split it here.
+$Step = @($Step | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 
-$Repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$Repo =(Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $env:CARGO_TARGET_DIR = Join-Path $Repo 'target-win'
 if (-not $OutDir) {
     $OutDir = Join-Path $env:CARGO_TARGET_DIR ('verify\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
@@ -259,6 +261,180 @@ function Step-W7 {
         if ($set -ne $script:Baseline) { Add-Result 'W7' 'FAIL' "$($run.Name): report differs from W5: [$set]"; return }
     }
     Add-Result 'W7' 'PASS' 'five rescans (walker, MFT, cache rebuild, cache twice) keep the W5 report'
+}
+
+# Sends Ctrl-C to the console of process $ProcessId from a separate powershell.exe, so this script's
+# own console never receives the event. The helper script is written to -OutDir. Returns
+# @{ Ok; Error; EventTicks } (EventTicks = UTC ticks taken right after the last event).
+function Send-CtrlC([int]$ProcessId, [int]$Count = 1, [int]$GapMs = 200, [string]$Name = 'W8-sendctrlc') {
+    $helper = Join-Path $OutDir 'W8-sendctrlc.ps1'
+    @'
+param([int]$TargetPid, [int]$Count, [int]$GapMs)
+$ErrorActionPreference = 'Stop'
+Add-Type -Namespace DD -Name K -MemberDefinition @"
+[DllImport("kernel32.dll", SetLastError=true)] public static extern bool FreeConsole();
+[DllImport("kernel32.dll", SetLastError=true)] public static extern bool AttachConsole(uint pid);
+[DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetConsoleCtrlHandler(IntPtr handler, bool add);
+[DllImport("kernel32.dll", SetLastError=true)] public static extern bool GenerateConsoleCtrlEvent(uint ev, uint group);
+"@
+[void][DD.K]::FreeConsole()
+if (-not [DD.K]::AttachConsole([uint32]$TargetPid)) {
+    Write-Output ('AttachConsole failed, win32 error ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+    exit 2
+}
+# Ignore the event in this helper; the target keeps its own handler.
+[void][DD.K]::SetConsoleCtrlHandler([IntPtr]::Zero, $true)
+for ($i = 0; $i -lt $Count; $i++) {
+    if ($i -gt 0) { Start-Sleep -Milliseconds $GapMs }
+    if (-not [DD.K]::GenerateConsoleCtrlEvent(0, 0)) {
+        Write-Output ('GenerateConsoleCtrlEvent failed, win32 error ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+        exit 3
+    }
+    Write-Output ('EVENT ' + [DateTime]::UtcNow.Ticks)
+}
+Start-Sleep -Milliseconds 200
+[void][DD.K]::FreeConsole()
+exit 0
+'@ | Set-Content -Path $helper -Encoding ASCII
+    $r = Invoke-Logged $Name 'powershell.exe' @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $helper, '-TargetPid', "$ProcessId", '-Count', "$Count", '-GapMs', "$GapMs")
+    if ($r.Code -ne 0) { return @{ Ok = $false; Error = (Get-Decisive $r.Lines 'failed'); EventTicks = 0L } }
+    $ev = @($r.Out | Where-Object { $_ -match '^EVENT \d+$' }) | Select-Object -Last 1
+    $ticks = if ($ev) { [long]($ev -replace '^EVENT ', '') } else { 0L }
+    return @{ Ok = $true; Error = ''; EventTicks = $ticks }
+}
+
+# Starts `dedupe scan` in its own minimized console (so it has a console to signal) and returns the
+# dedupe.exe pid. Output goes to <OutDir>\<Name>.out / .err; the exit code to <Name>.done.
+# cmd /v:on expands !ERRORLEVEL! after the scan; the .cmd itself returns at once.
+function Start-ScanInOwnConsole([string]$Name, [string[]]$ScanArgs) {
+    $out = Join-Path $OutDir "$Name.out"
+    $err = Join-Path $OutDir "$Name.err"
+    $done = Join-Path $OutDir "$Name.done"
+    foreach ($f in $out, $err, $done) { if (Test-Path $f) { Remove-Item -Force $f } }
+    $cmdFile = Join-Path $OutDir "$Name.cmd"
+    $argText = ($ScanArgs | ForEach-Object { '"{0}"' -f $_ }) -join ' '
+    @(
+        '@echo off',
+        ('start "dd-w8" /min cmd /v:on /c ""{0}" {1} > "{2}" 2> "{3}" & echo !ERRORLEVEL!> "{4}""' -f $Exe, $argText, $out, $err, $done)
+    ) | Set-Content -Path $cmdFile -Encoding ASCII
+    $t0 = (Get-Date).AddSeconds(-1)
+    # Not `& cmd /c ... | Out-Null`: the started scan inherits that pipe, so the call blocks until it ends.
+    Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', "`"$cmdFile`"") -WindowStyle Hidden
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline) {
+        $p = @(Get-Process dedupe -ErrorAction SilentlyContinue | Where-Object { $_.StartTime -gt $t0 } | Sort-Object StartTime -Descending) | Select-Object -First 1
+        if ($p) { return [int]$p.Id }
+        Start-Sleep -Milliseconds 50
+    }
+    throw "$Name : dedupe.exe did not appear within 10 s"
+}
+
+function Wait-ScanDone([string]$Done, [int]$TimeoutSec) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Path $Done) {
+            $text = @(Get-Content $Done -ErrorAction SilentlyContinue | Select-Object -First 1)
+            if ($text.Count -gt 0 -and "$($text[0])".Trim() -match '^\d+$') { return [int]"$($text[0])".Trim() }
+        }
+        Start-Sleep -Milliseconds 50
+    }
+    return $null
+}
+
+# One W8 case: start the scan, wait $DelayMs, send $Signals Ctrl-C events $GapMs apart, wait for exit.
+# Returns @{ ProcessId; Code; Early; SendError; Latency; Err } (Code $null on timeout; Latency = seconds
+# from the last event to the done file, one decimal; Early = scan ended before the signal).
+function Invoke-W8Case([string]$Name, [string[]]$ScanArgs, [int]$DelayMs, [int]$Signals, [int]$GapMs = 200) {
+    $done = Join-Path $OutDir "$Name.done"
+    $res = @{ ProcessId = 0; Code = $null; Early = $false; SendError = ''; Latency = ''; Err = @() }
+    $res.ProcessId = Start-ScanInOwnConsole $Name $ScanArgs
+    Start-Sleep -Milliseconds $DelayMs
+    if (Test-Path $done) { $res.Early = $true; $res.Code = Wait-ScanDone $done 5; return $res }
+    $s = Send-CtrlC $res.ProcessId $Signals $GapMs "$Name-sendctrlc"
+    if (-not $s.Ok) {
+        Stop-Process -Id $res.ProcessId -Force -ErrorAction SilentlyContinue
+        $res.SendError = $s.Error
+        return $res
+    }
+    $res.Code = Wait-ScanDone $done 30
+    if ($null -eq $res.Code) {
+        # Timeout: do not leave a stuck dedupe.exe behind.
+        Stop-Process -Id $res.ProcessId -Force -ErrorAction SilentlyContinue
+        return $res
+    }
+    $secs = ((Get-Item $done).LastWriteTimeUtc.Ticks - $s.EventTicks) / 1e7
+    $res.Latency = ([Math]::Max(0.0, $secs)).ToString('0.0', [Globalization.CultureInfo]::InvariantCulture)
+    $errFile = Join-Path $OutDir "$Name.err"
+    if (Test-Path $errFile) { $res.Err = @(Get-Content $errFile) }
+    return $res
+}
+
+function Step-W8 {
+    if (-not $script:Elevated) { Add-Result 'W8' 'SKIP' 'needs an elevated shell'; return }
+    if ($null -eq $script:Baseline) { Add-Result 'W8' 'SKIP' 'needs W5 to pass in the same run'; return }
+    Ensure-Exe
+    $cache = Join-Path $OutDir 'w8cache'
+    if (Test-Path $cache) { Remove-Item -Recurse -Force $cache }
+    New-Item -ItemType Directory -Force -Path $cache | Out-Null
+    $prevCache = $env:DEDUPE_CACHE_DIR
+    $env:DEDUPE_CACHE_DIR = $cache
+    try {
+        # W8a: single Ctrl-C during the full MFT read.
+        $db = Join-Path $OutDir 'w8a.db'
+        Remove-Db $db
+        $a = Invoke-W8Case 'W8a' @('scan', $TestRoot, '--db', $db, '--progress', 'never', '--rebuild-mft-cache') 1500 1
+        if ($a.SendError) { Add-Result 'W8' 'SKIP' "Send-CtrlC failed: $($a.SendError)"; return }
+        if ($a.Early) { Add-Result 'W8a' 'SKIP' "scan finished before the signal (exit $($a.Code))" }
+        elseif ($null -eq $a.Code) { Add-Result 'W8a' 'FAIL' 'scan still running 30 s after Ctrl-C; process killed' }
+        elseif ($a.Code -ne 130) { Add-Result 'W8a' 'FAIL' "exit $($a.Code), expected 130; latency $($a.Latency) s" }
+        elseif ([double]$a.Latency -gt 10) { Add-Result 'W8a' 'FAIL' "exit 130 but latency $($a.Latency) s, limit 10 s" }
+        elseif (-not (@($a.Err) -match 'cancelling')) { Add-Result 'W8a' 'FAIL' "no 'cancelling' line on stderr; latency $($a.Latency) s" }
+        elseif (@(Get-ChildItem -Recurse -Force -Filter '*.tmp' $cache -ErrorAction SilentlyContinue).Count -gt 0) { Add-Result 'W8a' 'FAIL' "temp file left in w8cache; latency $($a.Latency) s" }
+        else {
+            Invoke-Scan 'W8a-resume' $TestRoot $db @('--resume') | Out-Null
+            $set = Get-Report 'W8a-report' $db
+            if ($set -ne $script:Baseline) { Add-Result 'W8a' 'FAIL' "group set after resume differs from W5: [$set]" }
+            else { Add-Result 'W8a' 'PASS' "exit 130, latency $($a.Latency) s, 'cancelling' printed, no .tmp left; resume matches W5" }
+        }
+
+        # W8b: second Ctrl-C 200 ms after the first.
+        $db = Join-Path $OutDir 'w8b.db'
+        Remove-Db $db
+        $b = Invoke-W8Case 'W8b' @('scan', $TestRoot, '--db', $db, '--progress', 'never', '--rebuild-mft-cache') 1500 2 200
+        if ($b.SendError) { Add-Result 'W8b' 'SKIP' "Send-CtrlC failed: $($b.SendError)" }
+        elseif ($b.Early) { Add-Result 'W8b' 'SKIP' "scan finished before the signal (exit $($b.Code))" }
+        elseif ($null -eq $b.Code) { Add-Result 'W8b' 'FAIL' 'scan still running 30 s after the second Ctrl-C; process killed' }
+        elseif ($b.Code -ne 130) { Add-Result 'W8b' 'FAIL' "exit $($b.Code), expected 130; latency $($b.Latency) s" }
+        elseif ([double]$b.Latency -gt 2) { Add-Result 'W8b' 'FAIL' "exit 130 but latency $($b.Latency) s after the second signal, limit 2 s" }
+        else {
+            Invoke-Scan 'W8b-rescan' $TestRoot $db | Out-Null
+            $set = Get-Report 'W8b-report' $db
+            # The sweep only removes temp files older than 10 minutes, so the killed scan's own
+            # <name>.<pid>.tmp may legitimately remain; any other temp file after the rescan is a failure.
+            $tmps = @(Get-ChildItem -Recurse -Force -Filter '*.tmp' $cache -ErrorAction SilentlyContinue)
+            $other = @($tmps | Where-Object { $_.Name -notmatch "\.$($b.ProcessId)\.tmp$" })
+            if ($set -ne $script:Baseline) { Add-Result 'W8b' 'FAIL' "group set after rescan differs from W5: [$set]" }
+            elseif ($other.Count -gt 0) { Add-Result 'W8b' 'FAIL' "temp file left after rescan: $($other[0].Name)" }
+            else {
+                $own = $tmps.Count - $other.Count
+                Add-Result 'W8b' 'PASS' "exit 130, latency $($b.Latency) s after the second signal; rescan matches W5; killed pid's .tmp left: $own (swept only after 10 min)"
+            }
+        }
+
+        # W8c: Ctrl-C with a cache present (cache load, USN delta). A priming scan writes the cache first.
+        $db = Join-Path $OutDir 'w8c.db'
+        Remove-Db $db
+        Invoke-Scan 'W8c-prime' $TestRoot $db | Out-Null
+        $c = Invoke-W8Case 'W8c' @('scan', $TestRoot, '--db', $db, '--progress', 'never') 300 1
+        if ($c.SendError) { Add-Result 'W8c' 'SKIP' "Send-CtrlC failed: $($c.SendError)" }
+        elseif ($c.Early) { Add-Result 'W8c' 'PASS' "exit $($c.Code); finished before the signal" }
+        elseif ($null -eq $c.Code) { Add-Result 'W8c' 'FAIL' 'scan still running 30 s after Ctrl-C; process killed' }
+        elseif ($c.Code -eq 130) { Add-Result 'W8c' 'PASS' "exit 130, latency $($c.Latency) s" }
+        elseif ($c.Code -eq 0) { Add-Result 'W8c' 'PASS' "exit 0, finished before the signal took effect; latency $($c.Latency) s" }
+        else { Add-Result 'W8c' 'FAIL' "exit $($c.Code), expected 130 or 0; latency $($c.Latency) s" }
+    } finally {
+        if ($null -eq $prevCache) { Remove-Item Env:\DEDUPE_CACHE_DIR -ErrorAction SilentlyContinue } else { $env:DEDUPE_CACHE_DIR = $prevCache }
+    }
 }
 
 $script:Elevated = Test-Elevated
