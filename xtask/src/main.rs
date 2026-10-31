@@ -30,7 +30,7 @@ const CFG_LINE: &[&str] = &[
 
 fn main() {
     match std::env::args().nth(1).as_deref() {
-        Some("schema") => eprintln!("schema bump not implemented yet (schema is v1)"),
+        Some("schema") => eprintln!("schema bump not implemented yet (schema is v2)"),
         Some("boundaries") => match boundaries() {
             Ok(()) => println!("boundaries: ok"),
             Err(violations) => {
@@ -54,20 +54,19 @@ fn root() -> PathBuf {
         .to_path_buf()
 }
 
-/// All `.rs` files under `dir`, recursively. A missing dir yields nothing.
-fn rs_files(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
+/// All `.rs` files under `dir`, recursively. A missing or unreadable dir is an error, so the
+/// check never passes on files it did not see.
+fn rs_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
-    for path in entries.flatten().map(|e| e.path()) {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
         if path.is_dir() {
-            out.extend(rs_files(&path));
+            out.extend(rs_files(&path)?);
         } else if path.extension().is_some_and(|e| e == "rs") {
             out.push(path);
         }
     }
-    out
+    Ok(out)
 }
 
 /// The OS-specific needle found in `line`, if any. Comment lines are skipped.
@@ -86,8 +85,15 @@ fn os_needle(line: &str) -> Option<&'static str> {
 /// Violations for every `.rs` file under `src` that `allowed` does not exempt.
 /// `allowed` receives the path relative to the workspace root, with `/` separators.
 fn check_src(root: &Path, src: &str, rule: &str, allowed: impl Fn(&str) -> bool) -> Vec<String> {
+    let files = match rs_files(&root.join(src)) {
+        Ok(files) if files.is_empty() => {
+            return vec![format!("{src}: no .rs files found ({rule})")]
+        }
+        Ok(files) => files,
+        Err(e) => return vec![format!("{src}: cannot list ({e}) ({rule})")],
+    };
     let mut out = Vec::new();
-    for file in rs_files(&root.join(src)) {
+    for file in files {
         let rel = file
             .strip_prefix(root)
             .unwrap_or(&file)
@@ -96,7 +102,13 @@ fn check_src(root: &Path, src: &str, rule: &str, allowed: impl Fn(&str) -> bool)
         if allowed(&rel) {
             continue;
         }
-        let text = fs::read_to_string(&file).unwrap_or_default();
+        let text = match fs::read_to_string(&file) {
+            Ok(text) => text,
+            Err(e) => {
+                out.push(format!("{rel}: unreadable ({e}) ({rule})"));
+                continue;
+            }
+        };
         for (i, line) in text.lines().enumerate() {
             if let Some(n) = os_needle(line) {
                 out.push(format!("{rel}:{}: {n} ({rule})", i + 1));
@@ -111,7 +123,12 @@ fn check_src(root: &Path, src: &str, rule: &str, allowed: impl Fn(&str) -> bool)
 fn boundaries() -> Result<(), Vec<String>> {
     let root = root();
     let mut v = check_src(&root, "crates/core/src", "core: no OS code", |_| false);
-    let toml = fs::read_to_string(root.join("crates/core/Cargo.toml")).unwrap_or_default();
+    let toml = fs::read_to_string(root.join("crates/core/Cargo.toml")).unwrap_or_else(|e| {
+        v.push(format!(
+            "crates/core/Cargo.toml: unreadable ({e}) (core: no target deps)"
+        ));
+        String::new()
+    });
     for (i, line) in toml.lines().enumerate() {
         if line.starts_with("[target.") {
             v.push(format!(
@@ -139,5 +156,24 @@ fn boundaries() -> Result<(), Vec<String>> {
         Ok(())
     } else {
         Err(v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_src_should_report_violation_when_dir_missing() {
+        let v = check_src(&root(), "crates/does-not-exist/src", "test rule", |_| false);
+        assert_eq!(
+            v.len(),
+            1,
+            "a missing dir must give exactly one violation, got {v:?}"
+        );
+        assert!(
+            v[0].contains("cannot list"),
+            "violation must say the dir was not listed: {v:?}"
+        );
     }
 }

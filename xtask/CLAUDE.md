@@ -7,7 +7,7 @@ shipped. Run from any folder: `cargo run -p dedupe-xtask -- <task>`. The workspa
 Running `boundaries` is a project script. Ask the user before running it.
 
 ## Tasks
-- `schema`: stub. Prints `schema bump not implemented yet (schema is v1)` to stderr and exits 0.
+- `schema`: stub. Prints `schema bump not implemented yet (schema is v2)` to stderr and exits 0.
 - `boundaries`: OS-boundary check. Prints `boundaries: ok` on success. On a violation it prints one
   `path:line: needle (rule)` line per hit to stdout and exits 1.
 - No argument: prints usage to stderr and exits 0. Unknown task name: exits 2.
@@ -29,6 +29,8 @@ Running `boundaries` is a project script. Ask the user before running it.
   `windows,`, `unix,`) count only when the line also contains `cfg`. This catches `cfg(any(..))`,
   `cfg(all(..))` and `cfg_attr(..)`.
 - Lines whose trimmed start is `//` are skipped. A trailing comment on a code line is still checked.
+- Fails closed: a checked source dir that is missing, cannot be listed or holds no `.rs` file, an
+  unreadable `.rs` file, or an unreadable `crates/core/Cargo.toml` is reported as a violation.
 - Shortcut (source comment on `boundaries`): a `cfg` split across lines escapes the check. Upgrade to
   `syn` if that happens.
 
@@ -36,3 +38,7 @@ Running `boundaries` is a project script. Ask the user before running it.
 - 0: `boundaries: ok`, or `schema`, or no argument.
 - 1: at least one violation (printed to stdout).
 - 2: unknown task name.
+
+## Tests
+- One unit test in `src/main.rs`: `check_src_should_report_violation_when_dir_missing`. Run with
+  `cargo test -p dedupe-xtask` (only when the user asks).
