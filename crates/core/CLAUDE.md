@@ -26,7 +26,6 @@ workspace layering and cross-crate rules are in the root CLAUDE.md.
 - `src/scheduler.rs`: `Scheduler`, which orders rows by first extent on HDD and leaves them alone on SSD.
 - `src/report.rs`: `Report`, `Group`, `Member`, `ReportEvent`, JSON and human rendering.
 - `src/lookup.rs`: `lookup` and `lookup_report`, matching one query file against indexed rows.
-- `src/index/`: `Index` trait with `MemoryIndex` and `SqliteIndex`. Not wired into any pipeline.
 - `src/db/mod.rs`: `Db::open` (read-write), `Db::open_readonly`, pragma policy.
 - `src/db/schema.rs` and `src/db/schema/v2.sql`: schema, `user_version` check, no migrations.
 - `src/db/ids.rs`: `IdAllocator`, pre-assigned file and folder ids.
@@ -83,7 +82,6 @@ Threads:
   on `Shutdown` (commit, then `wal_checkpoint(TRUNCATE)`).
 - `flush()` is how the read connection sees a finished phase before the next pass selects rows.
 - Stale-row deletion goes through the writer as `Batch::DeleteStale`.
-- `Batch::Checkpoint` is handled but never sent.
 
 ## File state machine
 `files.state`. Each pass consumes one state and writes the next.
@@ -189,8 +187,7 @@ Transitions are forward only within a run. Two things to know:
 - Schema version 2 has no migrations. An older DB fails with "delete it and scan again".
 - `Services::hasher` is set by callers but never read in core. Hashing calls `hash::hash_bytes` and BLAKE3
   directly. `naive.rs` ignores its `hasher` argument as well.
-- `index/` (`Index`, `MemoryIndex`, `SqliteIndex`) is not used by any pass or by lookup. Only its own
-  tests use it. `Config::mem_budget` is not read by any pass.
+- `Config::mem_budget` is not read by any pass.
 - `Config` documents `VerifyMode::Byte` as "lands in Phase 2". That comment is stale. `pass_verify` is
   implemented.
 - Core has no `test-hooks` feature. The `dedupe` (cli) feature `test-hooks` gates `--stop-after-pass`;

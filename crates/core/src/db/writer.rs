@@ -58,7 +58,6 @@ pub enum Batch {
         /// that can read them.
         protected_folder_ids: Vec<i64>,
     },
-    Checkpoint,
     /// Commit everything pending, then ack. Needed so the pipeline's read
     /// connection observes a committed phase before selecting the next pass.
     /// Extension beyond 4.5 (surfaced to the user).
@@ -80,7 +79,6 @@ impl Batch {
             | Batch::DeleteStale { .. }
             | Batch::MarkPrefixSingletons { .. }
             | Batch::PromotePending { .. }
-            | Batch::Checkpoint
             | Batch::Flush(_)
             | Batch::Shutdown => 0,
         }
@@ -188,12 +186,6 @@ fn run(
                 commit(&mut conn, &mut pending, prefix_total)?;
                 conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
                 return Ok(());
-            }
-            Ok(Batch::Checkpoint) => {
-                commit(&mut conn, &mut pending, prefix_total)?;
-                rows = 0;
-                since = Instant::now();
-                conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
             }
             Ok(Batch::Flush(ack)) => {
                 let res = commit(&mut conn, &mut pending, prefix_total);
@@ -443,7 +435,7 @@ fn apply(tx: &Transaction<'_>, b: Batch, prefix_total: i64) -> Result<(), CoreEr
                 params![volume_id, run_id],
             )?;
         }
-        Batch::Checkpoint | Batch::Flush(_) | Batch::Shutdown => {}
+        Batch::Flush(_) | Batch::Shutdown => {}
     }
     Ok(())
 }

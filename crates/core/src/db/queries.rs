@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::error::Result;
-use crate::model::{now_unix_ns, ErrRow, FileEntry, FolderRow, Hash, Phase, State};
+use crate::model::{now_unix_ns, FileEntry, FolderRow, Hash, Phase, State};
 use crate::path::{separator_for, RawPath};
 use crate::traits::VolumeInfo;
 
@@ -180,18 +180,6 @@ pub fn insert_folder(conn: &Connection, f: &FolderRow) -> Result<()> {
     Ok(())
 }
 
-pub fn folder_path(conn: &Connection, folder_id: i64) -> Result<Option<RawPath>> {
-    let exists: Option<i64> = conn
-        .query_row("SELECT id FROM folders WHERE id=?1", [folder_id], |r| {
-            r.get(0)
-        })
-        .optional()?;
-    if exists.is_none() {
-        return Ok(None);
-    }
-    Ok(Some(reconstruct_path(conn, folder_id)?))
-}
-
 // ---------------------------------------------------------------------------
 // files
 // ---------------------------------------------------------------------------
@@ -307,14 +295,6 @@ pub fn rows_in_state(
         .query_map(params![volume_id, run_id, state.as_i64()], row_to_file)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
-}
-
-pub fn count_rows(conn: &Connection, volume_id: i64, run_id: i64) -> Result<i64> {
-    Ok(conn.query_row(
-        "SELECT COUNT(*) FROM files WHERE volume_id=?1 AND last_seen_run_id=?2",
-        params![volume_id, run_id],
-        |r| r.get(0),
-    )?)
 }
 
 /// The 4.6 grouping query: sizes whose state-0 rows cover more than one inode.
@@ -890,20 +870,6 @@ pub fn set_run_volume_phase(
         "INSERT INTO run_volumes(run_id,volume_id,phase_reached) VALUES(?1,?2,?3) \
          ON CONFLICT(run_id,volume_id) DO UPDATE SET phase_reached=excluded.phase_reached",
         params![run_id, volume_id, phase.as_i64()],
-    )?;
-    Ok(())
-}
-
-pub fn insert_error(conn: &Connection, e: &ErrRow) -> Result<()> {
-    conn.execute(
-        "INSERT INTO errors(run_id,file_row_id,path,kind,message) VALUES(?1,?2,?3,?4,?5)",
-        params![
-            e.run_id,
-            e.file_row_id,
-            e.path.as_ref().map(|p| p.as_bytes()),
-            e.kind.as_i64(),
-            e.message
-        ],
     )?;
     Ok(())
 }

@@ -177,30 +177,6 @@ fn read_span(handle: &mut dyn FileHandle, offset: u64, len: usize) -> Result<Vec
     Ok(buf)
 }
 
-/// Verify an expected prefix length is consistent with the config.
-pub fn prefix_bytes_matches(prefix_bytes: Option<i64>, cfg: &Config) -> bool {
-    match prefix_bytes {
-        // A negative stored length never matches; `as u64` would wrap it to a huge value.
-        // Either the full-file (small) case, or exactly F + L.
-        Some(b) => u64::try_from(b).is_ok_and(|b| b <= cfg.prefix_total()),
-        None => false,
-    }
-}
-
-/// Guard helper used by resume: string form of the current hash config.
-pub fn config_fingerprint(cfg: &Config) -> String {
-    format!(
-        "{}:first={}:last={}",
-        cfg.hash_algo, cfg.prefix_first_bytes, cfg.prefix_last_bytes
-    )
-}
-
-/// Unused-import guard for `CoreError` in this module's public signatures.
-#[allow(dead_code)]
-fn _assert_error_type(e: CoreError) -> CoreError {
-    e
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

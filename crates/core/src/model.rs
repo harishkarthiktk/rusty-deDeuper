@@ -178,8 +178,6 @@ impl Phase {
 /// `files.attrs` bitfield. Reserves room for reflink/clone labels in later phases.
 pub mod attrs {
     pub const HIDDEN: i64 = 1 << 0;
-    pub const SYSTEM: i64 = 1 << 1;
-    pub const READONLY: i64 = 1 << 2;
     pub const SPARSE: i64 = 1 << 3;
     pub const REFLINK: i64 = 1 << 4;
     pub const HARDLINK: i64 = 1 << 5;

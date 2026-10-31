@@ -11,7 +11,6 @@ pub mod error;
 pub mod exclude;
 pub mod hash;
 pub mod identity;
-pub mod index;
 pub mod lookup;
 pub mod model;
 pub mod path;

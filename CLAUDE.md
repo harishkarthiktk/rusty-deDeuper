@@ -64,7 +64,7 @@ Run the two Commands lines marked "Windows cross-check" after any edit that touc
 
 | Crate | Package | Role | Guide |
 |---|---|---|---|
-| `crates/core` | `dedupe-core` | All scan logic: pipelines, passes, DB, resume, report, lookup index. No OS code. | `crates/core/CLAUDE.md` |
+| `crates/core` | `dedupe-core` | All scan logic: pipelines, passes, DB, resume, report, lookup. No OS code. | `crates/core/CLAUDE.md` |
 | `crates/backend-generic` | `dedupe-backend-generic` | Portable backend: walker, positional reads, volume identity, path codec, storage probe. Per-OS code under `src/sys/`. | `crates/backend-generic/CLAUDE.md` |
 | `crates/backend-windows` | `dedupe-backend-windows` | NTFS `$MFT` fast path, open-by-id reads, overlapped read-ahead. Linked only into Windows builds. | `crates/backend-windows/CLAUDE.md` |
 | `crates/win-sys` | `dedupe-win-sys` | Shared Win32 handle and path FFI used by both backends. | `crates/win-sys/CLAUDE.md` |
