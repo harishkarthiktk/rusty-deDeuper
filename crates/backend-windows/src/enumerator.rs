@@ -254,7 +254,7 @@ fn walk_mft_volume(
     // this guard keeps that true if the policy is ever relaxed.
     if stats.records_skipped_errors == 0 {
         if let Some(site) = site.as_ref().filter(|_| !unchanged) {
-            store_cache(site, &tree, notices);
+            store_cache(site, &tree, cancel, notices)?;
         }
     }
 
@@ -330,9 +330,10 @@ fn load_cache_plan(
     notices: &EnumNotices,
     mem_budget: usize,
 ) -> std::result::Result<Plan, MftFailure> {
-    let cached = match mft_cache::read(&site.path, mem_budget) {
+    let cached = match mft_cache::read(&site.path, mem_budget, &|| cancel.is_cancelled()) {
         Ok(cached) => cached,
         Err(CacheError::Io(err)) if err.kind() == io::ErrorKind::NotFound => return Ok(Plan::Full),
+        Err(CacheError::Cancelled) => return Err(classify(MftError::Cancelled)),
         Err(err) => {
             notices.push(format!("MFT cache discarded: {err}"));
             return Ok(Plan::Full);
@@ -435,6 +436,9 @@ fn refresh_cached<S: RecordSource>(
 ) -> std::result::Result<(VolumeTree, DeltaStats), Refresh> {
     let mut tree = VolumeTree::from_facts(root_record, mem_budget, cached.records)
         .map_err(|err| Refresh::Discard(err.to_string()))?;
+    if cancel.is_cancelled() {
+        return Err(Refresh::Cancelled);
+    }
     let records = tree.records_iter().len();
     on_event(MftEvent::CacheLoaded {
         records: records as u64,
@@ -453,20 +457,34 @@ fn refresh_cached<S: RecordSource>(
     Ok((tree, delta))
 }
 
-/// Writes the cache for `tree`. A failed write is a notice, so it never fails the scan.
-fn store_cache(site: &CacheSite, tree: &VolumeTree, notices: &EnumNotices) {
+/// Writes the cache for `tree`. A failed write is a notice, so it never fails the scan. A cancel
+/// during the write stops the scan.
+fn store_cache(
+    site: &CacheSite,
+    tree: &VolumeTree,
+    cancel: &Token,
+    notices: &EnumNotices,
+) -> std::result::Result<(), MftFailure> {
     let journal = JournalStamp {
         journal_id: site.journal.journal_id,
         next_usn: site.journal.next_usn,
     };
-    match mft_cache::write_atomic_stream(&site.path, &site.volume, &journal, tree.records_iter()) {
+    match mft_cache::write_atomic_stream(
+        &site.path,
+        &site.volume,
+        &journal,
+        tree.records_iter(),
+        &|| cancel.is_cancelled(),
+    ) {
         Ok(()) => notices.push(format!(
             "MFT cache written: {} ({} records)",
             site.path.display(),
             tree.records_iter().len()
         )),
+        Err(CacheError::Cancelled) => return Err(classify(MftError::Cancelled)),
         Err(err) => notices.push(format!("could not write the MFT cache: {err}")),
     }
+    Ok(())
 }
 
 /// Keeps the visitor's errors and cancellation as they are. Every other MFT failure falls back.

@@ -307,6 +307,7 @@ pub fn emit_tree(
         dev,
         root_prefix,
         to_component,
+        cancelled,
         &mut |item: WalkItem| -> Result<(), MftError> {
             if stats.items_emitted.is_multiple_of(CANCEL_CHECK_INTERVAL) && cancelled() {
                 return Err(MftError::Cancelled);
@@ -320,6 +321,7 @@ pub fn emit_tree(
         Ok(()) => Ok(()),
         Err(EmitError::Budget(err)) => Err(MftError::BudgetExceeded(err)),
         Err(EmitError::Visit(err)) => Err(err),
+        Err(EmitError::Cancelled) => Err(MftError::Cancelled),
     }
 }
 

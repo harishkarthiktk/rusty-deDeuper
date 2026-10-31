@@ -15,6 +15,7 @@ use dedupe_core::path::RawPath;
 use dedupe_core::traits::{EntryKind, FileMeta, WalkItem};
 
 use crate::filetime::{ctime_ns, mtime_ns};
+use crate::mft_walk::CANCEL_CHECK_INTERVAL;
 
 /// NTFS reserves records 0..=23 for metafiles such as `$MFT` and `$Extend`.
 const METAFILE_LAST_RECORD: u64 = 23;
@@ -109,6 +110,14 @@ pub enum EmitError<E> {
     Budget(BudgetExceeded),
     /// The visitor failed; its error is returned unchanged.
     Visit(E),
+    /// The cancel check fired while reaching directories, before anything was emitted.
+    Cancelled,
+}
+
+/// Why [`reach_directories`] stopped.
+enum ReachError {
+    Budget(BudgetExceeded),
+    Cancelled,
 }
 
 /// Records under one root, indexed for a single walk.
@@ -224,6 +233,9 @@ impl VolumeTree {
     /// path codec on the wide name). A visitor error stops emission at that item and is
     /// returned as [`EmitError::Visit`].
     ///
+    /// `cancelled` is polled every `CANCEL_CHECK_INTERVAL` directories while their paths are
+    /// built and ends the call with [`EmitError::Cancelled`] before the first item is visited.
+    ///
     /// `dev` is set on every file's `FileMeta`. It is the volume serial, so ids from different
     /// volumes stay apart. It is passed in, not stored, so a cached tree takes the current volume's value.
     pub fn emit_items<E>(
@@ -231,6 +243,7 @@ impl VolumeTree {
         dev: u64,
         root_prefix: &RawPath,
         to_component: &dyn Fn(&[u16]) -> RawPath,
+        cancelled: &dyn Fn() -> bool,
         visit: &mut dyn FnMut(WalkItem) -> Result<(), E>,
     ) -> Result<(), EmitError<E>> {
         let Self {
@@ -254,8 +267,12 @@ impl VolumeTree {
             to_component,
             budget_bytes,
             budget_bytes.saturating_sub(used_bytes),
+            cancelled,
         )
-        .map_err(EmitError::Budget)?;
+        .map_err(|err| match err {
+            ReachError::Budget(err) => EmitError::Budget(err),
+            ReachError::Cancelled => EmitError::Cancelled,
+        })?;
 
         visit(WalkItem::Dir {
             path: root_prefix.clone(),
@@ -307,15 +324,22 @@ impl VolumeTree {
         to_component: &dyn Fn(&[u16]) -> RawPath,
     ) -> Result<Vec<WalkItem>, BudgetExceeded> {
         let mut items = Vec::new();
-        let collected: Result<(), EmitError<Infallible>> =
-            self.emit_items(dev, root_prefix, to_component, &mut |item: WalkItem| {
+        let collected: Result<(), EmitError<Infallible>> = self.emit_items(
+            dev,
+            root_prefix,
+            to_component,
+            &|| false,
+            &mut |item: WalkItem| {
                 items.push(item);
                 Ok(())
-            });
+            },
+        );
         match collected {
             Ok(()) => {}
             Err(EmitError::Budget(err)) => return Err(err),
             Err(EmitError::Visit(never)) => match never {},
+            // The check above never fires, so this arm is not taken.
+            Err(EmitError::Cancelled) => return Ok(Vec::new()),
         }
         items.sort_by(|a, b| path_of(a).cmp(path_of(b)));
         Ok(items)
@@ -369,6 +393,7 @@ fn index_dir_children(records: &BTreeMap<u64, RecordFacts>) -> HashMap<u64, Vec<
 ///
 /// Each directory, the root included, is charged its path length plus [`DIR_NODE_OVERHEAD_BYTES`]
 /// against `remaining`. Past it the walk fails with `limit_bytes` as the error's limit.
+/// `cancelled` is polled every `CANCEL_CHECK_INTERVAL` dequeued directories.
 fn reach_directories(
     records: &BTreeMap<u64, RecordFacts>,
     root: u64,
@@ -376,14 +401,15 @@ fn reach_directories(
     to_component: &dyn Fn(&[u16]) -> RawPath,
     limit_bytes: usize,
     remaining: usize,
-) -> Result<HashMap<u64, DirNode>, BudgetExceeded> {
+    cancelled: &dyn Fn() -> bool,
+) -> Result<HashMap<u64, DirNode>, ReachError> {
     let over = BudgetExceeded { limit_bytes };
     let mut charged = root_prefix
         .as_bytes()
         .len()
         .saturating_add(DIR_NODE_OVERHEAD_BYTES);
     if charged > remaining {
-        return Err(over);
+        return Err(ReachError::Budget(over));
     }
     let children = index_dir_children(records);
     let mut dirs = HashMap::from([(
@@ -395,7 +421,12 @@ fn reach_directories(
     )]);
     let mut queue = VecDeque::from([(root, 0usize)]);
 
+    let mut dequeued = 0u64;
     while let Some((dir, depth)) = queue.pop_front() {
+        if dequeued.is_multiple_of(CANCEL_CHECK_INTERVAL) && cancelled() {
+            return Err(ReachError::Cancelled);
+        }
+        dequeued += 1;
         let child_depth = depth.saturating_add(1);
         if child_depth > MAX_DEPTH {
             continue;
@@ -415,7 +446,7 @@ fn reach_directories(
                 .saturating_add(path.as_bytes().len())
                 .saturating_add(DIR_NODE_OVERHEAD_BYTES);
             if charged > remaining {
-                return Err(over);
+                return Err(ReachError::Budget(over));
             }
             dirs.insert(
                 child,
@@ -1062,10 +1093,16 @@ mod tests {
     fn emit_items_should_yield_same_items_as_into_items() {
         let mut emitted = Vec::new();
         let collected: Result<(), EmitError<Infallible>> = build(SCAN_ROOT, nested_records())
-            .emit_items(0, &prefix(), &to_component, &mut |item: WalkItem| {
-                emitted.push(item);
-                Ok(())
-            });
+            .emit_items(
+                0,
+                &prefix(),
+                &to_component,
+                &|| false,
+                &mut |item: WalkItem| {
+                    emitted.push(item);
+                    Ok(())
+                },
+            );
         assert!(collected.is_ok(), "an Infallible visitor cannot fail");
         emitted.sort_by(|a, b| path_of(a).cmp(path_of(b)));
         let expected = build(SCAN_ROOT, nested_records())
@@ -1089,14 +1126,20 @@ mod tests {
             ],
         );
         let mut calls = 0usize;
-        let result = tree.emit_items(0, &prefix(), &to_component, &mut |_item: WalkItem| {
-            calls += 1;
-            if calls == 2 {
-                Err("stop")
-            } else {
-                Ok(())
-            }
-        });
+        let result = tree.emit_items(
+            0,
+            &prefix(),
+            &to_component,
+            &|| false,
+            &mut |_item: WalkItem| {
+                calls += 1;
+                if calls == 2 {
+                    Err("stop")
+                } else {
+                    Ok(())
+                }
+            },
+        );
         assert!(
             matches!(result, Err(EmitError::Visit("stop"))),
             "the visitor's error must be returned unchanged"
@@ -1104,6 +1147,37 @@ mod tests {
         assert_eq!(
             calls, 2,
             "emission must stop at the failing item, got {calls} visits"
+        );
+    }
+
+    #[test]
+    fn emit_items_should_return_cancelled_when_flag_set() {
+        let tree = build(
+            SCAN_ROOT,
+            vec![
+                root_at(SCAN_ROOT),
+                dir(25, vec![win32(SCAN_ROOT, "Users")]),
+                file(26, vec![win32(25, "a.txt")]),
+            ],
+        );
+        let mut visits = 0usize;
+        let result = tree.emit_items(
+            0,
+            &prefix(),
+            &to_component,
+            &|| true,
+            &mut |_item: WalkItem| {
+                visits += 1;
+                Ok::<(), Infallible>(())
+            },
+        );
+        assert!(
+            matches!(result, Err(EmitError::Cancelled)),
+            "a set cancel flag must end emission with Cancelled"
+        );
+        assert_eq!(
+            visits, 0,
+            "nothing may be visited after a cancel, got {visits}"
         );
     }
 
@@ -1123,10 +1197,16 @@ mod tests {
         let tree = VolumeTree::from_facts(SCAN_ROOT, budget, records)
             .expect("the budget fits the records");
         let mut calls = 0usize;
-        let result = tree.emit_items(0, &prefix(), &to_component, &mut |_item: WalkItem| {
-            calls += 1;
-            Ok::<(), Infallible>(())
-        });
+        let result = tree.emit_items(
+            0,
+            &prefix(),
+            &to_component,
+            &|| false,
+            &mut |_item: WalkItem| {
+                calls += 1;
+                Ok::<(), Infallible>(())
+            },
+        );
         assert!(
             matches!(result, Err(EmitError::Budget(_))),
             "directory paths over the budget must fail, got {result:?}"
@@ -1146,15 +1226,20 @@ mod tests {
             ],
         );
         let mut kinds: Vec<&'static str> = Vec::new();
-        let collected: Result<(), EmitError<Infallible>> =
-            tree.emit_items(0, &prefix(), &to_component, &mut |item: WalkItem| {
+        let collected: Result<(), EmitError<Infallible>> = tree.emit_items(
+            0,
+            &prefix(),
+            &to_component,
+            &|| false,
+            &mut |item: WalkItem| {
                 kinds.push(match item {
                     WalkItem::Dir { .. } => "dir",
                     WalkItem::File { .. } => "file",
                     WalkItem::Error { .. } => "error",
                 });
                 Ok(())
-            });
+            },
+        );
         assert!(collected.is_ok(), "an Infallible visitor cannot fail");
         assert_eq!(
             kinds,

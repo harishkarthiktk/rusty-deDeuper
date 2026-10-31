@@ -14,6 +14,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::mft_walk::{RecordSource, CANCEL_CHECK_INTERVAL};
 use crate::records::RecordError;
@@ -79,6 +80,8 @@ pub enum CacheError {
         len: u64,
         max_bytes: usize,
     },
+    /// The caller's cancel flag was set during cache I/O.
+    Cancelled,
 }
 
 impl fmt::Display for CacheError {
@@ -96,6 +99,7 @@ impl fmt::Display for CacheError {
                 f,
                 "MFT cache is {len} bytes, over the {max_bytes} byte memory budget"
             ),
+            Self::Cancelled => write!(f, "MFT cache I/O was cancelled"),
         }
     }
 }
@@ -130,6 +134,7 @@ pub fn encode(index: &CachedIndex) -> Vec<u8> {
         &index.journal,
         index.records.len() as u64,
         index.records.iter(),
+        &|| false,
     )
     .expect("writing to memory with a matching record count cannot fail");
     let hash = blake3::hash(&out);
@@ -145,6 +150,7 @@ fn write_index<'a, W: Write>(
     journal: &JournalStamp,
     count: u64,
     records: impl Iterator<Item = &'a RecordFacts>,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<(), CacheError> {
     w.write_all(MAGIC)?;
     w.write_all(&FORMAT_VERSION.to_le_bytes())?;
@@ -166,6 +172,9 @@ fn write_index<'a, W: Write>(
         }
         encode_record(w, facts)?;
         written += 1;
+        if written.is_multiple_of(CANCEL_CHECK_INTERVAL) && cancelled() {
+            return Err(CacheError::Cancelled);
+        }
     }
     if written != count {
         return Err(CacheError::Malformed(COUNT_CHANGED));
@@ -255,6 +264,11 @@ fn namespace_from_byte(byte: u8) -> Result<NameSpace, CacheError> {
 
 /// Parses a cache file. The trailer hash is verified before any field is read.
 pub fn decode(bytes: &[u8]) -> Result<CachedIndex, CacheError> {
+    decode_with(bytes, &|| false)
+}
+
+/// [`decode`] that polls `cancelled` every `CANCEL_CHECK_INTERVAL` records.
+fn decode_with(bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<CachedIndex, CacheError> {
     if bytes.len() < HEADER_LEN + TRAILER_LEN {
         return Err(CacheError::Truncated);
     }
@@ -288,7 +302,10 @@ pub fn decode(bytes: &[u8]) -> Result<CachedIndex, CacheError> {
         .unwrap_or(usize::MAX)
         .min(cur.remaining() / MIN_RECORD_BYTES);
     let mut records = Vec::with_capacity(capacity);
-    for _ in 0..count {
+    for index in 0..count {
+        if index != 0 && index.is_multiple_of(CANCEL_CHECK_INTERVAL) && cancelled() {
+            return Err(CacheError::Cancelled);
+        }
         records.push(decode_record(&mut cur)?);
     }
     if cur.remaining() != 0 {
@@ -406,7 +423,13 @@ impl<'a> Cursor<'a> {
 /// The temp file is removed when any step fails, so a failed write leaves the previous cache
 /// (if any) untouched.
 pub fn write_atomic(path: &Path, index: &CachedIndex) -> Result<(), CacheError> {
-    write_atomic_stream(path, &index.volume, &index.journal, index.records.iter())
+    write_atomic_stream(
+        path,
+        &index.volume,
+        &index.journal,
+        index.records.iter(),
+        &|| false,
+    )
 }
 
 /// Like [`write_atomic`], but streams the records to disk instead of building the whole file in
@@ -414,11 +437,16 @@ pub fn write_atomic(path: &Path, index: &CachedIndex) -> Result<(), CacheError> 
 ///
 /// `records.len()` sets the header count, so the iterator must yield exactly that many items. Any
 /// other number fails with `Malformed`, and neither the target nor the temp file is left behind.
+///
+/// `cancelled` is polled every `CANCEL_CHECK_INTERVAL` records and ends the write with
+/// `CacheError::Cancelled`, which also removes the temp file. Temp files that a killed process
+/// left behind are swept first.
 pub fn write_atomic_stream<'a, I>(
     path: &Path,
     volume: &VolumeStamp,
     journal: &JournalStamp,
     records: I,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<(), CacheError>
 where
     I: ExactSizeIterator<Item = &'a RecordFacts>,
@@ -426,8 +454,9 @@ where
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    sweep_stale_temps(path, STALE_TEMP_AGE);
     let tmp = temp_path(path);
-    if let Err(err) = write_stream_then_rename(&tmp, path, volume, journal, records) {
+    if let Err(err) = write_stream_then_rename(&tmp, path, volume, journal, records, cancelled) {
         let _ = fs::remove_file(&tmp);
         return Err(err);
     }
@@ -443,19 +472,66 @@ fn temp_path(path: &Path) -> PathBuf {
     PathBuf::from(tmp_name)
 }
 
+/// shortcut: age-based, a write stalled for more than `STALE_TEMP_AGE` loses its temp file;
+/// upgrade to a pid liveness check if that is ever seen.
+const STALE_TEMP_AGE: Duration = Duration::from_secs(600);
+
+/// Removes `<name>.<pid>.tmp` siblings of `path` older than `max_age`, left by a killed scan.
+/// The current process's own temp file is kept. Best effort: every error is ignored.
+fn sweep_stale_temps(path: &Path, max_age: Duration) {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    let own = temp_path(path);
+    let mut prefix = name.to_os_string();
+    prefix.push(".");
+    let prefix = prefix.to_string_lossy().into_owned();
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let is_pid_temp = file_name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".tmp"))
+            .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()));
+        if entry_path == own || !is_pid_temp {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+        if stale {
+            let _ = fs::remove_file(&entry_path);
+        }
+    }
+}
+
 fn write_stream_then_rename<'a, I>(
     tmp: &Path,
     path: &Path,
     volume: &VolumeStamp,
     journal: &JournalStamp,
     records: I,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<(), CacheError>
 where
     I: ExactSizeIterator<Item = &'a RecordFacts>,
 {
     let file = fs::File::create(tmp)?;
     let mut hashing = HashingWriter::new(BufWriter::new(file));
-    write_index(&mut hashing, volume, journal, records.len() as u64, records)?;
+    write_index(
+        &mut hashing,
+        volume,
+        journal,
+        records.len() as u64,
+        records,
+        cancelled,
+    )?;
     let (mut out, hash) = hashing.finish();
     // The trailer is written past the hasher, so it is not part of its own checksum.
     out.write_all(hash.as_bytes())?;
@@ -471,13 +547,22 @@ where
 /// Reads and decodes the cache at `path`, unless the file is larger than `max_bytes`.
 ///
 /// A stored record never costs less in memory than on disk, so a bigger file cannot fit.
-pub fn read(path: &Path, max_bytes: usize) -> Result<CachedIndex, CacheError> {
+/// `cancelled` is checked before the file is read and then every `CANCEL_CHECK_INTERVAL`
+/// records while decoding; either ends the read with `CacheError::Cancelled`.
+pub fn read(
+    path: &Path,
+    max_bytes: usize,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<CachedIndex, CacheError> {
     let len = fs::metadata(path)?.len();
     if usize::try_from(len).map_or(true, |len| len > max_bytes) {
         return Err(CacheError::TooLarge { len, max_bytes });
     }
+    if cancelled() {
+        return Err(CacheError::Cancelled);
+    }
     let bytes = fs::read(path)?;
-    decode(&bytes)
+    decode_with(&bytes, cancelled)
 }
 
 /// Why a cached index cannot be used, or `None` when it is consistent with the live volume.
@@ -930,7 +1015,7 @@ mod tests {
             "write_atomic must create the missing directory and write the file: {written:?}"
         );
         let tmp_left_behind = temp_path(&path).exists();
-        let read_back = read(&path, usize::MAX);
+        let read_back = read(&path, usize::MAX, &|| false);
         let _ = fs::remove_dir_all(&dir);
 
         assert!(
@@ -956,8 +1041,13 @@ mod tests {
         let index = sample_index();
         let path = cache_path(&dir, index.volume.volume_serial);
 
-        let written =
-            write_atomic_stream(&path, &index.volume, &index.journal, index.records.iter());
+        let written = write_atomic_stream(
+            &path,
+            &index.volume,
+            &index.journal,
+            index.records.iter(),
+            &|| false,
+        );
         let on_disk = fs::read(&path);
         let _ = fs::remove_dir_all(&dir);
 
@@ -1010,7 +1100,7 @@ mod tests {
             reported: index.records.len() + 1,
         };
 
-        let result = write_atomic_stream(&path, &index.volume, &index.journal, records);
+        let result = write_atomic_stream(&path, &index.volume, &index.journal, records, &|| false);
         let target_exists = path.exists();
         let tmp_exists = temp_path(&path).exists();
         let _ = fs::remove_dir_all(&dir);
@@ -1029,6 +1119,82 @@ mod tests {
         assert!(
             !tmp_exists,
             "a failed streamed write must remove its temp file"
+        );
+    }
+
+    #[test]
+    fn write_atomic_stream_should_return_cancelled_and_leave_no_temp_when_flag_set() {
+        let dir = std::env::temp_dir().join(format!(
+            "dedupe-mft-cache-{}-write_atomic_stream_cancel",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let index = sample_index();
+        let path = cache_path(&dir, index.volume.volume_serial);
+        let template = index.records[0].clone();
+        let records = vec![template; CANCEL_CHECK_INTERVAL as usize];
+
+        let result = write_atomic_stream(
+            &path,
+            &index.volume,
+            &index.journal,
+            records.iter(),
+            &|| true,
+        );
+        let target_exists = path.exists();
+        let tmp_exists = temp_path(&path).exists();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(
+            matches!(result, Err(CacheError::Cancelled)),
+            "a set cancel flag must end the write with Cancelled, got {result:?}"
+        );
+        assert!(
+            !target_exists,
+            "a cancelled write must not create the target"
+        );
+        assert!(!tmp_exists, "a cancelled write must remove its temp file");
+    }
+
+    #[test]
+    fn sweep_stale_temps_should_remove_old_temp_and_keep_other_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "dedupe-mft-cache-{}-sweep_stale_temps",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create the scratch directory");
+        let path = dir.join("0000000000000001.cache");
+        let old_tmp = dir.join("0000000000000001.cache.1.tmp");
+        let fresh_tmp = dir.join("0000000000000001.cache.2.tmp");
+        let other = dir.join("other.cache.3.tmp");
+        let not_pid = dir.join("0000000000000001.cache.bak.tmp");
+        for file in [&path, &old_tmp, &fresh_tmp, &other, &not_pid] {
+            fs::write(file, b"x").expect("write a fixture file");
+        }
+        let long_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        for file in [&old_tmp, &other, &not_pid] {
+            fs::File::options()
+                .write(true)
+                .open(file)
+                .and_then(|f| f.set_modified(long_ago))
+                .expect("backdate the fixture file");
+        }
+
+        sweep_stale_temps(&path, STALE_TEMP_AGE);
+        let survivors = [
+            path.exists(),
+            old_tmp.exists(),
+            fresh_tmp.exists(),
+            other.exists(),
+            not_pid.exists(),
+        ];
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            survivors,
+            [true, false, true, true, true],
+            "only the old temp of this cache file may be removed"
         );
     }
 
@@ -1351,7 +1517,7 @@ mod tests {
         let path = cache_path(&dir, index.volume.volume_serial);
         write_atomic(&path, &index).expect("write the fixture");
 
-        let result = read(&path, 8);
+        let result = read(&path, 8, &|| false);
         let _ = fs::remove_dir_all(&dir);
 
         assert!(

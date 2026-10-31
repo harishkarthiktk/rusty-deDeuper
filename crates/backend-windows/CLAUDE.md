@@ -54,12 +54,12 @@ Threads: this crate spawns none. `HandleReader` keeps its volume hints behind an
 - `VolumeTree::push` checks the memory budget (`cfg.mem_budget`). `emit_items` then charges each directory path plus `DIR_NODE_OVERHEAD_BYTES` (64) against what the records leave, the root prefix included. Exceeding either falls back to the walker. `emit_items` returns `EmitError::Budget` before it visits anything, so a fallback never repeats items.
 - Delta limit: `max_touched(n)` = `max(100_000, n / 5)` distinct records. Above it the delta is refused and a full read runs.
 - Cache format: `FORMAT_VERSION` is 2 (`MAGIC` `DDMFTC01`). Bump it for any change to what a stored field means, not only to the layout. Version 2 changed `ctime_ft` from creation time to change time.
-- Cache writes go to `<name>.<pid>.tmp` (so two scans never share a temp file), `sync_all`, then `rename`, which replaces the target on Windows. The temp file is removed on any failure.
+- Cache writes go to `<name>.<pid>.tmp` (so two scans never share a temp file), `sync_all`, then `rename`, which replaces the target on Windows. The temp file is removed on any failure. Before each write, `sweep_stale_temps` removes sibling `<name>.*.tmp` files older than `STALE_TEMP_AGE` (10 minutes), which a killed scan leaves behind. It is age-based and best effort, and it skips this process's own temp file.
 - `records.rs` checks the namespace byte before calling `NtfsFileName::namespace`, which unwraps. Keep the check first.
 - `ntfs` is pinned exactly (`=0.4.0`) because it has no documented whole-MFT iterator. Upgrade on purpose.
 - `dev` is the low 32 bits of the volume serial, the same value the walker reports as `FileMeta.dev`. Both paths must agree.
-- Cancel is polled every 4096 records and items (`CANCEL_CHECK_INTERVAL`), at the start of every USN read round, and every 4096 records in `apply_delta`.
-- `mft_cache::read(path, max_bytes)` checks the file length first and returns `CacheError::TooLarge` over `max_bytes`. That follows the normal cache-discarded notice path.
+- Cancel is polled every 4096 (`CANCEL_CHECK_INTERVAL`) records and items, directories dequeued in `reach_directories`, records decoded in the cache read, and records written in the cache write. It is also checked before the cache file is read, at the start of every USN read round, after `VolumeTree::from_facts` in the refresh, and every 4096 records in `apply_delta`. A cancel in cache read, cache write or `reach_directories` ends as `MftError::Cancelled` (`CacheError::Cancelled`, `EmitError::Cancelled`) and stops the scan with no fallback.
+- `mft_cache::read(path, max_bytes, cancelled)` checks the file length first and returns `CacheError::TooLarge` over `max_bytes`. That follows the normal cache-discarded notice path.
 
 ## Gotchas
 
