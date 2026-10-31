@@ -19,6 +19,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use dedupe_core::cancel::Token;
 use dedupe_core::config::VerifyMode;
 use dedupe_core::storage_profile::ProfileChoice;
+use dedupe_core::CoreError;
 
 #[derive(Parser, Debug)]
 #[command(name = "dedupe", version, about = "Duplicate file finder")]
@@ -419,8 +420,27 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.log_level);
 
-    // First Ctrl-C cancels cooperatively; a second exits at once (safe: the DB survives kill -9,
-    // the lock is released by the OS, and the $MFT cache is written via tmp + rename).
+    // Only scan and report get a handler. Lookup and db keep the OS default, which ends the
+    // process at once (`lookup --insert` is a single transaction, so nothing is left half-done).
+    let result = match cli.cmd {
+        Cmd::Scan(args) => scan::run(args, &install_ctrlc()),
+        Cmd::Report(args) => report::run(args, &install_ctrlc()),
+        Cmd::Lookup(args) => lookup::run(args),
+        Cmd::Db(args) => db::run(args),
+    };
+    match result {
+        // Same text anyhow's main prints, then the conventional SIGINT exit code.
+        Err(err) if is_cancel(&err) => {
+            eprintln!("Error: {err:?}");
+            std::process::exit(130);
+        }
+        other => other,
+    }
+}
+
+/// First Ctrl-C cancels cooperatively; a second exits at once (safe: the DB survives kill -9,
+/// the lock is released by the OS, and the $MFT cache is written via tmp + rename).
+fn install_ctrlc() -> Token {
     let token = Token::new();
     {
         let token = token.clone();
@@ -432,13 +452,12 @@ fn main() -> anyhow::Result<()> {
             eprintln!("\ncancelling; press Ctrl-C again to quit immediately");
         });
     }
+    token
+}
 
-    match cli.cmd {
-        Cmd::Scan(args) => scan::run(args, &token),
-        Cmd::Report(args) => report::run(args, &token),
-        Cmd::Lookup(args) => lookup::run(args),
-        Cmd::Db(args) => db::run(args),
-    }
+/// True when the error chain holds `CoreError::Cancelled` (anyhow downcasts through `.context()`).
+fn is_cancel(err: &anyhow::Error) -> bool {
+    matches!(err.downcast_ref::<CoreError>(), Some(CoreError::Cancelled))
 }
 
 fn init_tracing(level: LogLevel) {

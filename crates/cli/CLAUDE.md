@@ -26,10 +26,12 @@ logic does not belong here. See the root CLAUDE.md for layering and cross-crate 
 - `src/size.rs`: parsers for byte-size flags (`parse_size`, `parse_size_i64`, `parse_buf_size`).
 
 ## How it works
-1. `main` parses args and sends tracing to stderr. It installs the Ctrl-C handler: the first press
-   cancels the `Token` and prints a notice; the second press exits with code 130. A failed handler
-   install is ignored.
-2. `scan` and `report` receive the token. `lookup` and `db` take none, so Ctrl-C cannot stop them.
+1. `main` parses args and sends tracing to stderr. Only `scan` and `report` get a Ctrl-C handler
+   (`install_ctrlc`): the first press cancels the `Token` and prints a notice; the second press
+   exits with code 130. A failed handler install is ignored.
+2. `scan` and `report` receive the token. A clean cancel (`CoreError::Cancelled` in the error
+   chain, see `is_cancel`) prints the error and exits 130. `lookup` and `db` take no token and
+   have no handler, so Ctrl-C ends them at once (`lookup --insert` is one transaction).
 3. `scan::run`:
    1. Format: `--json` wins; `auto` prints human text only when stdout is a terminal.
    2. DB target: `--no-db` gives none, `--db` gives that path, otherwise `scan_default_db` gives
