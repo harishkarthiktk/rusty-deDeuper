@@ -39,6 +39,7 @@ cargo run -p dedupe -- scan <root>            # persists to <root>/.dedupe.db
 cargo run -p dedupe -- scan --no-db <root>    # naive pipeline, no DB
 cargo run -p dedupe -- report                 # finds the DB in --dir (default cwd)
 cargo run -p dedupe -- lookup <file>
+cargo run -p dedupe -- unmask <plan.json>    # masked plan to real paths (needs the .dedupe.mask.db vault)
 cargo run -p dedupe -- db info
 
 # Tests (run only when the user asks; see Working conventions)
@@ -90,6 +91,7 @@ Run the two Commands lines marked "Windows cross-check" after any edit that touc
 
 ## Cross-crate gotchas
 
+- Output of `scan`, `report` and `lookup` is masked by default (words become `W<n>`, media extensions `E<n>`; `--unmasked` for real paths). The sidecar vault `.dedupe.mask.db` (tables `exports`, `tokens`, `ext_tokens`) sits next to the DB, maps tokens back to names and is a secret. It is separate from the DB and not part of schema v2. Core owns the masking and `unmask` logic (`crates/core/src/mask.rs`); the CLI owns the vault location and permissions.
 - `FileMeta.dev` (Unix `st_dev`, Windows low 32 bits of the volume serial) is runtime only. With `--cross-mounts`, `pass_enumerate::DevScope` namespaces the `file_id` of files on another device as `blake3(foreign uuid)[..8] || id`. The Windows walker, `ContentReader::metadata` (through `meta::file_meta_at`) and the `$MFT` path (`tree.rs` `file_meta_for`) all set `dev` on Windows when the handle open succeeds. Volumes whose serials match in the low 32 bits can still merge ids in `scan --no-db` (T4.2 full 64-bit id is open).
 - File identity on Windows: the walker opens each regular file once (`dedupe_win_sys::file_info`) and takes `file_id`, `nlink`, size, times and attributes from that open. NTFS ids are 8 bytes and are meant to equal the `$MFT` file references, but this is unverified on hardware, so assume switching between walker and `$MFT` re-hashes files. ReFS 128-bit ids are stored as 16 bytes (not truncated) and are never opened by id. Unix reads the inode directly.
 - Schema version is 2 and there are no migrations: an older DB fails with a "delete it and scan again" error.

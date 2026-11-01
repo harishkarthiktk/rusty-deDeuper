@@ -199,6 +199,25 @@ In JSON, each member has a `path` string. When the real path is not valid UTF-8,
 
 Log verbosity is a global option: `dedupe --log-level debug scan ~/Pictures`. Levels: `error`, `warn`, `info` (default), `debug`, `trace`.
 
+## Masked output for LLMs
+
+`scan`, `report` and `lookup` mask paths by default, so you can paste a report into an LLM without sending your file names. Each word of a path becomes a token, and media extensions are masked too:
+
+```
+/home/W1/Pictures/W2 W3/W4.E1      (was /home/ana/Pictures/Beach Trip/IMG0042.jpg)
+```
+
+Folders such as `home`, `Users`, `Documents`, `node_modules` and `.git`, common extensions (`.pdf`, `.py`, `.zip`), and words such as `copy`, `backup`, `final` or `v2` stay readable. Masked JSON has no `full_hash`, and carries a top-level `mask_export` id. Human output starts with `# mask export <id>`.
+
+- `--unmasked` prints real paths. Use it for your own scripts, such as `dedupe report --unmasked`.
+- The token maps are stored in a vault, `.dedupe.mask.db`, next to the database. A `scan --no-db` vault goes under the scan root, and its plans cannot be unmasked.
+- `dedupe unmask <plan.json>` (or stdin) turns a masked plan back into real paths. It needs the export id, from `--export N` or the plan's top-level `mask_export`, and fails on unknown tokens, a different database, or a path that is not in a current duplicate group. Its output has no `mask_export`.
+- `dedupe unmask --ext-map [--export N] [--json]` lists what each `E<n>` stands for.
+
+Flow: `dedupe report` (masked), then the LLM, then a plan that echoes `mask_export`, then `dedupe unmask`, then `agent/execute_plan.py`.
+
+What still leaks: folder depth, the readable folders listed above, file sizes, readable extensions, and how often each word appears within one export. Names are replaced, not encrypted: never share `.dedupe.mask.db`, because it maps every token back to the real name.
+
 ## Typical workflow
 
 ```bash

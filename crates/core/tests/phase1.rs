@@ -342,7 +342,7 @@ fn scan(
 
 fn report_json(db: &Path) -> String {
     let conn = Db::open_readonly(db).unwrap().conn;
-    Report::from_db(&conn, 0).unwrap().to_json()
+    Report::from_db(&conn, 0).unwrap().to_json(None)
 }
 
 // ---------------------------------------------------------------------------

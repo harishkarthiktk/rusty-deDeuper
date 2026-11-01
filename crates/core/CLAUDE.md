@@ -15,7 +15,9 @@ workspace layering and cross-crate rules are in the root CLAUDE.md.
   (`ErrorKind`, `SkipReason`, `FsType`, `UuidKind`), `now_unix_ns`.
 - `src/config.rs`: `Config`, every tunable in one struct. `VerifyMode`. `prefix_total()` is F + L.
 - `src/error.rs`: `CoreError`, the single error type (`thiserror`).
-- `src/path.rs`: `RawPath`, lossless path bytes, with display and terminal escaping.
+- `src/path.rs`: `RawPath`, lossless path bytes, with display and terminal escaping. `render(mask)` gives the
+  masked string or the terminal-safe form. `json_fields(obj, mask)` writes `path` (and `path_bytes` when the
+  bytes are not UTF-8) unmasked, and only the masked `path` when `mask` is `Some`.
 - `src/time.rs`: FILETIME and `SystemTime` to signed nanoseconds since the Unix epoch.
 - `src/hash.rs`: `HASH_ALGO` (`blake3-128`), `hash_prefix_target`, `hash_full_target`, `read_full`.
 - `src/identity.rs`: `run_key` (naive hardlink key), `volume_tag`, `namespaced_file_id` (`--cross-mounts`).
@@ -24,7 +26,11 @@ workspace layering and cross-crate rules are in the root CLAUDE.md.
 - `src/progress.rs`: `Sink` trait, `SharedSink`, `PhaseProgress`, `emit_*` helpers.
 - `src/storage_profile.rs`: `Profile`, `StorageKind`, `ProfileChoice`, `resolve()`.
 - `src/scheduler.rs`: `Scheduler`, which orders rows by first extent on HDD and leaves them alone on SSD.
-- `src/report.rs`: `Report`, `Group`, `Member`, `ReportEvent`, JSON and human rendering.
+- `src/report.rs`: `Report`, `Group`, `Member`, `ReportEvent`, JSON and human rendering, each with an optional
+  `Masker` (see Masked output).
+- `src/mask.rs`: `Masker` (per-export word and extension token maps), the vault schema (`exports`, `tokens`,
+  `ext_tokens`), `ALLOW`, `ALLOW_PREFIX`, `EXT_ALLOW`, `MEDIA_EXT`, `WORD_ALLOW`, and the reverse side: `unmask`,
+  `check_db_uuid`, `ext_map`. The vault is a separate SQLite file, not part of schema v2.
 - `src/lookup.rs`: `lookup` and `lookup_report`, matching one query file against indexed rows.
 - `src/db/mod.rs`: `Db::open` (read-write), `Db::open_readonly`, pragma policy.
 - `src/db/schema.rs` and `src/db/schema/v2.sql`: schema, `user_version` check, no migrations.
@@ -134,6 +140,31 @@ Transitions are forward only within a run. Two things to know:
 - Lookup considers every live row not in -1 or -2. Its freshness check (`is_fresh`) compares size,
   mtime, ctime and file id.
 
+## Masked output
+- `Masker::begin(vault, db_uuid)` opens or creates the vault (WAL, 5 s busy timeout), inserts an `exports` row
+  and returns the masker plus the vault `Connection`. Tokens are per export: each distinct word gets `W<n>`
+  and each media extension `E<n>`, counted from 1.
+- `Masker::mask(&RawPath)` keeps the root marker (`X:`, `\\`, `\\?\`, `\\?\UNC\`), splits on the path's own
+  separator and masks each segment. Allowlisted segments (`ALLOW`) stay readable whole. An `ALLOW_PREFIX`
+  (`cmake-`, `.venv`) keeps only the prefix readable and word-masks the rest, so `cmake-AcmeClient` becomes
+  `cmake-W<n>W<n>`. A final `.ext` in `EXT_ALLOW` stays readable, and a `MEDIA_EXT` suffix becomes `.E<n>`. Other segments split at
+  ASCII non-alphanumerics (kept verbatim) and at lower-to-upper camelCase. Each word is readable only if it is
+  in `WORD_ALLOW`, 1-4 digits, or `v` plus 1-3 digits; otherwise `W<n>`. The result is always valid UTF-8.
+- Masked `Report::to_json(Some(m))` has no `full_hash`, only a masked `path` per member (never `path_bytes`),
+  members sorted by masked string (`masked_members`), and a top-level `mask_export`. `to_human` starts with
+  `# mask export <id>` and drops the hash from each group line.
+- `Report::stream_human` takes `Option<(&mut Masker, &mut Connection)>`. When masked, each group is rendered
+  into a buffer, the new tokens are flushed to the vault, and only then is the group written to `out`.
+- `unmask(input, export_id, vault, in_dup_group)` is JSON only. It rebuilds every string that starts with a root
+  marker, with or without `W<n>`/`E<n>` tokens, and scope-checks each one through `in_dup_group`, so a token-free
+  real path is refused unless it is in a duplicate group. Other values are copied as is. It errors, listing all
+  offenders, on unknown tokens, on rebuilt paths for which `in_dup_group` is false, and on non-UTF-8 paths outside a `path` key. Under
+  a `path` key a non-UTF-8 result becomes a lossy `path` plus a `path_bytes` hex sibling. `check_db_uuid` is a
+  separate call so callers without a DB can skip it.
+- `queries::file_in_dup_group(conn, path)`: true when the path is an indexed file and another row shares its
+  `full_hash`. It resolves the folder chain through each volume's stored mount, as `lookup` does. It is the
+  guard that stops a spliced path from passing unmask.
+
 ## Progress and cancellation
 - `progress.rs`: a pass calls `phase_started`, then `advance` (the sum of advances equals `total`), then
   `phase_finished`. Emit helpers ignore a poisoned lock. Core never prints. It logs through `tracing`.
@@ -164,12 +195,18 @@ Transitions are forward only within a run. Two things to know:
 - One schema version (`EXPECTED_VERSION`, currently 2). Any other version is refused, with no migration.
   `open_readonly` also checks it.
 - Errors are `CoreError` values through `Result`. Use `tracing` for logs.
+- Scan invariant for masking: readable output text must never contain `[WE][0-9]`, or `unmask` could not find
+  tokens by scanning. `allowed_exact` rejects an allowlisted segment that holds one, `allowed_prefix_len` only
+  keeps the prefix of an `ALLOW_PREFIX` match readable, and `readable_word`
+  admits only digits and `v<digits>`, never a `W` or `E` followed by a digit.
+- Flush before output: `Masker::flush` must run before any masked text is written, so every token that
+  reaches a reader is already in the vault. `stream_human` does this per group.
 
 ## Gotchas
 - Only one process may write a database. `scan` and `lookup --insert` hold `db/lock.rs` (a `<db>.lock`
   sidecar, `File::try_lock`, so `rust-version` is 1.89). Read-only commands take no lock. If the
   filesystem reports file locking as unsupported (likely on WSL `/mnt/c`), `acquire_with` errors unless
-  `--no-lock` is passed. The scan skips `-wal`, `-shm` and `.lock` siblings of its own DB.
+  `--no-lock` is passed. The scan skips `-wal`, `-shm` and `.lock` siblings of its own DB, and the mask vault (`VAULT_NAME`, with `-wal` and `-shm`) in the DB folder.
 - Enumeration ids are claimed per run in `pass_enumerate` (`Claim::Path` and `Claim::Move`). Folders
   resolve through an in-run overlay before the read snapshot. Do not look folders or files up on
   `ctx.read` alone.
@@ -189,6 +226,9 @@ Transitions are forward only within a run. Two things to know:
   never registered, so `pass_enumerate` drops every file under it, including on the `$MFT` path, which
   cannot prune.
 - Schema version 2 has no migrations. An older DB fails with "delete it and scan again".
+- The vault (`.dedupe.mask.db`) is a secret: it holds the real word and extension bytes behind every token. Core
+  never decides its location or permissions (the CLI does). Masking hides names, not sizes, depth, allowlisted
+  folders, readable extensions or word frequency within one export.
 - `Services::hasher` is set by callers but never read in core. Hashing calls `hash::hash_bytes` and BLAKE3
   directly. `naive.rs` ignores its `hasher` argument as well.
 - `Config::mem_budget` is not read by any pass.
@@ -211,6 +251,9 @@ DEDUPE_SCALE_N=1000000 cargo test -p dedupe-core --test scale -- --ignored
 ## Tests
 - Unit tests sit in `#[cfg(test)]` modules inside `src/` (for example `model.rs`, `hash.rs`,
   `db/writer.rs`, `db/schema.rs`, `scheduler.rs`, `storage_profile.rs`, `traits.rs`).
+- `src/mask.rs` `#[cfg(test)]` module: byte-exact round trip (with `simplify_verbatim` as the expected bytes),
+  token lookalikes, name hiding (`ALLOW_PREFIX` leak), unknown and foreign-export tokens, the scope gate for
+  token-free paths, the DB uuid check, and non-UTF-8 and free-text handling.
 - `tests/phase1.rs`: resume at every batch boundary, lookup (including insert), rescan, move detection,
   the volume-UUID and hash-config guards, an abandoned run, root-scoped rescan, non-UTF-8 round trip.
 - `tests/pool.rs`: `queue_depth` 4 gives the same results as 1.

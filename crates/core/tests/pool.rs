@@ -277,7 +277,7 @@ fn scan_run(db: &Path, root: &Path, cfg: &Config) -> Result<i64> {
 
 fn report_json(db: &Path) -> std::result::Result<String, Box<dyn Error>> {
     let conn = Db::open_readonly(db)?.conn;
-    Ok(Report::from_db(&conn, 0)?.to_json())
+    Ok(Report::from_db(&conn, 0)?.to_json(None))
 }
 
 /// `(state, full_hash)` for every `files` row, sorted. Names and ids are left out

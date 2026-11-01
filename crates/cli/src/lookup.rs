@@ -7,6 +7,7 @@ use dedupe_backend_generic::{GenericBackend, GenericStorageProbe};
 use dedupe_core::config::Config;
 use dedupe_core::db::Db;
 use dedupe_core::lookup::{lookup_report, Freshness, InsertStatus, LookupOutcome, LookupReport};
+use dedupe_core::mask::Masker;
 use dedupe_core::storage_profile::{self, ProfileChoice};
 use dedupe_core::traits::StorageProbe;
 use serde_json::json;
@@ -72,13 +73,22 @@ pub fn run(args: LookupArgs) -> Result<()> {
     )
     .context("lookup failed")?;
 
-    match format {
-        Resolved::Json => println!("{}", to_json(&report)?),
-        Resolved::Human => {
-            print!("{}", to_human(&report.outcome));
-            if let Some(note) = insert_note(report.insert) {
-                eprintln!("note: {note}");
-            }
+    let mut masking = crate::mask::masker_for(&db, args.unmasked)?;
+    let text = {
+        let masker = masking.as_mut().map(|(m, _)| m);
+        match format {
+            Resolved::Json => format!("{}\n", to_json(&report, masker)?),
+            Resolved::Human => to_human(&report.outcome, masker),
+        }
+    };
+    // Flush first: tokens must never reach stdout unless they are in the vault.
+    if let Some((m, v)) = masking.as_mut() {
+        m.flush(v).context("write mask vault")?;
+    }
+    print!("{text}");
+    if format == Resolved::Human {
+        if let Some(note) = insert_note(report.insert) {
+            eprintln!("note: {note}");
         }
     }
     Ok(())
@@ -113,7 +123,7 @@ fn insert_note(s: InsertStatus) -> Option<&'static str> {
     }
 }
 
-fn to_json(report: &LookupReport) -> Result<String> {
+fn to_json(report: &LookupReport, mut mask: Option<&mut Masker>) -> Result<String> {
     let mut doc = match &report.outcome {
         LookupOutcome::Skipped(reason) => {
             json!({ "outcome": "skipped", "reason": reason.to_string() })
@@ -124,32 +134,40 @@ fn to_json(report: &LookupReport) -> Result<String> {
             "matches": rows.iter().map(|m| {
                 let mut o = serde_json::Map::new();
                 o.insert("volume_id".into(), m.volume_id.into());
-                m.path.json_fields(&mut o);
+                m.path.json_fields(&mut o, mask.as_deref_mut());
                 o.insert("freshness".into(), freshness_str(m.freshness).into());
                 serde_json::Value::Object(o)
             }).collect::<Vec<_>>(),
         }),
     };
+    if let Some(m) = mask.as_deref() {
+        doc["mask_export"] = json!(m.export_id());
+    }
     if report.insert != InsertStatus::NotRequested {
         doc["insert"] = json!(insert_str(report.insert));
     }
     serde_json::to_string_pretty(&doc).context("serialize lookup result")
 }
 
-fn to_human(outcome: &LookupOutcome) -> String {
-    match outcome {
-        LookupOutcome::Skipped(reason) => format!("skipped: {reason}\n"),
-        LookupOutcome::NoMatch => "no match\n".to_string(),
-        LookupOutcome::Matches(rows) => {
-            let mut out = format!("{} match(es)\n", rows.len());
-            for m in rows {
-                out.push_str(&format!(
-                    "    [{}] {}\n",
-                    freshness_str(m.freshness),
-                    m.path.to_terminal()
-                ));
+fn to_human(outcome: &LookupOutcome, mut mask: Option<&mut Masker>) -> String {
+    let header = mask
+        .as_deref()
+        .map(|m| format!("# mask export {}\n", m.export_id()))
+        .unwrap_or_default();
+    header
+        + &match outcome {
+            LookupOutcome::Skipped(reason) => format!("skipped: {reason}\n"),
+            LookupOutcome::NoMatch => "no match\n".to_string(),
+            LookupOutcome::Matches(rows) => {
+                let mut out = format!("{} match(es)\n", rows.len());
+                for m in rows {
+                    out.push_str(&format!(
+                        "    [{}] {}\n",
+                        freshness_str(m.freshness),
+                        m.path.render(mask.as_deref_mut())
+                    ));
+                }
+                out
             }
-            out
         }
-    }
 }

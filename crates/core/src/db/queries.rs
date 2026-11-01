@@ -7,7 +7,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::error::Result;
 use crate::model::{now_unix_ns, FileEntry, FolderRow, Hash, Phase, State};
-use crate::path::{separator_for, RawPath};
+use crate::path::{separator_for, strip_mount, RawPath};
 use crate::traits::VolumeInfo;
 
 const FILE_COLS: &str = "id,volume_id,folder_id,name,file_id,nlink,size,mtime_ns,ctime_ns,\
@@ -251,6 +251,34 @@ pub fn find_by_path(
             row_to_file,
         )
         .optional()?)
+}
+
+/// True when `path` is an indexed file and another row shares its `full_hash`.
+/// Resolves the folder chain through each volume's stored mount, as `lookup` does.
+pub fn file_in_dup_group(conn: &Connection, path: &RawPath) -> Result<bool> {
+    let Some(parent) = path.parent() else {
+        return Ok(false);
+    };
+    let name = RawPath::new(path.component());
+    for v in list_volumes(conn)? {
+        let Some(rel) = strip_mount(parent.as_bytes(), v.mount.as_bytes()) else {
+            continue;
+        };
+        let Some(folder) = crate::lookup::find_folder_by_rel(conn, v.id, v.mount.as_bytes(), rel)?
+        else {
+            continue;
+        };
+        let Some(f) = find_by_path(conn, v.id, folder, &name)? else {
+            continue;
+        };
+        return Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM files a JOIN files b \
+             ON b.full_hash = a.full_hash AND b.id <> a.id WHERE a.id = ?1)",
+            [f.id],
+            |r| r.get(0),
+        )?);
+    }
+    Ok(false)
 }
 
 /// A row with this `(volume_id, file_id)` that has **not** been seen this run.

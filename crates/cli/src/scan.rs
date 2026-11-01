@@ -12,12 +12,14 @@ use dedupe_core::config::Config;
 use dedupe_core::db::queries;
 use dedupe_core::exclude::ExcludeSet;
 use dedupe_core::hash::Blake3Hasher;
+use dedupe_core::mask::Masker;
 use dedupe_core::pipeline::scan::{run_scan, ScanOptions};
 use dedupe_core::pipeline::{scan_naive, Services};
 use dedupe_core::progress::SharedSink;
 use dedupe_core::report::Report;
 use dedupe_core::storage_profile::{self, Profile, StorageKind};
 use dedupe_core::traits::StorageProbe;
+use rusqlite::Connection;
 
 use crate::platform::{self, ScanExtras};
 use crate::progress::{should_draw, BarSink};
@@ -202,7 +204,10 @@ pub fn run(args: ScanArgs, cancel: &Token) -> Result<()> {
             cancel,
         )
         .context("scan failed")
-        .map(|(report, _stats)| emit(&report, format)),
+        .and_then(|(report, _stats)| {
+            let masking = crate::mask::masker_no_db(&args.roots[0], args.unmasked)?;
+            emit(&report, format, masking)
+        }),
         Some(db) => {
             if args.no_lock {
                 eprintln!("note: running without a database lock (--no-lock)");
@@ -227,7 +232,8 @@ pub fn run(args: ScanArgs, cancel: &Token) -> Result<()> {
                     let dbh =
                         dedupe_core::db::Db::open_readonly(db).context("open db for report")?;
                     let report = Report::from_db(&dbh.conn, 0).context("build report")?;
-                    emit(&report, format);
+                    let masking = crate::mask::masker_for(db, args.unmasked)?;
+                    emit(&report, format, masking)?;
                     eprintln!("scan run {run_id} finished (enumerator: {enumerator})");
                     Ok(())
                 })
@@ -242,11 +248,22 @@ pub fn run(args: ScanArgs, cancel: &Token) -> Result<()> {
     outcome
 }
 
-fn emit(report: &Report, format: Resolved) {
-    match format {
-        Resolved::Json => println!("{}", report.to_json()),
-        Resolved::Human => print!("{}", report.to_human()),
+fn emit(
+    report: &Report,
+    format: Resolved,
+    mut masking: Option<(Masker, Connection)>,
+) -> Result<()> {
+    let m = masking.as_mut().map(|(m, _)| m);
+    let text = match format {
+        Resolved::Json => format!("{}\n", report.to_json(m)),
+        Resolved::Human => report.to_human(m),
+    };
+    // Flush first: tokens must never reach stdout unless they are in the vault.
+    if let Some((m, v)) = masking.as_mut() {
+        m.flush(v).context("write mask vault")?;
     }
+    print!("{text}");
+    Ok(())
 }
 
 /// Canonical form of each `--exclude-dir`. Fails when a path is missing or covers a scan root.

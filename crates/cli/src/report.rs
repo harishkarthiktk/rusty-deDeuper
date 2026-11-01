@@ -18,8 +18,8 @@ pub fn run(args: ReportArgs, cancel: &Token) -> Result<()> {
         args.json,
         args.output.is_none() && std::io::stdout().is_terminal(),
     );
-    let db = crate::resolve_existing_db(args.db, args.dir)?;
-    let db = Db::open_readonly(&db).context("open database (read-only)")?;
+    let db_path = crate::resolve_existing_db(args.db, args.dir)?;
+    let db = Db::open_readonly(&db_path).context("open database (read-only)")?;
     if let Some(run) = dedupe_core::report::unfinished_newer_run(&db.conn)? {
         eprintln!(
             "note: scan run {run} did not finish; files it touched are missing from this report \
@@ -44,17 +44,29 @@ pub fn run(args: ReportArgs, cancel: &Token) -> Result<()> {
         )),
         None => Box::new(BufWriter::new(std::io::stdout().lock())),
     };
+    let mut masking = crate::mask::masker_for(&db_path, args.unmasked)?;
     match format {
         Resolved::Json => {
             let report = Report::from_db_with(&db.conn, args.min_wasted, cancel, &mut on)
                 .context("build report")?;
-            writeln!(out, "{}", report.to_json()).context("write report")?;
+            let text = report.to_json(masking.as_mut().map(|(m, _)| m));
+            // Flush first: tokens must never reach the output unless they are in the vault.
+            if let Some((m, v)) = masking.as_mut() {
+                m.flush(v).context("write mask vault")?;
+            }
+            writeln!(out, "{text}").context("write report")?;
             out.flush().context("write report")?;
         }
         Resolved::Human => {
             // Groups stream out as they are built; the bar stays on stderr.
-            let streamed =
-                Report::stream_human(&db.conn, args.min_wasted, cancel, &mut on, &mut out);
+            let streamed = Report::stream_human(
+                &db.conn,
+                args.min_wasted,
+                cancel,
+                &mut on,
+                &mut out,
+                masking.as_mut().map(|(m, v)| (m, v)),
+            );
             if let Err(CoreError::Cancelled) = streamed {
                 // The header is already written, so flush it and mark the output as partial.
                 let _ = out.flush();

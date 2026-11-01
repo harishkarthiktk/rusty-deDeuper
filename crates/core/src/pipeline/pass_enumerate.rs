@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use crate::db::queries;
 use crate::db::writer::Batch;
 use crate::error::Result;
+use crate::mask::VAULT_NAME;
 use crate::model::{attrs, now_unix_ns, ErrRow, FileEntry, FolderRow, State};
 use crate::path::RawPath;
 use crate::progress::{emit_advance, emit_finished, emit_started, PhaseProgress};
@@ -34,6 +35,16 @@ pub fn run(ctx: &Ctx, v: &VolumeScan) -> Result<Vec<i64>> {
             os.push(suf);
             let sibling = PathBuf::from(os);
             s.insert(std::path::absolute(&sibling).unwrap_or(sibling));
+        }
+        // The mask vault sits next to the DB and holds real names; never index it.
+        let dir = db.parent().unwrap_or_else(|| std::path::Path::new("."));
+        for name in [
+            VAULT_NAME,
+            &format!("{VAULT_NAME}-wal"),
+            &format!("{VAULT_NAME}-shm"),
+        ] {
+            let v = dir.join(name);
+            s.insert(std::path::absolute(&v).unwrap_or(v));
         }
         s
     });

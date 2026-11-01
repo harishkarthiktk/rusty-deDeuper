@@ -12,6 +12,7 @@ pub mod exclude;
 pub mod hash;
 pub mod identity;
 pub mod lookup;
+pub mod mask;
 pub mod model;
 pub mod path;
 pub mod pipeline;

@@ -7,6 +7,8 @@ use std::borrow::Cow;
 
 use unicode_normalization::UnicodeNormalization;
 
+use crate::mask::Masker;
+
 /// Raw, lossless path bytes. Linux: native bytes. Windows: WTF-8. macOS: bytes as
 /// returned by the OS. Never normalized on write.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -48,9 +50,28 @@ impl RawPath {
         escape_terminal(simplify_verbatim(&self.0))
     }
 
+    /// Masked string when `mask` is `Some`, else the terminal-safe form.
+    pub fn render(&self, mask: Option<&mut Masker>) -> Cow<'_, str> {
+        match mask {
+            // Delimiters pass through masking verbatim, so control bytes still need escaping.
+            Some(m) => Cow::Owned(escape_terminal(m.mask(self).as_bytes()).into_owned()),
+            None => self.to_terminal(),
+        }
+    }
+
     /// JSON fields for this path: exact `path`, plus `path_bytes` (lowercase hex of the
     /// raw bytes) only when the bytes are not valid UTF-8 and `path` is therefore lossy.
-    pub fn json_fields(&self, obj: &mut serde_json::Map<String, serde_json::Value>) {
+    ///
+    /// When `mask` is `Some`, only the masked `path` is written (never `path_bytes`).
+    pub fn json_fields(
+        &self,
+        obj: &mut serde_json::Map<String, serde_json::Value>,
+        mask: Option<&mut Masker>,
+    ) {
+        if let Some(m) = mask {
+            obj.insert("path".into(), m.mask(self).into());
+            return;
+        }
         let bytes = simplify_verbatim(&self.0);
         match std::str::from_utf8(bytes) {
             Ok(s) => {
@@ -169,7 +190,7 @@ pub(crate) fn escape_terminal(bytes: &[u8]) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-fn to_hex(bytes: &[u8]) -> String {
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     bytes
         .iter()

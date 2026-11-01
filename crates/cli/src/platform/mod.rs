@@ -35,6 +35,19 @@ pub struct Backend {
     pub extras: Extras,
 }
 
+/// Owner-only permissions for a secret file (the mask vault). No-op outside Unix, where
+/// the file inherits the folder's ACL.
+#[cfg(unix)]
+pub fn restrict_perms(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+pub fn restrict_perms(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Overlapped read slots for a profile. SSD gets 4, so several reads are in flight per file.
 /// HDD and unknown storage get 1: parallel reads make a seek-bound disk jump between files,
 /// which is the cost the HDD policy exists to avoid.

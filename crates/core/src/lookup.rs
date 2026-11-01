@@ -409,7 +409,7 @@ fn resolve_query_key(
 }
 
 /// Walks the folder rows below the volume root along the mount-stripped bytes `rel`.
-fn find_folder_by_rel(
+pub(crate) fn find_folder_by_rel(
     conn: &Connection,
     volume_id: i64,
     mount: &[u8],

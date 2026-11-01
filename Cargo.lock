@@ -320,6 +320,7 @@ dependencies = [
  "dedupe-core",
  "indicatif",
  "predicates",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "tracing",

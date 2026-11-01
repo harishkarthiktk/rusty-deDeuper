@@ -6,11 +6,13 @@
 mod db;
 mod discover;
 mod lookup;
+mod mask;
 mod platform;
 mod progress;
 mod report;
 mod scan;
 mod size;
+mod unmask;
 
 use std::path::{Path, PathBuf};
 
@@ -78,6 +80,8 @@ enum Cmd {
     Report(ReportArgs),
     /// Check whether a file duplicates anything already indexed.
     Lookup(LookupArgs),
+    /// Replace mask tokens in a masked plan with the real paths.
+    Unmask(UnmaskArgs),
     /// Database maintenance.
     Db(DbArgs),
 }
@@ -96,6 +100,10 @@ pub struct ScanArgs {
     /// Do not persist any state; print the report only.
     #[arg(long, conflicts_with_all = ["db", "resume"])]
     pub no_db: bool,
+
+    /// Print real paths instead of masked tokens. Masked is the default.
+    #[arg(long)]
+    pub unmasked: bool,
 
     /// Resume the latest interrupted run (uses the default DB when --db is omitted).
     #[arg(long, conflicts_with = "no_db")]
@@ -264,6 +272,10 @@ pub struct ReportArgs {
     #[arg(long, conflicts_with = "format")]
     pub json: bool,
 
+    /// Print real paths instead of masked tokens. Masked is the default.
+    #[arg(long)]
+    pub unmasked: bool,
+
     /// Hide groups whose logical waste is below this size (bytes, or e.g. 10MB, 1.5GiB).
     #[arg(long, default_value_t = 0, value_parser = size::parse_size_i64)]
     pub min_wasted: i64,
@@ -299,6 +311,10 @@ pub struct LookupArgs {
     #[arg(long, conflicts_with = "format")]
     pub json: bool,
 
+    /// Print real paths instead of masked tokens. Masked is the default.
+    #[arg(long)]
+    pub unmasked: bool,
+
     /// Persist on-demand hashes and, if applicable, the query row.
     #[arg(long)]
     pub insert: bool,
@@ -306,6 +322,29 @@ pub struct LookupArgs {
     /// Run without the database lock when the filesystem does not support locking (with --insert).
     #[arg(long)]
     pub no_lock: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct UnmaskArgs {
+    /// Folder holding the database (and its mask vault); a file path is used as the database.
+    /// Defaults to the current directory.
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+
+    /// Export id of the masked output. Defaults to the input's top-level `mask_export`.
+    #[arg(long)]
+    pub export: Option<i64>,
+
+    /// Print the `E<n> -> ext` map of an export (the latest without --export) instead of unmasking.
+    #[arg(long)]
+    pub ext_map: bool,
+
+    /// With --ext-map, print JSON.
+    #[arg(long, requires = "ext_map")]
+    pub json: bool,
+
+    /// Masked JSON input. `-` or omitted reads stdin.
+    pub file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -431,6 +470,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Scan(args) => scan::run(args, &install_ctrlc()),
         Cmd::Report(args) => report::run(args, &install_ctrlc()),
         Cmd::Lookup(args) => lookup::run(args),
+        Cmd::Unmask(args) => unmask::run(args),
         Cmd::Db(args) => db::run(args),
     };
     match result {

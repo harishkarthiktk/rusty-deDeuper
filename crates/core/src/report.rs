@@ -9,8 +9,9 @@ use serde_json::json;
 use crate::cancel::Token;
 use crate::db::queries;
 use crate::error::{CoreError, Result};
+use crate::mask::Masker;
 use crate::model::Hash;
-use crate::path::RawPath;
+use crate::path::{escape_terminal, RawPath};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Member {
@@ -70,27 +71,41 @@ impl Report {
         });
     }
 
-    pub fn to_json(&self) -> String {
+    /// With `mask` set: no `full_hash`, masked `path` only, members sorted by masked
+    /// string, and a top-level `mask_export`. The caller flushes the vault afterwards but
+    /// before writing the returned string.
+    pub fn to_json(&self, mut mask: Option<&mut Masker>) -> String {
         let groups: Vec<_> = self
             .groups
             .iter()
             .map(|g| {
-                json!({
-                    "full_hash": g.full_hash.to_hex(),
-                    "size": g.size,
-                    "member_count": g.members.len(),
-                    "distinct_inodes": g.distinct_inodes,
-                    "wasted_logical": g.wasted_logical,
-                    "members": g.members.iter().map(|m| {
+                let mut o = serde_json::Map::new();
+                if mask.is_none() {
+                    o.insert("full_hash".into(), g.full_hash.to_hex().into());
+                }
+                o.insert("size".into(), g.size.into());
+                o.insert("member_count".into(), g.members.len().into());
+                o.insert("distinct_inodes".into(), g.distinct_inodes.into());
+                o.insert("wasted_logical".into(), g.wasted_logical.into());
+                let members: Vec<_> = masked_members(g, mask.as_deref_mut())
+                    .into_iter()
+                    .map(|(m, masked)| {
                         let mut o = serde_json::Map::new();
                         o.insert("volume_id".into(), m.volume_id.into());
-                        m.path.json_fields(&mut o);
+                        match masked {
+                            Some(s) => {
+                                o.insert("path".into(), s.into());
+                            }
+                            None => m.path.json_fields(&mut o, None),
+                        }
                         serde_json::Value::Object(o)
-                    }).collect::<Vec<_>>(),
-                })
+                    })
+                    .collect();
+                o.insert("members".into(), members.into());
+                serde_json::Value::Object(o)
             })
             .collect();
-        let doc = json!({
+        let mut doc = json!({
             "group_count": self.groups.len(),
             "wasted_logical_total": self.total_wasted(),
             "files_enumerated": self.files_enumerated,
@@ -98,6 +113,9 @@ impl Report {
             "files_errored": self.files_errored,
             "groups": groups,
         });
+        if let Some(m) = &mask {
+            doc["mask_export"] = m.export_id().into();
+        }
         serde_json::to_string_pretty(&doc).expect("report serializes")
     }
 
@@ -139,12 +157,16 @@ impl Report {
         Ok(report)
     }
 
-    pub fn to_human(&self) -> String {
+    /// Masking behaves as in [`Report::to_json`], with `# mask export <id>` as line 1.
+    pub fn to_human(&self, mut mask: Option<&mut Masker>) -> String {
         let mut out = String::new();
+        if let Some(m) = &mask {
+            write_mask_line(&mut out, m).expect("writing to a String cannot fail");
+        }
         write_header(&mut out, self.groups.len(), self.total_wasted())
             .expect("writing to a String cannot fail");
         for g in &self.groups {
-            write_group(&mut out, g).expect("writing to a String cannot fail");
+            write_group(&mut out, g, mask.as_deref_mut()).expect("writing to a String cannot fail");
         }
         out
     }
@@ -154,13 +176,22 @@ impl Report {
     /// Writes the same bytes as [`Report::to_human`] within one volume. Volumes are
     /// visited in id order and each volume's groups in wasted-bytes order, so with
     /// several volumes the cross-volume order can differ from the buffered path.
+    ///
+    /// `mask` carries the masker and its vault connection. Each group is rendered into
+    /// a buffer, the new tokens are flushed to the vault, and only then is the group
+    /// written to `out`, so no token is ever visible before it is durable.
     pub fn stream_human<W: std::io::Write>(
         conn: &Connection,
         min_wasted: i64,
         cancel: &Token,
         on: ReportProgress<'_>,
         out: &mut W,
+        mask: Option<(&mut Masker, &mut Connection)>,
     ) -> Result<()> {
+        let (mut masker, mut vault) = match mask {
+            Some((m, v)) => (Some(m), Some(v)),
+            None => (None, None),
+        };
         let mut loaded = Vec::new();
         for (volume_id, _) in completed_volumes(conn)? {
             cancel.check()?;
@@ -174,12 +205,19 @@ impl Report {
             .sum();
         // Reused for each block so a group is one write to `out`.
         let mut line = String::new();
+        if let Some(m) = &masker {
+            write_mask_line(&mut line, m).expect("writing to a String cannot fail");
+        }
         write_header(&mut line, count, wasted).expect("writing to a String cannot fail");
         out.write_all(line.as_bytes())?;
         for (volume_id, groups) in loaded {
             emit_groups(conn, volume_id, groups, cancel, on, |g| {
                 line.clear();
-                write_group(&mut line, &g).expect("writing to a String cannot fail");
+                write_group(&mut line, &g, masker.as_deref_mut())
+                    .expect("writing to a String cannot fail");
+                if let (Some(m), Some(v)) = (masker.as_deref_mut(), vault.as_deref_mut()) {
+                    m.flush(v)?;
+                }
                 out.write_all(line.as_bytes())?;
                 Ok(())
             })?;
@@ -337,19 +375,57 @@ fn write_header<W: std::fmt::Write>(
     )
 }
 
-/// One group block: a hash line followed by one indented line per member.
-fn write_group<W: std::fmt::Write>(out: &mut W, g: &Group) -> std::fmt::Result {
+/// First line of masked human output.
+fn write_mask_line<W: std::fmt::Write>(out: &mut W, m: &Masker) -> std::fmt::Result {
+    writeln!(out, "# mask export {}", m.export_id())
+}
+
+/// Members paired with their masked path (`None` when unmasked); masked members are
+/// sorted by masked string so order does not reveal the real names' alphabetical rank.
+fn masked_members<'a>(
+    g: &'a Group,
+    mask: Option<&mut Masker>,
+) -> Vec<(&'a Member, Option<String>)> {
+    match mask {
+        None => g.members.iter().map(|m| (m, None)).collect(),
+        Some(mk) => {
+            let mut v: Vec<_> = g
+                .members
+                .iter()
+                .map(|m| (m, Some(mk.mask(&m.path))))
+                .collect();
+            v.sort_by(|a, b| a.1.cmp(&b.1));
+            v
+        }
+    }
+}
+
+/// One group block: a hash line (no hash when masked) followed by one indented line
+/// per member.
+fn write_group<W: std::fmt::Write>(
+    out: &mut W,
+    g: &Group,
+    mask: Option<&mut Masker>,
+) -> std::fmt::Result {
+    let masked = mask.is_some();
+    writeln!(out)?;
+    if !masked {
+        write!(out, "{}  ", g.full_hash.to_hex())?;
+    }
     writeln!(
         out,
-        "\n{}  {}  x{} ({} inode(s), wasted {})",
-        g.full_hash.to_hex(),
+        "{}  x{} ({} inode(s), wasted {})",
         fmt_size(g.size),
         g.members.len(),
         g.distinct_inodes,
         fmt_size(g.wasted_logical)
     )?;
-    for m in &g.members {
-        writeln!(out, "    {}", m.path.to_terminal())?;
+    for (m, s) in masked_members(g, mask) {
+        match s {
+            // Masked text can still hold ASCII control bytes from the name.
+            Some(s) => writeln!(out, "    {}", escape_terminal(s.as_bytes()))?,
+            None => writeln!(out, "    {}", m.path.to_terminal())?,
+        }
     }
     Ok(())
 }

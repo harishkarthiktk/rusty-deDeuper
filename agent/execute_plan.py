@@ -18,11 +18,31 @@ import argparse
 import filecmp
 import json
 import os
+import re
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from jsonio import key, path_style, strip_verbatim, to_local, to_style  # noqa: E402
+
+
+# A mask token (W<n> word, E<n> extension) as dedupe emits it by default; see `dedupe unmask`.
+# No left boundary: camelCase splits glue tokens to readable words (copyW1). The exists check keeps real names.
+MASK_TOKEN = re.compile(r'[WE][0-9]+')
+
+
+def find_masked(node):
+    """First string in the plan that holds a mask token and is not an existing path, else None.
+
+    A real file like 'W2 2023.pdf' exists on disk, so it is not refused; a masked path never exists.
+    """
+    if isinstance(node, str):
+        return node if MASK_TOKEN.search(node) and not os.path.exists(node) else None
+    for v in (node.values() if isinstance(node, dict) else node if isinstance(node, list) else ()):
+        hit = find_masked(v)
+        if hit is not None:
+            return hit
+    return None
 
 
 def k(p):
@@ -171,6 +191,9 @@ def main(argv):
 
     with open(a.plan, encoding='utf-8') as f:
         plan = json.load(f)
+    masked = 'mask_export' if isinstance(plan, dict) and 'mask_export' in plan else find_masked(plan)
+    if masked is not None:
+        sys.exit(f'masked plan, run dedupe unmask first: {masked}')
     log = open(a.log or a.plan + '.exec.jsonl', 'a', encoding='utf-8') if a.execute else None
 
     bad = []  # any skipped or failed row makes the exit code 1

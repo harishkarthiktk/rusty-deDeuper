@@ -6,14 +6,15 @@ The `dedupe` binary, the only user-facing entry point. It parses flags, builds a
 logic does not belong here. See the root CLAUDE.md for layering and cross-crate rules.
 
 ## Module map
-- `src/main.rs`: clap `Cli` (global `--log-level`), `Cmd` (`scan`, `report`, `lookup`, `db`) and their
-  `*Args` structs, `OutputFormat` / `Resolved`, the Ctrl-C handler, and the DB path helpers
+- `src/main.rs`: clap `Cli` (global `--log-level`), `Cmd` (`scan`, `report`, `lookup`, `unmask`, `db`) and their
+  `*Args` structs (`--unmasked` on scan, report and lookup; `UnmaskArgs`), `OutputFormat` / `Resolved`, the Ctrl-C handler, and the DB path helpers
   (`scan_default_db`, `resolve_existing_db`, `insert_db_target`, `is_drive_relative`, `DEFAULT_DB_NAME`).
 - `src/scan.rs`: `dedupe scan`. Chooses the DB or `--no-db` path, runs the locality check and the storage
   probe, builds the exclude list and `Config`, runs the scan, and writes `scan_runs.enumerator`. Holds
   `DEV_ARTIFACT_GLOBS` and `unknown_storage_notice`.
 - `src/platform/mod.rs`: the only CLI file with OS `cfg`. Defines the `ScanExtras` trait, the `Backend`
-  struct and `read_ahead_for`, and re-exports the cfg-selected `make_backend` and `Extras`.
+  struct and `read_ahead_for`, and re-exports the cfg-selected `make_backend` and `Extras`. Also
+  `restrict_perms`: mode 0600 on Unix, a no-op elsewhere (the file keeps the folder's ACL).
 - `src/platform/generic.rs`: `make_backend` for every non-Windows build. Label is always `walker`.
 - `src/platform/windows.rs`: `make_backend` for Windows: `AutoEnumerator` (NTFS `$MFT` path with walker
   fallback), `HandleReader`, MFT cache config, the `$MFT` progress bar, and the enumerator label mapping.
@@ -21,6 +22,9 @@ logic does not belong here. See the root CLAUDE.md for layering and cross-crate 
   `ReportBar`. Draws to stderr only.
 - `src/report.rs`: `dedupe report`. Streams human output or writes JSON, with optional `--output`.
 - `src/lookup.rs`: `dedupe lookup`. Read-only unless `--insert`, which takes the DB lock.
+- `src/mask.rs`: `VAULT_NAME` (`.dedupe.mask.db`), `vault_path` (next to the DB), `db_uuid` (from `meta`, shared by
+  export and unmask), `masker_for` (None with `--unmasked`), `masker_no_db`. Opening a vault calls `restrict_perms`.
+- `src/unmask.rs`: `dedupe unmask`. Rebuilds real paths in a masked JSON plan, or prints an export's extension map.
 - `src/db.rs`: `dedupe db info | vacuum | drop`.
 - `src/discover.rs`: `discover_db`, which finds the one dedupe DB directly inside a folder (not recursive).
 - `src/size.rs`: parsers for byte-size flags (`parse_size`, `parse_size_i64`, `parse_buf_size`).
@@ -47,6 +51,13 @@ logic does not belong here. See the root CLAUDE.md for layering and cross-crate 
 4. `report`, `lookup` and `db` call `resolve_existing_db`: `--db` must exist. Otherwise `--dir` (or the
    current directory) is used as the file itself, or as a folder searched with `discover_db`.
 5. stdout carries only the report. Progress, notes and errors go to stderr.
+6. Output is masked by default. `scan`, `report` and `lookup` build a `Masker` with `mask::masker_for` unless
+   `--unmasked` is given, render into a string, flush the vault, then print. A masked JSON report carries
+   `mask_export`, and human output starts with `# mask export <id>`.
+7. `unmask` finds the DB (`--dir`, or a file path, via `discover_db`), opens the vault read-only, reads the plan
+   from a file or stdin, takes the export id from `--export` or the plan's top-level `mask_export`, checks the
+   vault export's `db_uuid` against the DB, and prints the rebuilt plan with `mask_export` removed so
+   `agent/execute_plan.py` accepts it.
 
 ## Invariants and rules
 - `main.rs` has `#![forbid(unsafe_code)]`, which covers the whole crate.
@@ -103,6 +114,17 @@ logic does not belong here. See the root CLAUDE.md for layering and cross-crate 
   number is bytes. `--buf-size` accepts 1 byte to 64 MiB.
 - `lookup` prints the `--no-lock` note itself when the lock reports it is not held.
 - `db drop` requires `--yes`. Without it the command fails before touching any file.
+- The vault is `<db folder>/.dedupe.mask.db`. It is a secret (it maps tokens back to real names), so never share
+  it with the LLM. `report` and `lookup` reuse the vault of the DB they read, and each run adds an `exports` row.
+- `scan --no-db` masks too, with the vault at `<first root>/.dedupe.mask.db` and db_uuid `no-db`. No DB can match
+  that uuid, so `unmask` always refuses those exports. Use a DB scan to act on a plan.
+- `unmask` needs the export id: `--export N`, or a top-level `mask_export` in the input. With neither, it fails.
+- `unmask --ext-map [--export N] [--json]` prints `E<n> -> ext` for one export (the latest without `--export`).
+  It is a quick lookup of the real extensions, because media extensions are masked.
+- `unmask` removes `mask_export` from its output on purpose. `execute_plan.py` treats a plan that still has it as
+  masked and refuses it.
+- `scan` masks the report it prints after the scan, not the run itself. `scan --json` output is therefore masked
+  unless `--unmasked` is passed.
 
 ## Commands
 ```bash
@@ -122,6 +144,9 @@ Run only when the user asks. `cargo test -p dedupe` runs everything below except
   then checks the labels and counts printed by `db info`.
 - `tests/progress_cli.rs`: JSON scan with `--progress always`. Stdout must parse as JSON, and stderr must
   contain no bar text or ANSI escapes.
+- `tests/mask_cli.rs`: scan the core fixture tree, then `report --json` must be masked (`mask_export`, no
+  `full_hash`, no folder names). `unmask` with the masked plan must give the same member paths as `--unmasked`,
+  a token-free path to a unique file must be refused, and `unmask --ext-map` must succeed.
 - `tests/kill_fuzz.rs`: `#[ignore]`, nightly only. 20 iterations: start a scan, kill it after 100 to 299 ms,
   run `--resume`, and compare the JSON report with an uninterrupted scan. Writes about 576 MiB to a temp
   dir. The doc comment says Unix-only, but the code uses only `Child::kill`, so it is portable.
