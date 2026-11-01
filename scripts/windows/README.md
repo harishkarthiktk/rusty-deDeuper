@@ -21,7 +21,7 @@ From WSL: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\<path to r
 | W5 | scan a scratch tree with and without `--no-mft`; reports match; `lookup` finds the partner | elevated |
 | W6 | non-elevated scan prints one `note:` fallback line and matches W5 | W5 in the same run; from an elevated shell it uses `runas /trustlevel:0x20000` |
 | W7 | five rescans into W5's DB (walker, MFT, cache rebuild, cache twice) keep the report | elevated, W5 |
-| W8 | Ctrl-C: single during the MFT read (exit 130, `cancelling`, no `.tmp`, resume matches W5), double (exit 130 within 2 s), and with a cache present; latency of each case is recorded. Uses `DEDUPE_CACHE_DIR=<OutDir>\w8cache`; SKIP when the console attach is refused | elevated, W5 |
+| W8 | Ctrl-C: single during the MFT read (exit 130, `cancelling`, no `.tmp`, resume matches W5), double (exit 130 within 2 s), and with a cache present; latency of each case is recorded. Uses `DEDUPE_CACHE_DIR=<OutDir>\w8cache`; SKIP when the console attach or the Ctrl-C event is refused | elevated, W5 |
 
 Steps that cannot run are reported as SKIP; the exit code is 1 only when a step FAILs.
 

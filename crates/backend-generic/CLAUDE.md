@@ -6,7 +6,7 @@ Portable backend: walkdir enumeration, positional file reads, volume identity, s
 
 Facade modules hold no target `cfg` and no `unsafe`. They call `crate::sys::Os::<fn>` or re-export `sys::exports`.
 
-- `src/lib.rs`: `#![deny(unsafe_code)]`, module list, re-exports, `GenericBackend` (`new()` builds all five trait objects). `parse` and `sys` are private.
+- `src/lib.rs`: `#![deny(unsafe_code)]`, module list, re-exports, `GenericBackend` (`new()` builds the five concrete types). `parse` and `sys` are private.
 - `src/codec.rs`: `GenericPathCodec`, the `PathCodec` impl (native <-> `RawPath`).
 - `src/meta.rs`: `file_meta_from` (shared `Metadata` -> `FileMeta`), `file_meta_at` (Windows handle path, else `file_meta_from`).
 - `src/probe.rs`: `GenericStorageProbe`, `FsLocality` enum, `fs_locality()`.
@@ -53,8 +53,8 @@ Facade modules hold no target `cfg` and no `unsafe`. They call `crate::sys::Os::
 - `diskutil` reports `SolidState` (the inverse). `macos/probe.rs` inverts it once at the trait boundary.
 - Linux anonymous devices (major 0: btrfs, bcachefs, zfs, overlay) resolve through `/proc/self/mountinfo`. Overlay recurses one level. Deeper is unknown.
 - `fs_locality`: NFS, SMB, SMB2, CIFS, FUSE, and Ceph are `Remote`. The 9p magic is `Virtualized` (WSL). A failed `statfs` is `Unknown`. macOS treats a missing `MNT_LOCAL` as `Remote`. Windows treats `DRIVE_REMOTE` as `Remote`. The CLI policy that acts on these values (refusing remote default DBs, WSL note) is in `crates/cli/CLAUDE.md`.
-- Walker errors: `WalkItem::Error` carries the path, `is_dir`, and an error kind (`Permission` or `Io`). Walkdir errors without a path are skipped. A walkdir error whose path cannot be stat'ed is treated as a directory. Core passes unreadable directories to `Batch::DeleteStale` as protected folders, so their old rows survive. `is_dir` decides whether core protects the folder. A wrong `false` lets stale deletion remove rows under a directory that was never read.
-- Windows walker: `walk_file_meta` opens each regular file once through `dedupe_win_sys::file_info` (used by `file_meta_at` in `sys/windows/meta.rs`) and takes identity, size, times, and attributes from that open. `ctime` is the `FILE_BASIC_INFO` ChangeTime. The std `Metadata` path has no ChangeTime, so `ctime_ns` returns `None` there (unknown; core's `ctime_matches` treats it as a match).
+- Walker errors: `WalkItem::Error` carries the path, `is_dir`, and an error kind (`Permission` or `Io`). Walkdir errors without a path are attributed to the last directory yielded at that depth (`DirTrail`, `is_dir` true). They are skipped with a warning only when no parent is known. A walkdir error whose path cannot be stat'ed is treated as a directory. Core passes unreadable directories to `Batch::DeleteStale` as protected folders, so their old rows survive. `is_dir` decides whether core protects the folder. A wrong `false` lets stale deletion remove rows under a directory that was never read.
+- Windows walker: `walk_file_meta` opens each regular file once through `dedupe_win_sys::file_info` (`walk_file_meta` in `sys/windows/mod.rs` calls it directly; `file_meta_at` in `sys/windows/meta.rs` does the same for `ContentReader::metadata`) and takes identity, size, times, and attributes from that open. `ctime` is the `FILE_BASIC_INFO` ChangeTime. The std `Metadata` path has no ChangeTime, so `ctime_ns` returns `None` there (unknown; core's `ctime_matches` treats it as a match).
 - `dev` on Windows is `Some(volume serial)` only when the handle open succeeds. The fallback path leaves it `None`.
 - Linux `identify` uses the fs UUID when present. Otherwise it uses the fsid, and if the fsid is zero, `none:<fstype>:<source>` from mountinfo (or the mount path). `none:` is a weak resume guard and logs a warning.
 - Linux `fs_type_from_magic` values are from memory. The source comment says to confirm them against the kernel headers.
@@ -84,9 +84,9 @@ cargo test -p dedupe-backend-generic --test walk            # walker contract (U
 
 ## Tests
 
-- Inline `#[cfg(test)]` modules: every `src/parse/*.rs` file, `sys/unix.rs` (`output_with_timeout`, `mount_root`, byte-exact codec round trip), `sys/linux/extents.rs` (FIEMAP flag handling, temp files), `sys/linux/volume.rs` (`fs_type_from_magic`), and `sys/macos/volume.rs` (`format_uuid`).
+- Inline `#[cfg(test)]` modules: every `src/parse/*.rs` file, `walk.rs` (`DirTrail`), `sys/unix.rs` (`output_with_timeout`, `mount_root`, byte-exact codec round trip), `sys/linux/extents.rs` (FIEMAP flag handling, temp files), `sys/linux/volume.rs` (`fs_type_from_magic`), and `sys/macos/volume.rs` (`format_uuid`).
 - `src/sys/tests/`: facade-level tests. `meta.rs` covers `file_meta_from` kinds, identity, and time mapping. `reader.rs` covers open counting, positional reads, symlink refusal, and FIFO refusal (Unix). `probe.rs` covers `fs_locality` on Unix. `volume.rs` covers `identify` on Linux and macOS.
-- `tests/walk.rs`: eight walker contract tests (exclude pruning, root not pruned, dir before children, symlink not followed, `nlink` and hardlink bit, error item for missing root, error item and skipped children for unreadable subdir). Each builds its own tree under `std::env::temp_dir()`.
+- `tests/walk.rs`: nine walker contract tests (exclude pruning, root not pruned, dir before children, symlink not followed, `nlink` and hardlink bit, hardlink bit cleared for one name, error item for missing root, error item and skipped children for unreadable subdir). Each builds its own tree under `std::env::temp_dir()`.
 - No `#[ignore]` tests exist in this crate.
 - The Windows branch is compile-checked from the dev host, and the macOS branch is not compiled there. Run the test commands on each OS before trusting its branch.
 

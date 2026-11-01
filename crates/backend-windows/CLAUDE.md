@@ -10,10 +10,10 @@ Portable:
 - `caps`: `Capabilities`, `Mode`, `FallbackReason`, and `choose_mode` (pure rule). `probe_capabilities` is Win32.
 - `filetime`: `mtime_ns` (0 when out of range) and `ctime_ns` (`None` when out of range), over `dedupe_core::time::filetime_to_unix_ns`.
 - `handle`: `plan_open` (sync or overlapped) and `file_id_to_frn` (8-byte ids only). Declared under `any(windows, test)`. `HandleReader` is Win32.
-- `mft_cache`: the cache file format, `encode`/`decode`, `validate`, `write_atomic_stream`, `read` (size-checked), `cache_dir`, and `apply_delta`. Plain `std::fs` I/O.
-- `mft_walk`: `walk_mft`, `read_tree`, `emit_tree`, the `RecordSource` trait, and `NtfsRecordSource<R: Read + Seek>`. Tests use in-memory sources.
+- `mft_cache`: the cache file format, `encode`/`decode`, `validate`, `write_atomic_stream`, `read` (size-checked), `cache_dir`, `cache_path`, `apply_delta`, and `max_touched`. Plain `std::fs` I/O.
+- `mft_walk`: `walk_mft`, `read_tree`, `emit_tree`, the `RecordSource` trait, `NtfsRecordSource<R: Read + Seek>`, `MftEvent` and `MftObserver` (progress callback, re-exported from `lib.rs`), `MftError`, and `VolumeGeometry`. Tests use in-memory sources.
 - `readahead`: `ReadAhead<B: AsyncBackend>`, the window logic. Tested with a fake backend.
-- `records`: reads one `$MFT` record through `ntfs` into `RecordFacts`. The only module that calls the `ntfs` record API.
+- `records`: reads one `$MFT` record through `ntfs` into `RecordFacts`. The only module that reads records through `Ntfs::file`. `mft_walk.rs` also constructs the `Ntfs` root.
 - `sector`: `SectorReader`, an aligned chunk cache that serves unaligned reads over any `Read + Seek`.
 - `tree`: `VolumeTree`, `RecordFacts`, `NameFact`, path building, hard links, `kind_of` (reparse classification), `file_meta_of`.
 - `usn`: `parse_usn_buffer`, `parse_journal_data`, `read_request_bytes`, `UsnError` (has `Cancelled`). `query_journal` and `read_journal` are Win32 (`cfg(windows)`).

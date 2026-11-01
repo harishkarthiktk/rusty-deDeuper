@@ -32,9 +32,9 @@ logic does not belong here. See the root CLAUDE.md for layering and cross-crate 
 ## How it works
 1. `main` parses args and sends tracing to stderr. Only `scan` and `report` get a Ctrl-C handler
    (`install_ctrlc`): the first press cancels the `Token` and prints a notice; the second press
-   exits with code 130. A failed handler install is ignored.
+   exits with code 130. A failed handler install is ignored. Any other error exits 1.
 2. `scan` and `report` receive the token. A clean cancel (`CoreError::Cancelled` in the error
-   chain, see `is_cancel`) prints the error and exits 130. `lookup` and `db` take no token and
+   chain, see `is_cancel`) prints the error and exits 130. `lookup`, `unmask` and `db` take no token and
    have no handler, so Ctrl-C ends them at once (`lookup --insert` is one transaction).
 3. `scan::run`:
    1. Format: `--json` wins; `auto` prints human text only when stdout is a terminal.
@@ -55,7 +55,8 @@ logic does not belong here. See the root CLAUDE.md for layering and cross-crate 
    `--unmasked` is given, render into a string, flush the vault, then print. A masked JSON report carries
    `mask_export`, and human output starts with `# mask export <id>`.
 7. `unmask` finds the DB (`--dir`, or a file path, via `discover_db`), opens the vault read-only, reads the plan
-   from a file or stdin, takes the export id from `--export` or the plan's top-level `mask_export`, checks the
+   from a file or stdin, takes the export id from `--export` or the plan's top-level `mask_export` (a mismatch
+   between the two is an error), checks the
    vault export's `db_uuid` against the DB, and prints the rebuilt plan with `mask_export` removed so
    `agent/execute_plan.py` accepts it.
 
@@ -69,7 +70,8 @@ logic does not belong here. See the root CLAUDE.md for layering and cross-crate 
 - Clap enums (`VerifyArg`, `ProfileArg`) convert to core enums with `From`. Core must not depend on clap.
 - With `--format json`, stdout is JSON only. `--progress always` still draws nothing in JSON mode.
 - Clap `conflicts_with` attributes encode the flag rules (`--json` vs `--format`, `--db` vs `--no-db`,
-  `--resume` vs `--no-db`, `--cross-mounts` vs `--one-file-system`). Keep them in the attributes.
+  `--resume` vs `--no-db`, `--cross-mounts` vs `--one-file-system`, `--no-mft-cache` vs `--rebuild-mft-cache`,
+  and on report and lookup `--json` vs `--format` and positional dir vs `--db`). Keep them in the attributes.
 - `DEV_ARTIFACT_GLOBS` keys only on artifact folder names and extensions. Never add a folder name that
   may hold media (such as `TurboC++`).
 - The probe runs before the profile exists, so it cannot come from `make_backend`. A failed probe is
@@ -114,8 +116,12 @@ logic does not belong here. See the root CLAUDE.md for layering and cross-crate 
   number is bytes. `--buf-size` accepts 1 byte to 64 MiB.
 - `lookup` prints the `--no-lock` note itself when the lock reports it is not held.
 - `db drop` requires `--yes`. Without it the command fails before touching any file.
+- Flags with no other mention: `report --min-wasted` hides groups below a logical-waste size. `scan --verify byte`
+  compares duplicate candidates byte for byte after hashing. `scan --mem-budget` caps the in-memory maps.
+  `scan --include-placeholders` includes cloud placeholders instead of skipping them. `scan --rebuild-mft-cache`
+  (Windows) ignores the existing MFT cache and writes a fresh one.
 - The vault is `<db folder>/.dedupe.mask.db`. It is a secret (it maps tokens back to real names), so never share
-  it with the LLM. `report` and `lookup` reuse the vault of the DB they read, and each run adds an `exports` row.
+  it with the LLM. `scan`, `report` and `lookup` reuse the vault of the DB they read, and each run adds an `exports` row.
 - `scan --no-db` masks too, with the vault at `<first root>/.dedupe.mask.db` and db_uuid `no-db`. No DB can match
   that uuid, so `unmask` always refuses those exports. Use a DB scan to act on a plan.
 - `unmask` needs the export id: `--export N`, or a top-level `mask_export` in the input. With neither, it fails.
@@ -137,7 +143,7 @@ phase N. It is a test hook, not a supported option.
 
 ## Tests
 Run only when the user asks. `cargo test -p dedupe` runs everything below except the ignored test.
-- In-module unit tests: `main.rs` (queue depth 0 rejected, `--no-mft` and `--no-mft-cache` parsing),
+- In-module unit tests: `main.rs` (15 unit tests: 12 clap parsing and flag-conflict tests, `parse_queue_depth`, and 2 for `is_drive_relative`),
   `scan.rs` (`unknown_storage_notice` text and conditions), `platform/mod.rs` (`read_ahead_for`, which
   compiles and runs on every OS), `progress.rs` (`should_draw` truth table), `size.rs` (size parsing).
 - `tests/db_info.rs`: scans the core fixture tree (`crates/core/tests/fixtures/tree`) into a temp DB,

@@ -37,7 +37,7 @@ Every rule below is a must. If one cannot be met, stop and ask the user. Details
 
 ## 2. Input format
 
-`dedupe.json` is the CLI's `--json` report. Reference files with made-up data: `agent/examples/dedupe.example.windows.json` (Windows build: a plain duplicate, a group with two hardlinked members, a venv artifact group) and `agent/examples/dedupe.example.posix.json` (Linux build, including a member with `path_bytes`). Both use the CLI's layout: keys sorted, 2-space indent, LF.
+`dedupe.json` is the output of `dedupe report --unmasked --json`. Masked output has no `full_hash`, so the scripts cannot use it. Reference files with made-up data: `agent/examples/dedupe.example.windows.json` (Windows build: a plain duplicate, a group with two hardlinked members, a venv artifact group) and `agent/examples/dedupe.example.posix.json` (Linux build, including a member with `path_bytes`). Both use the CLI's layout: keys sorted, 2-space indent, LF.
 
 Top-level keys:
 
@@ -65,7 +65,7 @@ Facts to rely on:
 
 - Equal `full_hash` and equal `size` means equal content. Trust the hash over file names.
 - `wasted_logical = (distinct_inodes - 1) * size`. If two members are already hardlinks they share an inode and add no waste.
-- Encoding: the CLI writes UTF-8 (`report --json --output FILE`). A report captured with Windows PowerShell 5 `>` is **UTF-16 LE with BOM, CRLF newlines**. The scripts detect the BOM; for ad hoc reads use `agent/jsonio.py` `load_json`.
+- Encoding: the CLI writes UTF-8 (`report --unmasked --json --output FILE`). A report captured with Windows PowerShell 5 `>` is **UTF-16 LE with BOM, CRLF newlines**. The scripts detect the BOM; for ad hoc reads use `agent/jsonio.py` `load_json`.
 
 ### Path styles
 

@@ -9,7 +9,7 @@ workspace layering and cross-crate rules are in the root CLAUDE.md.
 - `src/lib.rs`: `#![forbid(unsafe_code)]`, the module list, re-exports `CoreError` and `Result`.
 - `src/traits.rs`: the OS boundary. `Enumerator`, `ContentReader` (with `FileHandle`, `ReadTarget`,
   `AccessPattern`), `Hasher`, `VolumeIdentity`, `PathCodec`, `StorageProbe`, plus `WalkItem` and
-  `FileMeta`. `Action` is an empty placeholder.
+  `FileMeta`. `Action` is a placeholder trait (`describe` only) for the actions that land in Phase 7.
 - `src/model.rs`: `Hash` (16 bytes), `State` (`files.state`), `Phase` (`run_volumes.phase_reached`),
   `is_legal_transition`, `attrs` bits, row structs (`FileEntry`, `FolderRow`, `ErrRow`), enums
   (`ErrorKind`, `SkipReason`, `FsType`, `UuidKind`), `now_unix_ns`.
@@ -135,7 +135,7 @@ Transitions are forward only within a run. Two things to know:
   rows in states 3, 4 and 5 last seen by a finished run, so roots a later scan skipped remain listed.
 - Header counts come from each volume's latest finished run (`completed_volumes`).
 - `unfinished_newer_run` reports a running run newer than every finished one.
-- `ReportEvent` is `Volume { groups }`, `Group { done }`, then `Done`. Cancellation is checked before
+- `ReportEvent` is `Volume { volume_id, groups }`, `Group { done }`, then `Done`. Cancellation is checked before
   each group.
 - Lookup considers every live row not in -1 or -2. Its freshness check (`is_fresh`) compares size,
   mtime, ctime and file id.
@@ -232,8 +232,6 @@ Transitions are forward only within a run. Two things to know:
 - `Services::hasher` is set by callers but never read in core. Hashing calls `hash::hash_bytes` and BLAKE3
   directly. `naive.rs` ignores its `hasher` argument as well.
 - `Config::mem_budget` is not read by any pass.
-- `Config` documents `VerifyMode::Byte` as "lands in Phase 2". That comment is stale. `pass_verify` is
-  implemented.
 - Core has no `test-hooks` feature. The `dedupe` (cli) feature `test-hooks` gates `--stop-after-pass`;
   `ScanOptions::stop_after` always compiles.
 - Two types named `PathCache` exist. `pipeline::PathCache` is per pass and cached. `db::queries::PathCache`
@@ -255,7 +253,7 @@ DEDUPE_SCALE_N=1000000 cargo test -p dedupe-core --test scale -- --ignored
   token lookalikes, name hiding (`ALLOW_PREFIX` leak), unknown and foreign-export tokens, the scope gate for
   token-free paths, the DB uuid check, and non-UTF-8 and free-text handling.
 - `tests/phase1.rs`: resume at every batch boundary, lookup (including insert), rescan, move detection,
-  the volume-UUID and hash-config guards, an abandoned run, root-scoped rescan, non-UTF-8 round trip.
+  the volume-UUID and hash-config guards, an abandoned run, root-scoped rescan, non-UTF-8 round trip, and `scan_naive` dropping an `--exclude-dir` subtree.
 - `tests/pool.rs`: `queue_depth` 4 gives the same results as 1.
 - `tests/progress.rs`: balanced advances per pass, and the null sink.
 - `tests/verify.rs`: byte verify sets state 4. A file changed after hashing is an error. Hardlinks

@@ -64,8 +64,12 @@ A rescan reuses a file's saved hash only when its size, modification time, chang
 | `--include-dev-artifacts` | Also scan build and package artifacts. By default the scan skips `site-packages`, `dist-packages`, `node_modules`, `__pycache__`, Rust `target/debug` and `target/release`, `.fingerprint`, `.git`, and `.pyc`, `.pyo`, `.o`, `.obj`, `.pdb`, `.rlib`, `.rmeta` files, so `lookup` does not match files under these paths. A default scan of a database built before this default removes rows under these paths. `--exclude` still applies. |
 | `--no-mft` | Windows only: skip the NTFS `$MFT` fast path and use the standard directory walker. Ignored on other systems. See [Windows](#windows). |
 | `--mem-budget <SIZE>` | Memory budget for the in-memory working set. Accepts bytes or a unit, such as `512MiB` or `1GiB`. |
-| `--format <human\|json>` | Output format. Default: `human`. |
+| `--format <auto\|human\|json>` | Output format. Default: `auto` (human on a terminal, JSON when piped). `--json` is shorthand for `--format json`. |
 | `--progress <auto\|always\|never>` | Progress bar on stderr. Default: `auto` (shown only in a terminal). |
+| `--unmasked` | Print real paths instead of masked tokens. Masked is the default. See [Masked output](#masked-output-for-llms). |
+| `--one-file-system` | Do not descend across mount points. This is the default. |
+| `--no-mft-cache` | Windows only: do not read or write the MFT cache for this scan. Ignored elsewhere. |
+| `--rebuild-mft-cache` | Windows only: ignore the existing MFT cache, read the whole volume, and write a fresh cache. Ignored elsewhere. |
 | `--verify <off\|byte>` | `byte` compares duplicate candidates byte for byte after hashing. Default: `off`. Ignored with `--no-db`. |
 | `--profile <auto\|hdd\|ssd>` | Storage policy. `auto` checks whether the first root is on rotational media. `hdd` or `ssd` forces one. Default: `auto`. Ignored with `--no-db`. |
 | `--queue-depth <N>` | Number of full-file hashes to run in parallel. Default: CPU count, capped at 8 on SSD; 1 on HDD; at most 2 when the storage type is unknown. Must be at least 1. Ignored with `--no-db`. |
@@ -95,9 +99,13 @@ Prints the duplicate groups from the last completed scan of each volume. If that
 
 | Option | What it does |
 |---|---|
-| `--db <PATH>` | Read this database. Default: `./.dedupe.db` in the current folder. |
+| `[DIR]` | Folder holding the database; a file path is used as the database itself. Default: the current folder. The folder must hold exactly one dedupe database. |
+| `--db <PATH>` | Read this database. Use it when the folder holds several. |
 | `--min-wasted <SIZE>` | Hide groups that waste less than this size. Accepts a plain byte count or a size with a unit, such as `10MB` or `1.5GiB`. |
-| `--format <human\|json>` | Output format. |
+| `-o, --output <FILE>` | Write the report to this file as UTF-8 instead of stdout. With `--format auto` the file gets JSON. |
+| `--format <auto\|human\|json>` | Output format. Default: `auto`. |
+| `--json` | Shorthand for `--format json`. |
+| `--unmasked` | Print real paths instead of masked tokens. Masked is the default. |
 | `--progress <auto\|always\|never>` | Draw a progress bar on stderr while the report is built. `auto` draws only on a terminal and never with `--format json`. |
 
 Human output streams group by group as it is built, so large databases show results immediately. Press Ctrl-C to cancel.
@@ -124,16 +132,19 @@ dedupe report --min-wasted 1048576    # plain bytes still work
 Example output (values are illustrative):
 
 ```
+# mask export 1
 2 duplicate group(s), 1.2 KiB (1234 bytes) wasted (logical)
 
 3f9c...e210  617 bytes  x2 (2 inode(s), wasted 617 bytes)
-    /Users/me/Pictures/a.jpg
-    /Users/me/Pictures/copy/a.jpg
+    /Users/W1/W2/W3.E1
+    /Users/W1/W2/copy/W3.E1
 
 b81d...47aa  11.7 MiB (12271312 bytes)  x2 (2 inode(s), wasted 11.7 MiB (12271312 bytes))
-    /Users/me/Videos/clip.mp4
-    /Users/me/Videos/backup/clip.mp4
+    /Users/W1/W4/W5.E2
+    /Users/W1/W4/backup/W5.E2
 ```
+
+The example is masked, as `scan` and `report` print by default. Add `--unmasked` to see real paths.
 
 Each group shows the content hash, the file size, how many copies exist, and the members of the group.
 Sizes in human output use binary units (KiB, MiB, GiB, TiB) with one decimal, followed by the exact byte count once a value reaches 1 KiB. `--format json` always emits raw byte counts.
@@ -149,8 +160,9 @@ Tells you whether a file already has a duplicate in the database. It hashes only
 Example output:
 
 ```
+# mask export 1
 1 match(es)
-    [fresh] /Users/me/Pictures/a.jpg
+    [fresh] /Users/W1/W2/W3.E1
 ```
 
 A file never matches itself, and neither does another hard link to the same data. With `--insert`, a file that is already indexed and unchanged is left as it is.
@@ -168,10 +180,13 @@ Other options:
 
 | Option | What it does |
 |---|---|
-| `--db <PATH>` | Query this database. Default: `./.dedupe.db`. |
-| `--insert` | Save the file and its hash into the database, so later lookups and reports include it. Creates the database if it does not exist. |
+| `[--dir <DIR>]` | Folder holding the database; a file path is used as the database itself. Default: the current folder. The folder must hold exactly one dedupe database. |
+| `--db <PATH>` | Query this database. Use it when the folder holds several. |
+| `--insert` | Save the file and its hash into the database, so later lookups and reports include it. If the folder has no database, creates `.dedupe.db` there. |
 | `--no-lock` | With `--insert`, run without the database lock when the filesystem does not support file locking. |
-| `--format <human\|json>` | Output format. |
+| `--format <auto\|human\|json>` | Output format. Default: `auto`. |
+| `--json` | Shorthand for `--format json`. |
+| `--unmasked` | Print real paths instead of masked tokens. Masked is the default. |
 
 Files that are not checked: empty files, symlinks, special files (pipes, sockets, devices), and cloud placeholders.
 
@@ -183,11 +198,20 @@ dedupe db vacuum            # compact the database file
 dedupe db drop --yes        # delete the database and its WAL files (irreversible)
 ```
 
-Each subcommand takes `--db <PATH>`. The default is `./.dedupe.db`. `drop` refuses to run without `--yes`.
+Each subcommand takes `--db <PATH>` or `--dir <DIR>`. `--dir` defaults to the current folder, and the one dedupe database inside it is used. `drop` refuses to run without `--yes`.
+
+### `unmask`: turn a masked plan back into real paths
+
+```bash
+dedupe unmask [--dir <DIR>] [--export <N>] [plan.json]     # reads stdin when no file is given
+dedupe unmask [--dir <DIR>] [--export <N>] --ext-map [--json]
+```
+
+`--dir` is the folder holding the database and its mask vault (default: the current folder). `--export` is the export id; it defaults to the plan's top-level `mask_export`. See [Masked output for LLMs](#masked-output-for-llms).
 
 ## Output formats
 
-Every command that prints results accepts `--format json`, which is useful in scripts:
+`scan`, `report` and `lookup` accept `--format json` (or `--json`), which is useful in scripts:
 
 ```bash
 dedupe report --format json | jq '.group_count'
@@ -204,7 +228,7 @@ Log verbosity is a global option: `dedupe --log-level debug scan ~/Pictures`. Le
 `scan`, `report` and `lookup` mask paths by default, so you can paste a report into an LLM without sending your file names. Each word of a path becomes a token, and media extensions are masked too:
 
 ```
-/home/W1/Pictures/W2 W3/W4.E1      (was /home/ana/Pictures/Beach Trip/IMG0042.jpg)
+/home/W1/W2/W3 W4/W5.E1            (was /home/ana/Pictures/Beach Trip/IMG0042.jpg)
 ```
 
 Folders such as `home`, `Users`, `Documents`, `node_modules` and `.git`, common extensions (`.pdf`, `.py`, `.zip`), and words such as `copy`, `backup`, `final` or `v2` stay readable. Masked JSON has no `full_hash`, and carries a top-level `mask_export` id. Human output starts with `# mask export <id>`.
@@ -251,7 +275,7 @@ On Windows, `scan` can read the NTFS master file table (`$MFT`) directly instead
 
 ## Development
 
-See `CLAUDE.md` for the build, lint, and test commands and the code layout. The full engineering plan and status are in `../.overall_plan.md`.
+See `CLAUDE.md` for the build, lint, and test commands and the code layout. The full engineering plan and status are in `.overall_plan.md`.
 
 ## License
 

@@ -1,6 +1,6 @@
 # agent/ - duplicate analysis helpers
 
-Analysis scripts for a `dedupe.json` produced by the dedupe CLI. All are read-only except `execute_plan.py`, which changes the drive only with `--execute` after the user approves the exact command. Full workflow: `../AGENT-instruction.md`.
+Analysis scripts for a `dedupe.json` produced by the dedupe CLI. Only `execute_plan.py` changes files on the scanned drives, and only with `--execute` after the user approves the exact command. The others write output files (such as the split and plan files) and leave the drive alone. Full workflow: `../AGENT-instruction.md`.
 
 By default, `dedupe scan` skips most of what `rules.py` classifies (venv `site-packages`, `node_modules`, Rust `target`, `.git`, compiled objects) at scan time (`--include-dev-artifacts` turns this off). `split.py` still catches the rest, such as `cmake-*` installs and venv `Scripts` launchers. Rules match folder names case-insensitively.
 

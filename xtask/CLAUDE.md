@@ -9,7 +9,8 @@ Running `boundaries` is a project script. Ask the user before running it.
 ## Tasks
 - `schema`: stub. Prints `schema bump not implemented yet (schema is v2)` to stderr and exits 0.
 - `boundaries`: OS-boundary check. Prints `boundaries: ok` on success. On a violation it prints one
-  `path:line: needle (rule)` line per hit to stdout and exits 1.
+  `path:line: needle (rule)` line per hit to stdout and exits 1. Fail-closed errors print `path: reason (rule)`
+  with no line number.
 - No argument: prints usage to stderr and exits 0. Unknown task name: exits 2.
 
 ## Boundary rules (`fn boundaries`)
