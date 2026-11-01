@@ -96,11 +96,22 @@ Run the two Commands lines marked "Windows cross-check" after any edit that touc
 - The hash is BLAKE3 truncated to 128 bits (`blake3-128`). `meta.hash_algo` and the prefix sizes must match the DB.
 - Build matrix: lint and `cargo check` run on the Linux host and for `x86_64-pc-windows-gnu` (mingw). Nothing compiles the macOS code (`crates/backend-generic/src/sys/macos/`, `crates/backend-generic/src/sys/other.rs`) or MSVC or aarch64 from this host; check those on a Mac or Windows machine. Win32 code is compile-checked only; no test on this host executes it.
 - `scale.rs` (core) and `kill_fuzz.rs` (cli) tests are `#[ignore]`. Plain `cargo test` skips them.
+- Line endings are mixed: about 40 tracked files are CRLF in the index (list them with `git ls-files --eol | grep i/crlf`), including `cli/src/main.rs`, `backend-windows/src/overlapped.rs` and `usn.rs`, and `xtask/src/main.rs`. `cargo fmt` and most editors rewrite a touched file to LF, which turns a small edit into a whole-file diff. After formatting, convert those files back (`sed -i 's/\r$//' F && sed -i 's/$/\r/' F`) and check `git diff --stat`.
 
 ## Working conventions
 ALWAYS use 'rust-best-practises' skill while working on rust code and systems.
 
 - Lint and format checks can run without asking. Builds and tests run only when the user asks for them. When they do run, use a subagent.
+- Test only the change: run the tests that directly cover the edited code, and say what stays unverified. Never start a full suite on your own initiative, even for a broad change. The full workspace suite, the full Windows runbook (W1-W8, over an hour, with a ~9 min `$MFT` read in a debug build) and `kill_fuzz` run only when the user asks.
+- Picking the tests:
+  - Linux: `cargo test -p <crate> --lib`, or `--test <file> <filter>` for the touched crate. A test in a crate that compiles only for Windows (`backend-windows` Win32 modules, `win-sys`) does not run here.
+  - Windows: `scripts\windows\verify.ps1 -Step ...` (steps in `scripts/windows/README.md`). W1 builds and comes first.
+    - W2: unit and integration tests.
+    - W5: `$MFT` and walker scans plus `lookup`.
+    - W8: Ctrl-C.
+    - W4 (`mft_vs_walk`): only for `$MFT` record or tree code.
+    - W6: only for elevation or fallback code.
+    - W7: only for MFT cache or USN code.
 - Benchmarks are deferred to the end of the plan and run by the user on reference hardware. Do not run them as verification.
 - Plan status and task IDs live in `.overall_plan.md`. Read that file before starting work on any task ID.
 - When a change moves or renames code, update the affected crate's `CLAUDE.md` in the same change, and this file only if a cross-crate fact changed.
