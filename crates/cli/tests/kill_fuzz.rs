@@ -43,6 +43,8 @@ fn report(db: &Path) -> serde_json::Value {
         .args(["report", "--db"])
         .arg(db)
         .args(["--format", "json"])
+        // the comparison needs real paths, not per-run mask tokens
+        .arg("--unmasked")
         .output()
         .expect("run report");
     assert!(
